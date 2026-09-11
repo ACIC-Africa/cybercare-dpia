@@ -6,3 +6,54 @@
 from sqlalchemy import MetaData
 
 PRIVACYCARE_METADATA = MetaData()
+
+import uuid
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    String,
+    Table,
+    Text,
+    func,
+)
+from sqlalchemy.orm import registry
+
+mapper_registry = registry(metadata=PRIVACYCARE_METADATA)
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+business_process_table = Table(
+    "privacycare_business_process",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column("name", String(255), nullable=False),
+    Column("description", Text),
+    Column("business_cycle", String(255)),
+    Column("owner_name", String(255)),
+    Column("owner_email", String(255)),
+    Column("is_critical", Boolean, nullable=False, server_default="false"),
+    Column("criticality_note", Text),
+    Column("external_ref", String(255)),
+    Column("last_attested_at", DateTime(timezone=True)),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+    Column("deleted_at", DateTime(timezone=True)),
+)
+
+
+@mapper_registry.mapped
+class BusinessProcess:
+    # A business process the customer actually runs. Fides has no equivalent:
+    # its map is anchored on systems, which can be scanned, while a process
+    # exists only once a consultant has written it down.
+    __table__ = business_process_table
