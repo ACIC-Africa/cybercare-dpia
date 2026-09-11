@@ -1,19 +1,35 @@
 """The admin-ui ships assessment screens that call `plus/privacy-assessments/*`.
-Those routes are Fides Plus and absent from OSS. W1 implements them.
 
-This test asserts the CURRENT state (absent) so that when W1 lands, the
-assertion is inverted in the same commit that adds the routes — making the
-gap closing visible in the diff rather than implicit."""
-from fides.api.main import app
+W1 has landed: `fides.api.privacycare.asgi` registers our own router onto
+Fides' `app_setup.ROUTERS`, so the six READ paths below are now served.
 
-EXPECTED_ASSESSMENT_ROUTES = [
+This test used to assert the gap (routes absent) and said, in its own
+docstring, to invert the assertion once W1 lands — making the gap closing
+visible in the diff rather than implicit. That inversion happens here.
+
+Only the six READ paths are asserted present. The remaining paths in the
+original gap list (single-question fetch, questionnaire, questionnaire
+reminders, PDF export, tasks, and config) are WRITE-adjacent or not part of
+this read surface — they belong to plan 04 and are still correctly absent.
+That absence is intentional, not a regression: see
+`test_write_and_other_routes_still_absent` below.
+"""
+from fides.api.privacycare.asgi import app
+
+EXPECTED_READ_ROUTES = [
     "plus/privacy-assessments",
     "plus/privacy-assessments/summary",
     "plus/privacy-assessments/templates",
-    "plus/privacy-assessments/{id}",
-    "plus/privacy-assessments/{id}/questions",
+    "plus/privacy-assessments/{assessment_id}",
+    "plus/privacy-assessments/{assessment_id}/questions",
+    "plus/privacy-assessments/{assessment_id}/evidence",
+]
+
+# Not part of this read surface (plan 04, write paths) — still absent, and
+# that is correct. Kept here (with the original `{id}` naming from the gap
+# list) so a later reader sees the absence was checked, not overlooked.
+EXPECTED_STILL_ABSENT_ROUTES = [
     "plus/privacy-assessments/{id}/questions/{question_id}",
-    "plus/privacy-assessments/{id}/evidence",
     "plus/privacy-assessments/{id}/questionnaire",
     "plus/privacy-assessments/{id}/questionnaire/reminders",
     "plus/privacy-assessments/{id}/pdf",
@@ -28,12 +44,20 @@ def _registered_paths():
     return {getattr(r, "path", "") for r in app.routes}
 
 
-def test_assessment_routes_are_absent_in_oss():
+def test_assessment_routes_are_now_served_by_privacycare():
     paths = _registered_paths()
-    present = [r for r in EXPECTED_ASSESSMENT_ROUTES if any(r in p for p in paths)]
+    missing = [r for r in EXPECTED_READ_ROUTES if not any(r in p for p in paths)]
+    assert not missing, f"read routes not registered: {missing}"
+
+
+def test_write_and_other_routes_still_absent():
+    # Guard against mistaking this deliberate, still-pending scope (plan 04)
+    # for a regression: these paths are NOT expected to exist yet.
+    paths = _registered_paths()
+    present = [r for r in EXPECTED_STILL_ABSENT_ROUTES if any(r in p for p in paths)]
     assert not present, (
-        "Assessment routes now exist — W1 has landed. Invert this assertion "
-        f"to require them. Found: {present}"
+        "Write/other assessment routes now exist — update this test's scope. "
+        f"Found: {present}"
     )
 
 
