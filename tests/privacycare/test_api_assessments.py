@@ -55,15 +55,40 @@ def _seed_template_named(db, name: str) -> str:
     return tid
 
 
-def _seed_assessment(db, template_id: str, name: str) -> str:
+def _seed_assessment(
+    db,
+    template_id: str,
+    name: str,
+    *,
+    status: str = "in_progress",
+    risk_level: str | None = None,
+    created_by: str | None = None,
+    data_use: str | None = None,
+    data_use_name: str | None = None,
+) -> str:
+    # status/risk_level/created_by/data_use/data_use_name are all optional
+    # kwargs (defaulting to the original single-status behaviour) so the
+    # summary tests below can drive every AssessmentSummarySegment and the
+    # blocked_groups/owners aggregation without a second seed helper.
     aid = f"asmt_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO privacy_assessment "
-            "(id, template_id, name, status, system_fides_key) "
-            "VALUES (:id, :tid, :name, 'in_progress', 'sys_test')"
+            "(id, template_id, name, status, system_fides_key, risk_level, "
+            " created_by, data_use, data_use_name) "
+            "VALUES (:id, :tid, :name, :status, 'sys_test', :risk_level, "
+            " :created_by, :data_use, :data_use_name)"
         ),
-        {"id": aid, "tid": template_id, "name": name},
+        {
+            "id": aid,
+            "tid": template_id,
+            "name": name,
+            "status": status,
+            "risk_level": risk_level,
+            "created_by": created_by,
+            "data_use": data_use,
+            "data_use_name": data_use_name,
+        },
     )
     return aid
 
@@ -123,12 +148,92 @@ def test_templates_fall_back_to_id_when_name_has_no_letters_or_digits(db):
     assert tpl.key != ""
 
 
-def test_summary_counts_by_status_and_risk(db):
+def test_summary_shape_matches_the_ui_contract(db):
+    # Fix round 1: _summary() previously invented a {total, by_status,
+    # by_risk_level} shape instead of reading
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. This
+    # asserts the real AssessmentSummaryResponse shape: total, by_segment
+    # (all 4 segments, always present), blocked_groups, owners.
     tid = _seed_template(db)
     _seed_assessment(db, tid, "Summary A")
     _seed_assessment(db, tid, "Summary B")
     db.flush()
     out = _summary(db)
+    assert set(out.keys()) == {"total", "by_segment", "blocked_groups", "owners"}
     assert out["total"] >= 2
-    assert out["by_status"].get("in_progress", 0) >= 2
-    assert "by_risk_level" in out
+    assert set(out["by_segment"].keys()) == {"completed", "pending", "open", "risk"}
+    assert isinstance(out["blocked_groups"], list)
+    assert isinstance(out["owners"], list)
+
+
+def test_summary_segments_follow_status_and_risk_level(db):
+    # Port of segmentForAssessment() in compute-summary.ts: completed ->
+    # "completed", generating -> "pending", in_progress/outdated -> "risk"
+    # if risk_level is high else "open".
+    tid = _seed_template(db)
+    _seed_assessment(db, tid, "Completed", status="completed")
+    _seed_assessment(db, tid, "Generating", status="generating")
+    _seed_assessment(db, tid, "Open", status="in_progress", risk_level="medium")
+    _seed_assessment(db, tid, "At risk", status="in_progress", risk_level="high")
+    _seed_assessment(db, tid, "Outdated at risk", status="outdated", risk_level="high")
+    db.flush()
+    out = _summary(db)
+    assert out["by_segment"]["completed"] >= 1
+    assert out["by_segment"]["pending"] >= 1
+    assert out["by_segment"]["open"] >= 1
+    assert out["by_segment"]["risk"] >= 2
+
+
+def test_summary_blocked_groups_aggregate_by_data_use(db):
+    # Port of the groupAgg logic in compute-summary.ts: a group only
+    # appears in blocked_groups once it has an outdated or high-risk
+    # assessment, named after data_use_name (or "Uncategorized").
+    tid = _seed_template(db)
+    _seed_assessment(
+        db,
+        tid,
+        "Marketing outdated",
+        status="outdated",
+        data_use="marketing.advertising",
+        data_use_name="Marketing",
+    )
+    _seed_assessment(
+        db,
+        tid,
+        "Marketing fine",
+        status="in_progress",
+        data_use="marketing.advertising",
+        data_use_name="Marketing",
+    )
+    db.flush()
+    out = _summary(db)
+    marketing = next(
+        (g for g in out["blocked_groups"] if g["name"] == "Marketing"), None
+    )
+    assert marketing is not None, "a group with an outdated assessment must be blocked"
+    assert marketing["outdated_count"] >= 1
+    assert marketing["total_count"] >= 2
+
+
+def test_summary_owners_aggregate_open_assessments(db):
+    # Port of the ownerAgg logic in compute-summary.ts: only open
+    # (in_progress/outdated) assessments with a created_by count toward an
+    # owner's open_count/outdated_count.
+    tid = _seed_template(db)
+    _seed_assessment(
+        db, tid, "Owned open", status="in_progress", created_by="alice@example.com"
+    )
+    _seed_assessment(
+        db, tid, "Owned outdated", status="outdated", created_by="alice@example.com"
+    )
+    _seed_assessment(
+        db, tid, "Owned but completed", status="completed", created_by="alice@example.com"
+    )
+    db.flush()
+    out = _summary(db)
+    alice = next(
+        (o for o in out["owners"] if o["owner"] == "alice@example.com"), None
+    )
+    assert alice is not None
+    assert alice["open_count"] >= 2, "completed assessments must not count as open"
+    assert alice["outdated_count"] >= 1

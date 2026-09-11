@@ -11,10 +11,19 @@ from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
     AssessmentResponse,
+    AssessmentSummaryResponse,
     TemplateResponse,
     template_key,
 )
 from fides.common.scope_registry import SYSTEM_READ
+
+# Status values that make an assessment "open" work — matches AssessmentStatus
+# in src/fides/api/models/privacy_assessment.py (Ethyca-authored; not imported
+# here to avoid coupling this read-only module to that ORM setup). Mirrors the
+# segmentForAssessment()/isOpen logic in
+# clients/admin-ui/src/mocks/privacy-assessments/compute-summary.ts.
+_OPEN_STATUSES = {"in_progress", "outdated"}
+_UNCATEGORIZED_GROUP_KEY = "__uncategorized__"
 
 _TEMPLATE_SQL = sqlalchemy.text(
     """
@@ -60,15 +69,92 @@ def _list_templates(db: Session) -> list[TemplateResponse]:
     ]
 
 
+def _segment_for_row(row) -> str:
+    # Port of segmentForAssessment() in compute-summary.ts. status values are
+    # AssessmentStatus ("in_progress" | "completed" | "outdated" |
+    # "generating"); risk_level values are RiskLevel ("high" | "medium" |
+    # "low") — both verified against src/fides/api/models/privacy_assessment.py.
+    status_value = row["status"]
+    if status_value == "completed":
+        return "completed"
+    if status_value == "generating":
+        return "pending"
+    if status_value in _OPEN_STATUSES:
+        return "risk" if row["risk_level"] == "high" else "open"
+    # Unexpected status value: the TS switch is exhaustive over the 4-member
+    # enum and would fail to compile on a 5th; there is no such compile-time
+    # guarantee here, so fall back to "open" rather than raising in
+    # production on a value this module doesn't recognise.
+    return "open"
+
+
 def _summary(db: Session) -> dict:
+    # Port of computeSummary() in
+    # clients/admin-ui/src/mocks/privacy-assessments/compute-summary.ts — the
+    # shipped reference implementation for AssessmentSummaryResponse. Fix
+    # round 1: the original draft invented a {total, by_status,
+    # by_risk_level} shape instead of reading this contract; every field
+    # below (total, by_segment, blocked_groups, owners) is derivable from
+    # columns _ASSESSMENT_SQL already selects (status, risk_level, data_use,
+    # data_use_name, created_by), so nothing here is a stand-in.
     rows = _list_assessments(db)
-    by_status: dict = {}
-    by_risk: dict = {}
+    by_segment = {"completed": 0, "pending": 0, "open": 0, "risk": 0}
+    groups: dict = {}
+    owners: dict = {}
+    total = 0
+
     for row in rows:
-        by_status[row["status"]] = by_status.get(row["status"], 0) + 1
-        if row["risk_level"]:
-            by_risk[row["risk_level"]] = by_risk.get(row["risk_level"], 0) + 1
-    return {"total": len(rows), "by_status": by_status, "by_risk_level": by_risk}
+        total += 1
+        by_segment[_segment_for_row(row)] += 1
+
+        group_key = row["data_use"] or _UNCATEGORIZED_GROUP_KEY
+        group = groups.setdefault(
+            group_key,
+            {
+                "name": row["data_use_name"] or "Uncategorized",
+                "outdated_count": 0,
+                "high_risk_count": 0,
+                "total_count": 0,
+            },
+        )
+        group["total_count"] += 1
+        if row["risk_level"] == "high":
+            group["high_risk_count"] += 1
+        is_outdated = row["status"] == "outdated"
+        if is_outdated:
+            group["outdated_count"] += 1
+
+        if row["status"] in _OPEN_STATUSES and row["created_by"]:
+            owner = owners.setdefault(
+                row["created_by"],
+                {
+                    "owner": row["created_by"],
+                    "open_count": 0,
+                    "outdated_count": 0,
+                },
+            )
+            owner["open_count"] += 1
+            if is_outdated:
+                owner["outdated_count"] += 1
+
+    blocked_groups = [
+        g
+        for g in groups.values()
+        if g["outdated_count"] > 0 or g["high_risk_count"] > 0
+    ]
+    blocked_groups.sort(
+        key=lambda g: g["outdated_count"] + g["high_risk_count"], reverse=True
+    )
+    owners_list = sorted(
+        owners.values(), key=lambda o: o["open_count"], reverse=True
+    )
+
+    return {
+        "total": total,
+        "by_segment": by_segment,
+        "blocked_groups": blocked_groups,
+        "owners": owners_list,
+    }
 
 
 def _assessment_to_response(row) -> AssessmentResponse:
@@ -111,9 +197,10 @@ def list_assessments(
 @privacycare_router.get(
     "/summary",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=AssessmentSummaryResponse,
 )
-def assessment_summary(*, db: Session = Depends(get_db)) -> dict:
-    return _summary(db)
+def assessment_summary(*, db: Session = Depends(get_db)) -> AssessmentSummaryResponse:
+    return AssessmentSummaryResponse(**_summary(db))
 
 
 @privacycare_router.get(

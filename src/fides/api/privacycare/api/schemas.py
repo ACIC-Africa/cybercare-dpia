@@ -4,7 +4,7 @@
 # clients/admin-ui/src/types/api/models/. The shipped admin-UI is compiled
 # against those types, so this file does not get to choose its own shape.
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -43,6 +43,39 @@ class TemplateResponse(BaseModel):
     legal_reference: Optional[str] = None
     description: Optional[str] = None
     is_active: Optional[bool] = True
+
+
+class AssessmentSummaryBlockedGroup(BaseModel):
+    # Mirrors AssessmentSummaryBlockedGroup in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. This type is
+    # hand-authored in the admin-UI feature module, NOT generated into
+    # clients/admin-ui/src/types/api/models/ — do not look for it there.
+    name: str
+    outdated_count: int
+    high_risk_count: int
+    total_count: int
+
+
+class AssessmentSummaryOwner(BaseModel):
+    # Mirrors AssessmentSummaryOwner in the same feature types.ts file.
+    owner: str
+    open_count: int
+    outdated_count: int
+
+
+class AssessmentSummaryResponse(BaseModel):
+    # Mirrors AssessmentSummaryResponse in the same feature types.ts file.
+    # Fix-round-1 finding: an earlier draft of this endpoint invented a
+    # {total, by_status, by_risk_level} shape instead of reading this
+    # contract. by_segment buckets into exactly the 4
+    # AssessmentSummarySegment values ("completed" | "pending" | "open" |
+    # "risk"); see _summary() in api/assessments.py for the derivation,
+    # which follows clients/admin-ui/src/mocks/privacy-assessments/
+    # compute-summary.ts (the shipped reference implementation).
+    total: int
+    by_segment: Dict[str, int]
+    blocked_groups: List[AssessmentSummaryBlockedGroup]
+    owners: List[AssessmentSummaryOwner]
 
 
 def template_key(name: str, id: Optional[str] = None) -> str:
