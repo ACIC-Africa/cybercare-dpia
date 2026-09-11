@@ -57,3 +57,35 @@ class BusinessProcess:
     # its map is anchored on systems, which can be scanned, while a process
     # exists only once a consultant has written it down.
     __table__ = business_process_table
+
+
+from sqlalchemy import ForeignKey, UniqueConstraint
+
+process_declaration_table = Table(
+    "privacycare_process_declaration",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column(
+        "business_process_id",
+        String(255),
+        ForeignKey("privacycare_business_process.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # No FK: privacydeclaration's lifecycle belongs to upstream Fides. The read
+    # path skips links whose declaration has gone.
+    Column("privacy_declaration_id", String(255), nullable=False, index=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+    UniqueConstraint(
+        "business_process_id",
+        "privacy_declaration_id",
+        name="uq_privacycare_process_declaration",
+    ),
+)
+
+
+@mapper_registry.mapped
+class ProcessDeclaration:
+    # The ROPA edge: this business process processes data under that
+    # declaration. Projects onto edge_process_handles_data in phase 3.
+    __table__ = process_declaration_table

@@ -53,3 +53,38 @@ def test_soft_delete_keeps_the_row(db):
     found = db.get(BusinessProcess, proc.id)
     assert found is not None, "a soft-deleted process must remain readable"
     assert found.deleted_at is not None
+
+
+from fides.api.privacycare.models import ProcessDeclaration
+
+
+def test_process_links_to_declarations(db):
+    proc = BusinessProcess(name="Customer Onboarding")
+    db.add(proc)
+    db.flush()
+    link = ProcessDeclaration(
+        business_process_id=proc.id,
+        privacy_declaration_id="decl_stub_1",
+    )
+    db.add(link)
+    db.flush()
+    assert link.id
+
+
+def test_the_same_pair_cannot_be_linked_twice(db):
+    proc = BusinessProcess(name="Duplicate Link Test")
+    db.add(proc)
+    db.flush()
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id, privacy_declaration_id="decl_stub_2"
+        )
+    )
+    db.flush()
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id, privacy_declaration_id="decl_stub_2"
+        )
+    )
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        db.flush()
