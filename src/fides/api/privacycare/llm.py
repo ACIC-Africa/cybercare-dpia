@@ -43,6 +43,11 @@ def complete(
         max_tokens: completion cap.
         system: optional system prompt.
 
+    Returns:
+        The concatenated `text` fields of the response's content blocks
+        whose `type` is `"text"`, in order. Non-text blocks (e.g.
+        `tool_use`) are dropped.
+
     Raises:
         GatewayUnavailable: on any non-200 response or transport error.
     """
@@ -69,4 +74,7 @@ def complete(
             f"gateway returned {response.status_code}: {response.text[:200]}"
         )
 
-    return response.json()["content"]
+    blocks = response.json()["content"]
+    return "".join(
+        block["text"] for block in blocks if block.get("type") == "text"
+    )
