@@ -45,7 +45,21 @@ class TemplateResponse(BaseModel):
     is_active: Optional[bool] = True
 
 
-def template_key(name: str) -> str:
+def template_key(name: str, id: Optional[str] = None) -> str:
     # Derive the `key` the UI contract requires but the table does not store.
     # Lowercase, non-alphanumerics collapsed to underscores, trimmed.
-    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    #
+    # A name that is empty or made entirely of punctuation (`""`, `"!!!"`,
+    # `"---"`) collapses to "" here. An empty string satisfies Pydantic's bare
+    # `str`, so it would pass silently and every such template would collide
+    # on the same key. Guarantee a non-empty, stable result instead: fall
+    # back to a slug of `id` (always present, always unique), and only fall
+    # back further to a fixed placeholder if even that yields nothing.
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if slug:
+        return slug
+    if id:
+        id_slug = re.sub(r"[^a-z0-9]+", "_", str(id).lower()).strip("_")
+        if id_slug:
+            return id_slug
+    return "template"
