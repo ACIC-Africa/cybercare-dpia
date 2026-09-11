@@ -17,6 +17,18 @@ _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
 def register() -> None:
+    """Append privacycare_router to app_setup.ROUTERS.
+
+    MUST be called — and must complete — before `fides.api.main` is
+    imported anywhere in the process. `fides.api.main` builds and caches
+    `app` at import time via `create_fides_app()`, whose router list is a
+    mutable default bound to this same `ROUTERS` object at function-definition
+    time: the append only reaches the built app if it happens first. Import
+    `fides.api.main` before this runs and the cached app silently has none
+    of our routes, with nothing raising to say so. See
+    `fides/api/privacycare/asgi.py` for the entrypoint that gets this
+    ordering right, and why it is marked `isort: skip_file`.
+    """
     # Idempotent: importing twice must not register the router twice.
     from fides.api import app_setup
 
