@@ -5,10 +5,12 @@ import pathlib
 import re
 
 from fides.api.privacycare.api.schemas import (
+    AssessmentEvidenceResponse,
     AssessmentResponse,
     AssessmentSummaryBlockedGroup,
     AssessmentSummaryOwner,
     AssessmentSummaryResponse,
+    EvidenceItem,
     TemplateResponse,
     template_key,
 )
@@ -141,6 +143,49 @@ def test_the_feature_types_file_was_actually_read():
     assert len(_feature_interface_fields("AssessmentSummaryResponse")) == 4
     assert len(_feature_interface_fields("AssessmentSummaryBlockedGroup")) == 4
     assert len(_feature_interface_fields("AssessmentSummaryOwner")) == 3
+
+
+def test_evidence_item_matches_the_shipped_contract():
+    # Plan 05's brief told an implementer to return an empty list from the
+    # evidence endpoint and "not invent an evidence table" — that guidance
+    # was wrong (evidence lives on answer_version.evidence) and inventing a
+    # response shape instead of reading EvidenceItem here was caught twice
+    # already in this plan. This is the guard against a third invented shape.
+    assert set(EvidenceItem.model_fields) == _feature_interface_fields(
+        "EvidenceItem"
+    )
+
+
+def test_evidence_item_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "EvidenceItem"
+    ).items():
+        pydantic_required = EvidenceItem.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_assessment_evidence_response_matches_the_shipped_contract():
+    assert set(
+        AssessmentEvidenceResponse.model_fields
+    ) == _feature_interface_fields("AssessmentEvidenceResponse")
+
+
+def test_assessment_evidence_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "AssessmentEvidenceResponse"
+    ).items():
+        pydantic_required = AssessmentEvidenceResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_evidence_feature_types_were_actually_read():
+    # Same guard as test_the_feature_types_file_was_actually_read: a bad
+    # path or regex would make the parity tests above compare empty sets
+    # and pass vacuously.
+    assert len(_feature_interface_fields("EvidenceItem")) == 9
+    assert len(_feature_interface_fields("AssessmentEvidenceResponse")) == 5
 
 
 def test_template_key_derives_a_slug_from_a_normal_name():

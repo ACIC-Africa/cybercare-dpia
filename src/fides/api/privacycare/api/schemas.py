@@ -78,6 +78,56 @@ class AssessmentSummaryResponse(BaseModel):
     owners: List[AssessmentSummaryOwner]
 
 
+class EvidenceItem(BaseModel):
+    # Mirrors EvidenceItem in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts.
+    #
+    # `answer_version.evidence` is JSONB, NOT NULL, server_default '{}' (an
+    # empty *object*, not an array) — verified against the live migration
+    # (xx_2026_02_05_1500_b2c3d4e5f6g7_add_privacy_assessment_schema.py).
+    # No write path in this repo populates it yet (the writer lands in plan
+    # 04) and the live `fides` database has zero answer_version rows, so
+    # this shape is matched against the UI contract, not against observed
+    # data — see task-5-report.md for what was actually checked.
+    id: str
+    type: str
+    value: Optional[str] = None
+    created_at: str
+    field_name: Optional[str] = None
+    source_key: Optional[str] = None
+    source_type: Optional[str] = None
+    # TS types this `number | null` with no `?` — the key is always present,
+    # only its value may be null. No default: an omitted key must fail
+    # validation the same way it would fail the UI's required-field parity.
+    citation_number: Optional[int]
+    data: Optional[Dict] = None
+
+
+class QuestionEvidence(BaseModel):
+    # Mirrors QuestionEvidence in the same feature types.ts file. Exists for
+    # AssessmentEvidenceResponse.by_question field-for-field parity; nothing
+    # in this plan populates it (see AssessmentEvidenceResponse below).
+    question_id: str
+    question_text: str
+    evidence: List[EvidenceItem]
+
+
+class AssessmentEvidenceResponse(BaseModel):
+    # Mirrors AssessmentEvidenceResponse in the same feature types.ts file.
+    # by_question/by_type (driven by GetAssessmentEvidenceParams.group_by)
+    # are left unpopulated: useGetAssessmentEvidenceQuery is exported from
+    # the RTK slice but no shipped UI component calls it yet (AssessmentDetail
+    # derives evidence client-side from question_groups instead), so there is
+    # no consumer to validate a grouping implementation against. Only the
+    # flat `items` list — the shape every other EvidenceItem consumer
+    # (EvidenceCardGroup, EvidenceDrawer) actually reads — is populated here.
+    assessment_id: str
+    total_count: int
+    by_question: Optional[Dict[str, QuestionEvidence]] = None
+    by_type: Optional[Dict[str, List[EvidenceItem]]] = None
+    items: Optional[List[EvidenceItem]] = None
+
+
 def template_key(name: str, id: Optional[str] = None) -> str:
     # Derive the `key` the UI contract requires but the table does not store.
     # Lowercase, non-alphanumerics collapsed to underscores, trimmed.

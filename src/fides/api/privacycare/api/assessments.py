@@ -10,6 +10,7 @@ from fides.api.deps import get_db
 from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
+    AssessmentEvidenceResponse,
     AssessmentResponse,
     AssessmentSummaryResponse,
     TemplateResponse,
@@ -47,8 +48,125 @@ _ASSESSMENT_SQL = sqlalchemy.text(
 )
 
 
+_QUESTION_SQL = sqlalchemy.text(
+    """
+    SELECT q.id, q.requirement_key, q.requirement_title, q.group_order,
+           q.question_key, q.question_text, q.guidance, q.question_order,
+           q.required, a.id AS answer_id,
+           av.answer_status, av.answer_text, av.answer_source
+    FROM assessment_question q
+    JOIN privacy_assessment pa ON pa.template_id = q.template_id
+    LEFT JOIN assessment_answer a
+           ON a.question_id = q.id AND a.assessment_id = pa.id
+    LEFT JOIN answer_version av ON av.id = a.current_version_id
+    WHERE pa.id = :assessment_id
+    ORDER BY q.group_order, q.requirement_key, q.question_order, q.id
+    """
+)
+
+# `assessment_answer` carries no status/text/evidence of its own (verified
+# against the live schema) — everything content-bearing lives on the
+# `answer_version` a given answer's `current_version_id` points at, so every
+# evidence read has to join through it. `evidence`/`source_references` are
+# JSONB NOT NULL columns whose server_default is the empty object '{}';
+# excluding that exact default is how we tell "no evidence recorded" apart
+# from "evidence recorded but genuinely empty" without a nullability check
+# the column doesn't offer.
+_EVIDENCE_SQL = sqlalchemy.text(
+    """
+    SELECT a.question_id, av.evidence, av.source_references,
+           av.answer_source, av.created_by, av.created_at, av.updated_at
+    FROM assessment_answer a
+    JOIN answer_version av ON av.id = a.current_version_id
+    WHERE a.assessment_id = :assessment_id
+      AND av.evidence IS NOT NULL
+      AND av.evidence != '{}'::jsonb
+    ORDER BY a.question_id, av.created_at
+    """
+)
+
+
 def _list_assessments(db: Session):
     return db.execute(_ASSESSMENT_SQL).mappings().all()
+
+
+def _questions_for(db: Session, assessment_id: str) -> list[dict]:
+    groups: list[dict] = []
+    index: dict = {}
+    for row in db.execute(
+        _QUESTION_SQL, {"assessment_id": assessment_id}
+    ).mappings():
+        key = row["requirement_key"]
+        if key not in index:
+            index[key] = {
+                "requirement_key": key,
+                "requirement_title": row["requirement_title"],
+                "group_order": row["group_order"],
+                "questions": [],
+            }
+            groups.append(index[key])
+        index[key]["questions"].append(
+            {
+                "id": row["id"],
+                "question_key": row["question_key"],
+                "question_text": row["question_text"],
+                "guidance": row["guidance"],
+                "question_order": row["question_order"],
+                "required": row["required"],
+                "answer_id": row["answer_id"],
+                "answer_status": row["answer_status"],
+                "answer_text": row["answer_text"],
+                "answer_source": row["answer_source"],
+            }
+        )
+    return groups
+
+
+def _as_str(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
+    # `answer_version.evidence` has no writer in this repo yet (that lands in
+    # plan 04) and the live `fides` database has zero answer_version rows, so
+    # there is no observed payload to shape this against. Its column default
+    # is a JSON *object* (not an array), which matches one EvidenceItem per
+    # answer_version rather than a list of them — so each qualifying row is
+    # treated as a single EvidenceItem-shaped payload. A payload that lacks
+    # the two fields EvidenceItem requires (`id`, `type`) is skipped rather
+    # than papered over with invented values.
+    items: list[dict] = []
+    for row in db.execute(
+        _EVIDENCE_SQL, {"assessment_id": assessment_id}
+    ).mappings():
+        payload = row["evidence"]
+        if not isinstance(payload, dict) or "id" not in payload or "type" not in payload:
+            continue
+        items.append(
+            {
+                "id": payload["id"],
+                "type": payload["type"],
+                "value": payload.get("value"),
+                "created_at": payload.get("created_at")
+                or _as_str(row["created_at"])
+                or _as_str(row["updated_at"]),
+                "field_name": payload.get("field_name"),
+                "source_key": payload.get("source_key"),
+                "source_type": payload.get("source_type"),
+                "citation_number": payload.get("citation_number"),
+                "data": payload.get("data"),
+            }
+        )
+    return items
+
+
+def _evidence_for(db: Session, assessment_id: str) -> dict:
+    items = _evidence_items_for(db, assessment_id)
+    return {
+        "assessment_id": assessment_id,
+        "total_count": len(items),
+        "items": items,
+    }
 
 
 def _list_templates(db: Session) -> list[TemplateResponse]:
@@ -235,13 +353,16 @@ def get_assessment(
     "/{assessment_id}/questions",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
 )
-def get_questions(assessment_id: str) -> list:
-    return []
+def get_questions(assessment_id: str, *, db: Session = Depends(get_db)) -> list:
+    return _questions_for(db, assessment_id)
 
 
 @privacycare_router.get(
     "/{assessment_id}/evidence",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=AssessmentEvidenceResponse,
 )
-def get_evidence(assessment_id: str) -> list:
-    return []
+def get_evidence(
+    assessment_id: str, *, db: Session = Depends(get_db)
+) -> AssessmentEvidenceResponse:
+    return AssessmentEvidenceResponse(**_evidence_for(db, assessment_id))

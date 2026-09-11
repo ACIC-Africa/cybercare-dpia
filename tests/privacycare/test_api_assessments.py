@@ -1,4 +1,5 @@
 # Endpoint behaviour against real rows. Inserts are rolled back.
+import json
 import uuid
 
 import pytest
@@ -7,8 +8,10 @@ from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.assessments import (
     _assessment_to_response,
+    _evidence_for,
     _list_assessments,
     _list_templates,
+    _questions_for,
     _summary,
 )
 
@@ -237,3 +240,149 @@ def test_summary_owners_aggregate_open_assessments(db):
     assert alice is not None
     assert alice["open_count"] >= 2, "completed assessments must not count as open"
     assert alice["outdated_count"] >= 1
+
+
+def _seed_question(db, template_id: str, key: str, group: str, order: int) -> str:
+    qid = f"q_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO assessment_question "
+            "(id, template_id, requirement_key, requirement_title, group_order, "
+            " question_key, question_text, question_order, required) "
+            "VALUES (:id, :tid, :rk, :rt, :go, :qk, 'Is this processing necessary?', 1, true)"
+        ),
+        {"id": qid, "tid": template_id, "rk": group, "rt": group.title(),
+         "go": order, "qk": key},
+    )
+    return qid
+
+
+def test_questions_are_grouped_by_requirement(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Grouped DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_question(db, tid, "q3", "security", 2)
+    db.flush()
+    groups = _questions_for(db, aid)
+    keys = [g["requirement_key"] for g in groups]
+    assert keys == ["necessity", "security"], "groups must be ordered by group_order"
+    assert len(groups[0]["questions"]) == 2
+
+
+def test_unknown_assessment_yields_no_groups(db):
+    assert _questions_for(db, "nope") == []
+
+
+def _seed_answer_with_evidence(
+    db,
+    assessment_id: str,
+    question_id: str,
+    evidence: dict,
+    *,
+    answer_source: str = "ai_analysis",
+    created_by: str = "ai@cybota.com",
+) -> str:
+    # assessment_answer <-> answer_version is a circular FK (verified against
+    # the live migration): the answer row has to exist before a version can
+    # point back at it via answer_id, and current_version_id has to be
+    # backfilled afterward. `evidence` is JSONB — CAST is required because a
+    # bound text parameter has no implicit cast to jsonb in Postgres.
+    answer_id = f"aa_{uuid.uuid4().hex[:8]}"
+    version_id = f"av_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO assessment_answer (id, assessment_id, question_id) "
+            "VALUES (:id, :assessment_id, :question_id)"
+        ),
+        {"id": answer_id, "assessment_id": assessment_id, "question_id": question_id},
+    )
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO answer_version "
+            "(id, answer_id, answer_status, answer_source, change_type, "
+            " created_by, evidence) "
+            "VALUES (:id, :answer_id, 'complete', :answer_source, 'ai_generated', "
+            " :created_by, CAST(:evidence AS JSONB))"
+        ),
+        {
+            "id": version_id,
+            "answer_id": answer_id,
+            "answer_source": answer_source,
+            "created_by": created_by,
+            "evidence": json.dumps(evidence),
+        },
+    )
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_answer SET current_version_id = :version_id "
+            "WHERE id = :id"
+        ),
+        {"version_id": version_id, "id": answer_id},
+    )
+    return answer_id
+
+
+def test_evidence_is_empty_when_no_answer_has_recorded_evidence(db):
+    # `evidence` is JSONB NOT NULL with server_default '{}' — an answer that
+    # never had evidence attached still has a row, just with the untouched
+    # default. That must not surface as an evidence item.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No Evidence DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(db, aid, qid, {})
+    db.flush()
+    assert _evidence_for(db, aid) == {
+        "assessment_id": aid,
+        "total_count": 0,
+        "items": [],
+    }
+
+
+def test_evidence_returns_real_rows_from_answer_version(db):
+    # The earlier draft of this plan stubbed this endpoint to `[]` and told
+    # the implementer not to invent an evidence table. That was wrong:
+    # evidence lives on answer_version.evidence. This asserts it is actually
+    # read and returned, not stubbed.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Evidence DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(
+        db,
+        aid,
+        qid,
+        {
+            "id": "ev_1",
+            "type": "ai_analysis",
+            "value": "System X processes payroll data.",
+            "created_at": "2026-09-01T00:00:00+00:00",
+            "field_name": "data_categories",
+            "source_type": "system",
+            "citation_number": 1,
+        },
+        answer_source="ai_analysis",
+        created_by="scribe@cybota.com",
+    )
+    db.flush()
+    out = _evidence_for(db, aid)
+    assert out["assessment_id"] == aid
+    assert out["total_count"] == 1
+    item = out["items"][0]
+    assert item["id"] == "ev_1"
+    assert item["type"] == "ai_analysis"
+    assert item["value"] == "System X processes payroll data."
+    assert item["field_name"] == "data_categories"
+    assert item["source_type"] == "system"
+    assert item["citation_number"] == 1
+
+
+def test_evidence_skips_payloads_missing_the_fields_evidenceitem_requires(db):
+    # A JSON object in `evidence` that doesn't carry `id`/`type` cannot be
+    # turned into an EvidenceItem without inventing values, so it is
+    # dropped rather than papered over.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Malformed Evidence DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(db, aid, qid, {"value": "no id or type here"})
+    db.flush()
+    assert _evidence_for(db, aid)["items"] == []
