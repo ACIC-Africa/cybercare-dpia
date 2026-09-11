@@ -497,6 +497,30 @@ def pytest_misc_unit(session: Session, pytest_config: PytestConfig) -> None:
         "/opt/fides/bin/python",
         "pytest",
         *pytest_config.args,
+        # tests/privacycare/ MUST be listed first, ahead of every tests/fides/
+        # directory below. pytest collects command-line paths in the order
+        # given, and tests/fides/conftest.py does `from fides.api.main import
+        # app` at collection time — the same import-order hazard
+        # fides/api/privacycare/asgi.py documents: whichever module imports
+        # fides.api.main first permanently caches its `app` (and, in a local
+        # dev environment, its already-resolved DB/Redis config) for the rest
+        # of the process. tests/privacycare/conftest.py imports
+        # fides.api.privacycare.asgi (which registers PrivacyCare's router
+        # before touching fides.api.main) — but only if it runs first.
+        # Verified empirically: with tests/fides/common/ listed before
+        # tests/privacycare/, the PrivacyCare route-registration and
+        # TestClient tests fail (routes missing / DB host unresolvable);
+        # with tests/privacycare/ first, both pass. This ordering requirement
+        # is package-internal to this pytest invocation, not something a
+        # human running `pytest tests/privacycare/` alone would ever hit.
+        "tests/privacycare/",
+        # PrivacyCare's own suite (tests/privacycare/) is not under
+        # tests/fides/ and so is invisible to TEST_MATRIX/TEST_DIRECTORY_COVERAGE
+        # and testpaths (pyproject.toml) alike — nothing in CI ran it before
+        # this line. misc-unit is the smallest-diff home for it: no new
+        # TEST_GROUPS entry, no workflow matrix change, and its "unit, no
+        # external services beyond the shared Postgres/Redis this session
+        # already starts" profile matches the other directories here.
         "tests/fides/common/",
         "tests/fides/config/",
         "tests/fides/service/",

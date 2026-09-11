@@ -33,8 +33,11 @@ register()
 # any *other* process — a test file, a script, a REPL — that imports
 # `fides.api.main` directly before anything imports this module, since that
 # permanently caches a routeless `app` in `sys.modules` for the rest of that
-# process. `tests/privacycare/test_api_registration.py` sorts alphabetically
-# before the other test files in this package for exactly this reason.
+# process. `tests/privacycare/conftest.py` imports this module before any
+# test in the package is collected, regardless of file name or which single
+# test file pytest was asked to run — that is what actually guarantees this
+# ordering now (alphabetical-sort-of-the-first-test-file was never a real
+# guarantee and stopped being true once more test files were added).
 from fides.api.main import app  # noqa: E402  (import order is the point)
 
 __all__ = ["app"]

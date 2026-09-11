@@ -1,6 +1,4 @@
 # Read endpoints for the DPIA engine.
-from typing import List
-
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security, status
 from fastapi_pagination import Page, Params, paginate
@@ -32,10 +30,17 @@ _TEMPLATE_SQL = sqlalchemy.text(
     SELECT id, version, name, assessment_type, region, authority,
            legal_reference, description, is_active
     FROM assessment_template
-    ORDER BY name, version
+    ORDER BY name, version, id
     """
 )
 
+# No tenant/organisation filter below — by design, per spec decision D14
+# (docs/superpowers/specs/2026-09-11-privacycare-design.md): "PrivacyCare
+# deploys SINGLE-TENANT — one instance per client." This query is correct
+# ONLY because the database backing it holds exactly one client's data.
+# If PrivacyCare is ever deployed multi-tenant against a shared database,
+# this query leaks every client's assessments to every other client —
+# nothing in the SQL itself would stop it.
 _ASSESSMENT_SQL = sqlalchemy.text(
     """
     SELECT pa.id, pa.template_id, t.name AS template_name, pa.name, pa.status,
@@ -49,6 +54,10 @@ _ASSESSMENT_SQL = sqlalchemy.text(
 )
 
 
+# No tenant/organisation filter below — same D14 basis as _ASSESSMENT_SQL
+# above: correct only because this deployment is single-tenant (one
+# PrivacyCare instance per client). A shared-database deployment would let
+# this join return another client's questions/answers for any assessment id.
 _QUESTION_SQL = sqlalchemy.text(
     """
     SELECT q.id, q.requirement_key, q.requirement_title, q.group_order,
@@ -73,6 +82,11 @@ _QUESTION_SQL = sqlalchemy.text(
 # excluding that exact default is how we tell "no evidence recorded" apart
 # from "evidence recorded but genuinely empty" without a nullability check
 # the column doesn't offer.
+#
+# No tenant/organisation filter below either — same D14 basis as
+# _ASSESSMENT_SQL/_QUESTION_SQL above: correct only because this deployment
+# is single-tenant. If that ever changes, this is evidence — the exact
+# regulatory record a DPIA audit exists to protect — leaking across clients.
 _EVIDENCE_SQL = sqlalchemy.text(
     """
     SELECT a.question_id, av.evidence, av.source_references,
@@ -301,9 +315,6 @@ def _summary(db: Session) -> dict:
 
 
 def _assessment_to_response(row) -> AssessmentResponse:
-    def as_str(value):
-        return value.isoformat() if hasattr(value, "isoformat") else value
-
     return AssessmentResponse(
         id=row["id"],
         template_id=row["template_id"],
@@ -320,8 +331,8 @@ def _assessment_to_response(row) -> AssessmentResponse:
         data_use_name=row["data_use_name"],
         data_categories=list(row["data_categories"] or []),
         created_by=row["created_by"],
-        created_at=as_str(row["created_at"]),
-        updated_at=as_str(row["updated_at"]),
+        created_at=_as_str(row["created_at"]),
+        updated_at=_as_str(row["updated_at"]),
     )
 
 
@@ -349,10 +360,17 @@ def assessment_summary(*, db: Session = Depends(get_db)) -> AssessmentSummaryRes
 @privacycare_router.get(
     "/templates",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
-    response_model=List[TemplateResponse],
+    response_model=Page[TemplateResponse],
 )
-def list_templates(*, db: Session = Depends(get_db)) -> List[TemplateResponse]:
-    return _list_templates(db)
+def list_templates(
+    *, db: Session = Depends(get_db), params: Params = Depends()
+) -> Page[TemplateResponse]:
+    # The admin-UI's RTK slice types this response as Page_TemplateResponse_
+    # and GenerateAssessmentsModal reads templatesData?.items — a bare list
+    # left the modal with nothing to render. paginate() here matches
+    # list_assessments() above, which the UI already reads correctly.
+    rows = _list_templates(db)
+    return paginate(rows, params)
 
 
 @privacycare_router.get(
