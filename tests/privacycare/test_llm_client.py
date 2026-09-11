@@ -104,9 +104,16 @@ def test_module_never_imports_an_llm_sdk():
     import pathlib
 
     src = pathlib.Path(__file__).parents[2] / "src" / "fides" / "api" / "privacycare"
+    assert src.is_dir(), (
+        f"{src} does not exist — if the package moved, this guard is "
+        "scanning nothing and passing vacuously; update the path"
+    )
+    scanned = 0
     for path in src.rglob("*.py"):
+        scanned += 1
         text = path.read_text()
         for token in FORBIDDEN_IMPORTS:
             assert token not in text, f"{path} imports an LLM SDK directly (matched {token!r})"
         for token in FORBIDDEN_HOSTS:
             assert token not in text, f"{path} addresses a model host directly (matched {token!r})"
+    assert scanned > 0, f"{src} contains no .py files — the guard scanned nothing"
