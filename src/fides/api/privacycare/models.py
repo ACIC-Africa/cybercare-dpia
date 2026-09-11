@@ -3,22 +3,23 @@
 # Deliberately NOT Fides' Base.metadata: keeping a separate MetaData means our
 # Alembic chain can never autogenerate a drop for a Fides table, and our models
 # are not registered in an Ethyca-authored module.
-from sqlalchemy import MetaData
-
-PRIVACYCARE_METADATA = MetaData()
-
 import uuid
 
 from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    ForeignKey,
+    MetaData,
     String,
     Table,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import registry
+
+PRIVACYCARE_METADATA = MetaData()
 
 mapper_registry = registry(metadata=PRIVACYCARE_METADATA)
 
@@ -58,8 +59,6 @@ class BusinessProcess:
     # exists only once a consultant has written it down.
     __table__ = business_process_table
 
-
-from sqlalchemy import ForeignKey, UniqueConstraint
 
 process_declaration_table = Table(
     "privacycare_process_declaration",

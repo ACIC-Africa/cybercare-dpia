@@ -7,7 +7,7 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.models import BusinessProcess
+from fides.api.privacycare.models import BusinessProcess, ProcessDeclaration
 
 
 @pytest.fixture
@@ -53,9 +53,6 @@ def test_soft_delete_keeps_the_row(db):
     found = db.get(BusinessProcess, proc.id)
     assert found is not None, "a soft-deleted process must remain readable"
     assert found.deleted_at is not None
-
-
-from fides.api.privacycare.models import ProcessDeclaration
 
 
 def test_process_links_to_declarations(db):

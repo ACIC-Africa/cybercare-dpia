@@ -93,3 +93,108 @@ def test_fides_and_privacycare_chains_are_separate():
         "PrivacyCare's migration chain — version_table may be misconfigured "
         "and pointing at the wrong table"
     )
+
+
+def test_c1_fides_autogenerate_would_not_drop_privacycare_tables():
+    # C1: the guard above runs in one direction only. Nobody checked the
+    # reverse: Fides' own `alembic revision --autogenerate`
+    # (src/fides/api/alembic/) compares the live database against
+    # `fides.api.db.base.Base.metadata` through
+    # `fides.api.db.database.include_object`, which excludes only the table
+    # names listed in `fides.api.db.database.EXCLUDED_TABLES` — three names,
+    # none of them ours (read from database.py, not guessed). PrivacyCare's
+    # tables are not in that set and are not part of Base.metadata, so
+    # without protection this comparison sees every privacycare_* table as
+    # removable and Fides' own autogenerate would emit
+    # `op.drop_table('privacycare_business_process')` the moment anyone
+    # adds a Fides-side model.
+    #
+    # We may never edit database.py (Ethyca-authored). EXCLUDED_TABLES is a
+    # plain, mutable `set` object, though, and include_object re-checks
+    # membership against it at call time rather than freezing a copy at
+    # import time — so fides.api.privacycare.fides_exclusion_guard
+    # registers our table names into that same set object from our own
+    # side, on import. Importing fides.api.privacycare below (as every
+    # other test in this package already does transitively) runs that
+    # guard. This test proves it actually closes the gap against a live
+    # database, using Fides' real include_object function — not a
+    # reimplementation that could drift from it.
+    #
+    # RESIDUAL RISK (see fides_exclusion_guard.py for the full docstring):
+    # the guard protects only a process that has imported
+    # fides.api.privacycare before Fides' autogenerate runs. Nothing under
+    # src/fides/ outside privacycare/ imports this package today, so a bare
+    # `fides db generate-migration` invoked from a process that never
+    # touches PrivacyCare code is NOT yet protected by this alone.
+    import fides.api.privacycare  # noqa: F401 -- activates fides_exclusion_guard
+    from alembic.autogenerate import compare_metadata
+    from alembic.runtime import migration
+
+    from fides.api.db.base import Base
+    from fides.api.db.database import include_object as fides_include_object
+
+    with _engine().connect() as connection:
+        migration_context = migration.MigrationContext.configure(
+            connection, opts={"include_object": fides_include_object}
+        )
+        diff = compare_metadata(migration_context, Base.metadata)
+
+    dropped_privacycare_tables = sorted(
+        op[1].name
+        for op in diff
+        if op[0] == "remove_table" and op[1].name.startswith("privacycare_")
+    )
+    assert dropped_privacycare_tables == [], (
+        "Fides' own autogenerate would drop PrivacyCare tables: "
+        f"{dropped_privacycare_tables} — fides_exclusion_guard did not "
+        "close the gap"
+    )
+
+
+def test_c2_privacycare_autogenerate_measures_zero_diff_ops():
+    # C2: env.py's "0 diff ops" claim was a comment recording a manual
+    # measurement taken on 2026-09-11, never re-checked by a test. An
+    # Alembic upgrade or a new model could silently void it. This
+    # re-measures it on every run, against the same include_object function
+    # PrivacyCare's own Alembic chain actually runs through (pulled out of
+    # env.py into include_object.py specifically so it can be imported
+    # without triggering env.py's live migration run — see that module).
+    #
+    # Also closes a separate blind spot: if a future PrivacyCare table were
+    # ever added to PRIVACYCARE_METADATA without the "privacycare_" prefix,
+    # include_object's prefix filter would silently treat it as a Fides
+    # table and it would never be created. Asserting every table in
+    # PRIVACYCARE_METADATA.tables is prefixed catches that before it ships.
+    from alembic.autogenerate import compare_metadata
+    from alembic.runtime import migration
+
+    from fides.api.privacycare.migrations.include_object import (
+        VERSION_TABLE,
+        include_object,
+    )
+    from fides.api.privacycare.models import PRIVACYCARE_METADATA
+
+    unprefixed = [
+        name
+        for name in PRIVACYCARE_METADATA.tables
+        if not name.startswith("privacycare_")
+    ]
+    assert unprefixed == [], (
+        f"table(s) {unprefixed} in PRIVACYCARE_METADATA do not start with "
+        "'privacycare_' — include_object's prefix filter would silently "
+        "skip them and they would never be created"
+    )
+
+    with _engine().connect() as connection:
+        migration_context = migration.MigrationContext.configure(
+            connection,
+            opts={"version_table": VERSION_TABLE, "include_object": include_object},
+        )
+        diff = compare_metadata(migration_context, PRIVACYCARE_METADATA)
+
+    remove_ops = [op for op in diff if op[0] in ("remove_table", "remove_index")]
+    assert remove_ops == [], (
+        "PrivacyCare's own autogenerate view of the live database is not "
+        f"clean (0 diff ops expected): "
+        f"{[(op[0], getattr(op[1], 'name', op[1])) for op in remove_ops]}"
+    )

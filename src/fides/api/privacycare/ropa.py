@@ -17,6 +17,7 @@ _DECLARATION_SQL = sqlalchemy.text(
     FROM privacydeclaration pd
     LEFT JOIN ctl_systems s ON s.id = pd.system_id
     WHERE pd.id = ANY(:ids)
+    ORDER BY pd.id
     """
 )
 

@@ -180,3 +180,73 @@ def test_a_mix_of_real_and_missing_links_does_not_interfere(db):
     assert len(entry.declarations) == 1
     assert entry.declarations[0].id == "decl_ropa_mixed"
     assert entry.missing_declarations == ["decl_ropa_mixed_missing"]
+
+
+def test_declaration_order_is_stable_across_calls(db):
+    # I5: the declaration query has no ORDER BY, so two renderings of the
+    # same Article 30 record could order entries differently and diff
+    # spuriously in a regulatory artifact. Deliberately insert declarations
+    # with ids that would sort differently than insertion order under
+    # anything but an explicit ORDER BY, to catch a regression back to
+    # whatever order Postgres happens to return.
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO ctl_systems (id, fides_key, name)
+            VALUES (:id, :fides_key, :name)
+            """
+        ),
+        {
+            "id": "sys_ropa_order",
+            "fides_key": "sys_ropa_order_key",
+            "name": "Order Stability Test System",
+        },
+    )
+    declaration_ids = ["decl_ropa_order_c", "decl_ropa_order_a", "decl_ropa_order_b"]
+    for decl_id in declaration_ids:
+        db.execute(
+            sqlalchemy.text(
+                """
+                INSERT INTO privacydeclaration (
+                    id, data_use, data_categories, data_subjects,
+                    legal_basis_for_processing, retention_period, system_id
+                )
+                VALUES (
+                    :id, :data_use, :data_categories, :data_subjects,
+                    :legal_basis_for_processing, :retention_period, :system_id
+                )
+                """
+            ),
+            {
+                "id": decl_id,
+                "data_use": "essential.service.operations",
+                "data_categories": ["user.contact.email"],
+                "data_subjects": ["customer"],
+                "legal_basis_for_processing": "Contract",
+                "retention_period": "1 year",
+                "system_id": "sys_ropa_order",
+            },
+        )
+    proc = BusinessProcess(name="Process With Multiple Linked Declarations")
+    db.add(proc)
+    db.flush()
+    for decl_id in declaration_ids:
+        db.add(
+            ProcessDeclaration(
+                business_process_id=proc.id,
+                privacy_declaration_id=decl_id,
+            )
+        )
+    db.flush()
+
+    first_call = [d.id for d in ropa_for_process(db, proc.id).declarations]
+    second_call = [d.id for d in ropa_for_process(db, proc.id).declarations]
+
+    assert first_call == second_call, (
+        "two renderings of the same ROPA entry ordered its declarations "
+        "differently"
+    )
+    assert first_call == sorted(declaration_ids), (
+        "declarations must come back ordered by id, not insertion or "
+        "database-arbitrary order"
+    )
