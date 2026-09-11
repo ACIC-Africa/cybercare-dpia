@@ -151,6 +151,110 @@ def test_c1_fides_autogenerate_would_not_drop_privacycare_tables():
     )
 
 
+def test_excluded_tables_holds_no_privacycare_entries():
+    """Regression test for a data-destruction hazard a previous fix of C1
+    introduced: `fides.api.db.database.EXCLUDED_TABLES` is dual-purpose —
+    `include_object` (database.py:44) reads it to filter autogenerate, but
+    `reset_db` (database.py:120-123) ALSO iterates it and runs
+    `DROP TABLE IF EXISTS {name} CASCADE` for every member. An earlier
+    version of fides_exclusion_guard registered our `privacycare_*` table
+    names into that set to close the autogenerate gap, which meant
+    `fides db reset` would CASCADE-drop every PrivacyCare table on any
+    process that had imported this package. The fix wraps
+    `include_object` instead of touching the set (see
+    fides_exclusion_guard.py's docstring). This test reads EXCLUDED_TABLES
+    directly — after privacycare has been imported — and asserts no member
+    starts with 'privacycare_', so nobody can reintroduce the destructive
+    version without this test catching it.
+    """
+    import fides.api.privacycare  # noqa: F401 -- ensure the guard has run
+    from fides.api.db.database import EXCLUDED_TABLES
+
+    privacycare_entries = sorted(
+        name for name in EXCLUDED_TABLES if name.startswith("privacycare_")
+    )
+    assert privacycare_entries == [], (
+        "privacycare_* table names were found in EXCLUDED_TABLES: "
+        f"{privacycare_entries} — this would make `fides db reset` "
+        "CASCADE-drop PrivacyCare tables (database.py:120-123)"
+    )
+    assert EXCLUDED_TABLES == {
+        "post_upgrade_background_migration_tasks",
+        "privacy_preferences_current",
+        "privacy_preferences_historic",
+    }, (
+        "EXCLUDED_TABLES no longer matches Fides' original three shipped "
+        f"entries: {sorted(EXCLUDED_TABLES)}"
+    )
+
+
+def test_fides_exclusion_guard_install_is_idempotent():
+    """The guard wraps `fides.api.db.database.include_object` by rebinding
+    the module attribute on import. If that install step were not
+    idempotent, importing the guard twice (or a reload) would treat the
+    already-wrapped function as "the original" and wrap it again — each
+    layer still correct in isolation, but silently losing the true Ethyca
+    original underneath a growing pile of our own wrappers, and doing
+    needless extra work on every autogenerate call forever. This proves
+    that invoking the guard's install step twice leaves exactly one layer
+    of wrapping in place: the true original stays directly reachable via
+    `__privacycare_original__`, the wrapper object itself is unchanged by
+    the second call, and the filter still behaves correctly (accepts
+    non-privacycare tables, rejects privacycare_* tables) without
+    recursing.
+    """
+    import fides.api.privacycare  # noqa: F401 -- ensure the guard has run at least once
+    from fides.api.db import database as fides_database
+    from fides.api.privacycare import fides_exclusion_guard
+
+    before = fides_database.include_object
+    assert getattr(before, "__privacycare_wrapped__", False) is True, (
+        "include_object was not wrapped by fides_exclusion_guard"
+    )
+    true_original = before.__privacycare_original__
+    assert not getattr(true_original, "__privacycare_wrapped__", False), (
+        "the captured 'original' is itself one of our wrappers — a prior "
+        "install() call already double-wrapped include_object"
+    )
+
+    # Invoke the install step a second time.
+    fides_exclusion_guard._install()
+
+    after = fides_database.include_object
+    assert after is before, (
+        "a second install() call replaced the wrapper instead of "
+        "no-op'ing — include_object was wrapped again"
+    )
+    assert after.__privacycare_original__ is true_original, (
+        "a second install() call rebound __privacycare_original__ — it "
+        "would now point at the first wrapper instead of the true Ethyca "
+        "original, meaning a third install() could stack indefinitely"
+    )
+
+    # The filter still behaves correctly and a single call returns
+    # promptly (does not recurse).
+    assert (
+        after(
+            object=None,
+            name="privacycare_business_process",
+            type_="table",
+            reflected=False,
+            compare_to=None,
+        )
+        is False
+    )
+    assert (
+        after(
+            object=None,
+            name="some_other_fides_table",
+            type_="table",
+            reflected=False,
+            compare_to=None,
+        )
+        is True
+    )
+
+
 def test_c2_privacycare_autogenerate_measures_zero_diff_ops():
     # C2: env.py's "0 diff ops" claim was a comment recording a manual
     # measurement taken on 2026-09-11, never re-checked by a test. An
