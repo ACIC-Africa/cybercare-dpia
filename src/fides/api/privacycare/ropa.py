@@ -3,7 +3,6 @@
 # PrivacyCare owns the process and the link. Fides owns the declaration and
 # the system. This module joins them without copying either.
 from dataclasses import dataclass, field
-from typing import Any
 
 import sqlalchemy
 from sqlalchemy.orm import Session
@@ -37,17 +36,27 @@ class RopaDeclaration:
 
 @dataclass
 class RopaEntry:
-    process: Any
+    process: BusinessProcess
     declarations: list[RopaDeclaration] = field(default_factory=list)
+    # Ids linked to this process that could not be resolved to a
+    # privacydeclaration row right now. This deliberately does not
+    # distinguish a declaration that existed and was later deleted from an
+    # id that was never valid in the first place — telling those apart
+    # would require a write-time existence check on the link, which is out
+    # of scope here.
     missing_declarations: list[str] = field(default_factory=list)
 
 
 def ropa_for_process(db: Session, business_process_id: str) -> RopaEntry:
     # Assemble the ROPA entry for one business process.
     #
-    # Raises LookupError if the process does not exist. Links pointing at a
-    # declaration that no longer exists are reported in `missing_declarations`
-    # rather than dropped — a dangling link is a finding, not a non-event.
+    # Raises LookupError if the process does not exist. Links whose id does
+    # not resolve to a privacydeclaration row right now are reported in
+    # `missing_declarations` rather than dropped — a dangling link is a
+    # finding, not a non-event. This does not distinguish a declaration that
+    # was deleted after the link was created from an id that was never
+    # valid; separating those would require a write-time existence check,
+    # which is out of scope here.
     process = db.get(BusinessProcess, business_process_id)
     if process is None:
         raise LookupError(f"no business process with id {business_process_id!r}")

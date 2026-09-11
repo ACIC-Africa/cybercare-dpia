@@ -50,3 +50,133 @@ def test_a_link_to_a_vanished_declaration_is_reported_not_crashed(db):
 def test_unknown_process_raises(db):
     with pytest.raises(LookupError):
         ropa_for_process(db, "no-such-process")
+
+
+def test_a_real_declaration_round_trips_with_system_and_categories(db):
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO ctl_systems (id, fides_key, name)
+            VALUES (:id, :fides_key, :name)
+            """
+        ),
+        {
+            "id": "sys_ropa_test",
+            "fides_key": "sys_ropa_test_key",
+            "name": "Loan Origination System",
+        },
+    )
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO privacydeclaration (
+                id, data_use, data_categories, data_subjects,
+                legal_basis_for_processing, retention_period, system_id
+            )
+            VALUES (
+                :id, :data_use, :data_categories, :data_subjects,
+                :legal_basis_for_processing, :retention_period, :system_id
+            )
+            """
+        ),
+        {
+            "id": "decl_ropa_test",
+            "data_use": "essential.service.operations",
+            "data_categories": [
+                "user.contact.email",
+                "user.financial.account_number",
+            ],
+            "data_subjects": ["customer", "employee"],
+            "legal_basis_for_processing": "Contract",
+            "retention_period": "7 years",
+            "system_id": "sys_ropa_test",
+        },
+    )
+    proc = BusinessProcess(name="Loan Origination")
+    db.add(proc)
+    db.flush()
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id,
+            privacy_declaration_id="decl_ropa_test",
+        )
+    )
+    db.flush()
+
+    entry = ropa_for_process(db, proc.id)
+
+    assert entry.missing_declarations == []
+    assert len(entry.declarations) == 1
+    decl = entry.declarations[0]
+    assert decl.id == "decl_ropa_test"
+    assert decl.data_use == "essential.service.operations"
+    assert decl.data_categories == [
+        "user.contact.email",
+        "user.financial.account_number",
+    ]
+    assert decl.data_subjects == ["customer", "employee"]
+    assert decl.legal_basis == "Contract"
+    assert decl.retention_period == "7 years"
+    assert decl.system_id == "sys_ropa_test"
+    assert decl.system_name == "Loan Origination System"
+
+
+def test_a_mix_of_real_and_missing_links_does_not_interfere(db):
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO ctl_systems (id, fides_key, name)
+            VALUES (:id, :fides_key, :name)
+            """
+        ),
+        {
+            "id": "sys_ropa_mixed",
+            "fides_key": "sys_ropa_mixed_key",
+            "name": "Mixed Test System",
+        },
+    )
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO privacydeclaration (
+                id, data_use, data_categories, data_subjects,
+                legal_basis_for_processing, retention_period, system_id
+            )
+            VALUES (
+                :id, :data_use, :data_categories, :data_subjects,
+                :legal_basis_for_processing, :retention_period, :system_id
+            )
+            """
+        ),
+        {
+            "id": "decl_ropa_mixed",
+            "data_use": "essential.service.operations",
+            "data_categories": ["user.contact.email", "user.device.cookie_id"],
+            "data_subjects": ["customer"],
+            "legal_basis_for_processing": "Legitimate interests",
+            "retention_period": "3 years",
+            "system_id": "sys_ropa_mixed",
+        },
+    )
+    proc = BusinessProcess(name="Process With One Real And One Missing Link")
+    db.add(proc)
+    db.flush()
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id,
+            privacy_declaration_id="decl_ropa_mixed",
+        )
+    )
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id,
+            privacy_declaration_id="decl_ropa_mixed_missing",
+        )
+    )
+    db.flush()
+
+    entry = ropa_for_process(db, proc.id)
+
+    assert len(entry.declarations) == 1
+    assert entry.declarations[0].id == "decl_ropa_mixed"
+    assert entry.missing_declarations == ["decl_ropa_mixed_missing"]
