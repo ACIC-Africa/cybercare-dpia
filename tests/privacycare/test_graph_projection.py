@@ -73,4 +73,17 @@ def test_an_empty_ropa_projects_to_a_process_with_no_data():
     proj = project_to_graph(entry, organisation_id="org-1")
     assert proj.data_nodes == []
     assert proj.edges == []
+    assert proj.node_correlation_ids == []
     assert proj.process_node["name"] == "Fuel Dealer Onboarding"
+
+
+def test_every_edge_resolves_to_exactly_one_emitted_node_in_the_batch():
+    # source_id/target_id are batch-local correlation keys, not real graph
+    # ids — a loader must insert nodes, capture assigned ids, and remap
+    # edges before persisting. This test proves the correlation itself is
+    # sound: every edge's target_id matches exactly one node emitted in
+    # this batch, so a loader has something consistent to remap from.
+    proj = project_to_graph(_entry(), organisation_id="org-1")
+    assert len(proj.node_correlation_ids) == len(proj.data_nodes)
+    for edge in proj.edges:
+        assert proj.node_correlation_ids.count(edge["target_id"]) == 1
