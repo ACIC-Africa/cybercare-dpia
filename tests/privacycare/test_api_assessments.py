@@ -386,3 +386,27 @@ def test_evidence_skips_payloads_missing_the_fields_evidenceitem_requires(db):
     _seed_answer_with_evidence(db, aid, qid, {"value": "no id or type here"})
     db.flush()
     assert _evidence_for(db, aid)["items"] == []
+
+
+def test_evidence_skip_is_logged_not_silent(db, caplog):
+    # Fix round 1: the skip above used to leave zero trace. A dropped
+    # evidence row on a real DPIA is a silent gap in a regulatory record --
+    # worse than a loud failure, because nobody notices to fix it. This
+    # project's `caplog` fixture is patched by the installed pytest-loguru
+    # plugin (tests/fides/api/middleware/test_logging.py exercises the same
+    # loguru->caplog wiring via its own `loguru_caplog` fixture; that
+    # fixture isn't reachable from tests/privacycare's conftest scope, but
+    # plain `caplog` here is already the pytest-loguru-patched one, verified
+    # by `uv run --python 3.13 pytest tests/privacycare --fixtures -q`
+    # listing only pytest_loguru's caplog for this directory).
+    caplog.set_level("WARNING")
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Malformed Evidence DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(db, aid, qid, {"value": "no id or type here"})
+    db.flush()
+    out = _evidence_for(db, aid)
+    assert out["items"] == []
+    assert aid in caplog.text
+    assert qid in caplog.text
+    assert "id" in caplog.text and "type" in caplog.text

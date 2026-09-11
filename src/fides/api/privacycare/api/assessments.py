@@ -4,6 +4,7 @@ from typing import List
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security, status
 from fastapi_pagination import Page, Params, paginate
+from loguru import logger
 from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
@@ -135,12 +136,36 @@ def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
     # treated as a single EvidenceItem-shaped payload. A payload that lacks
     # the two fields EvidenceItem requires (`id`, `type`) is skipped rather
     # than papered over with invented values.
+    #
+    # Fix round 1: this skip was silent — a malformed `evidence` object just
+    # vanished, with nothing to say so. Evidence is the thing a DPIA audit
+    # asks for; once plan 04's writer exists, a shape bug there would make
+    # evidence disappear from every assessment with no error, no log, no
+    # count. Skipping is still correct (one bad row must not fail the whole
+    # endpoint), but it must be loud, not silent.
     items: list[dict] = []
     for row in db.execute(
         _EVIDENCE_SQL, {"assessment_id": assessment_id}
     ).mappings():
         payload = row["evidence"]
-        if not isinstance(payload, dict) or "id" not in payload or "type" not in payload:
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Skipped evidence for assessment {} question {}: evidence "
+                "was not a JSON object (got {})",
+                assessment_id,
+                row["question_id"],
+                type(payload).__name__,
+            )
+            continue
+        missing_fields = [f for f in ("id", "type") if f not in payload]
+        if missing_fields:
+            logger.warning(
+                "Skipped evidence for assessment {} question {}: missing "
+                "required field(s) {}",
+                assessment_id,
+                row["question_id"],
+                missing_fields,
+            )
             continue
         items.append(
             {
