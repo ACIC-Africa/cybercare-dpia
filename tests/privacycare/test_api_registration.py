@@ -9,7 +9,6 @@ EXPECTED_READ_PATHS = {
     "/plus/privacy-assessments/summary",
     "/plus/privacy-assessments/templates",
     "/plus/privacy-assessments/{assessment_id}",
-    "/plus/privacy-assessments/{assessment_id}/questions",
     "/plus/privacy-assessments/{assessment_id}/evidence",
 }
 
@@ -72,6 +71,23 @@ def test_every_assessment_route_requires_verify_oauth_client_with_system_read():
             f"{path}'s verify_oauth_client dependency does not require "
             f"SYSTEM_READ ({SYSTEM_READ!r}) among its scopes"
         )
+
+
+def test_every_route_declares_a_response_model():
+    # The defect-class fix: a route with no response_model has no schema, no
+    # validation, and no contract test — which is exactly how
+    # GET /{assessment_id}/questions drifted into existing with an invented
+    # shape that nothing called. Every plus/privacy-assessments route, across
+    # every HTTP method sharing a path, must declare one.
+    offenders = [
+        r.path
+        for r in _app().routes
+        if getattr(r, "path", "").startswith("/plus/privacy-assessments")
+        and getattr(r, "response_model", None) is None
+    ]
+    assert not offenders, (
+        f"routes without a response_model cannot be contract-tested: {offenders}"
+    )
 
 
 def test_fides_own_routes_still_present():

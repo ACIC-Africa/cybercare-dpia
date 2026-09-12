@@ -615,14 +615,6 @@ def get_assessment(
 
 
 @privacycare_router.get(
-    "/{assessment_id}/questions",
-    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
-)
-def get_questions(assessment_id: str, *, db: Session = Depends(get_db)) -> list:
-    return _questions_for(db, assessment_id)
-
-
-@privacycare_router.get(
     "/{assessment_id}/evidence",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
     response_model=AssessmentEvidenceResponse,

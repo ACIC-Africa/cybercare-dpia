@@ -1,18 +1,26 @@
 """The admin-ui ships assessment screens that call `plus/privacy-assessments/*`.
 
 W1 has landed: `fides.api.privacycare.asgi` registers our own router onto
-Fides' `app_setup.ROUTERS`, so the six READ paths below are now served.
+Fides' `app_setup.ROUTERS`, so the five READ paths below are now served.
 
 This test used to assert the gap (routes absent) and said, in its own
 docstring, to invert the assertion once W1 lands — making the gap closing
 visible in the diff rather than implicit. That inversion happens here.
 
-Only the six READ paths are asserted present. The remaining paths in the
+Only the five READ paths are asserted present. The remaining paths in the
 original gap list (single-question fetch, questionnaire, questionnaire
 reminders, PDF export, tasks, and config) are WRITE-adjacent or not part of
 this read surface — they belong to plan 04 and are still correctly absent.
 That absence is intentional, not a regression: see
 `test_write_and_other_routes_still_absent` below.
+
+`GET /{assessment_id}/questions` was a sixth READ path here, but nothing
+called it — the UI's slice defines a PUT on that path, never a GET — and
+question data now reaches the UI inside the detail response, which is where
+the contract puts it. It was removed (task 4), not merely absent by design,
+so it does not belong in EXPECTED_STILL_ABSENT_ROUTES either: that list is
+for plan-04 write surface that was never built, not for a read route that
+existed and was deleted.
 """
 from fides.api.privacycare.asgi import app
 
@@ -21,7 +29,6 @@ EXPECTED_READ_ROUTES = [
     "plus/privacy-assessments/summary",
     "plus/privacy-assessments/templates",
     "plus/privacy-assessments/{assessment_id}",
-    "plus/privacy-assessments/{assessment_id}/questions",
     "plus/privacy-assessments/{assessment_id}/evidence",
 ]
 

@@ -28,7 +28,6 @@ GET_ROUTE_SUFFIXES = [
     "/summary",
     "/templates",
     f"/{_ASSESSMENT_ID}",
-    f"/{_ASSESSMENT_ID}/questions",
     f"/{_ASSESSMENT_ID}/evidence",
 ]
 
@@ -36,8 +35,8 @@ GET_ROUTE_SUFFIXES = [
 @pytest.fixture(scope="module")
 def client():
     # `with TestClient(app) as c:` runs the app's real startup lifespan
-    # (migrations, scheduler, etc.) — module-scoped so the six requests
-    # below share one boot rather than paying for it six times.
+    # (migrations, scheduler, etc.) — module-scoped so the five requests
+    # below share one boot rather than paying for it five times.
     with TestClient(app) as c:
         yield c
 
