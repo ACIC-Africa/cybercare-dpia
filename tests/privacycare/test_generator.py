@@ -4,10 +4,14 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+from fides.api.privacycare import llm as llm_module
 from fides.api.privacycare.api.assessments import _assessment_detail, _evidence_for
 from fides.api.privacycare.generator import (
+    GENERATION_CALLER,
     GENERATOR_AUTHOR,
+    NEEDS_INPUT_SENTINEL,
     draft_from_context,
+    draft_with_llm,
     answer_questions,
 )
 from tests.privacycare.test_api_assessments import (
@@ -322,3 +326,178 @@ def test_citation_counter_holds_when_a_middle_question_drafts_nothing(db):
         for row in rows
     }
     assert citations_by_question == {q1: [1], q3: [2]}
+
+
+def test_partial_coverage_asks_the_model_and_records_a_partial_answer(monkeypatch):
+    captured = {}
+
+    def _fake_complete(caller, messages, *, model, max_tokens, system=None):
+        captured["caller"] = caller
+        captured["messages"] = messages
+        captured["model"] = model
+        captured["system"] = system
+        return "The activity is described as email marketing to existing customers."
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _fake_complete)
+
+    question = _question(
+        "partial", ["system.name", "privacy_declaration.name"],
+        text="What is the name and description of this processing activity?",
+    )
+
+    draft = draft_with_llm(question, _CONTEXT, model=None)
+
+    assert draft.answer_status == "partial"
+    assert draft.answer_source == "ai_analysis"
+    assert draft.answer_text.startswith("The activity is described")
+    assert captured["caller"] == GENERATION_CALLER
+
+
+def test_the_prompt_carries_the_resolved_facts_and_the_question(monkeypatch):
+    # The model's ONLY ground truth is the resolved sources. If the prompt
+    # does not carry them, the model is free to invent the customer's
+    # processing — which is the failure mode that makes a generated DPIA
+    # worse than no DPIA.
+    captured = {}
+
+    def _fake_complete(caller, messages, *, model, max_tokens, system=None):
+        captured["prompt"] = messages[0]["content"]
+        captured["system"] = system
+        return "An answer."
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _fake_complete)
+
+    question = _question(
+        "partial", ["system.name", "privacy_declaration.name"],
+        text="What is this activity?",
+    )
+    draft_with_llm(question, _CONTEXT, model=None)
+
+    assert "CRM" in captured["prompt"]
+    assert "Email campaigns" in captured["prompt"]
+    assert "What is this activity?" in captured["prompt"]
+    assert NEEDS_INPUT_SENTINEL in captured["system"]
+
+
+def test_the_model_can_decline_and_that_writes_nothing(monkeypatch):
+    # A model that cannot answer from the record must say so rather than
+    # guess. The sentinel is how it says so, and a declined question is
+    # left for a human exactly like a `none` question.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: NEEDS_INPUT_SENTINEL,
+    )
+
+    question = _question("partial", ["system.name"])
+
+    assert draft_with_llm(question, _CONTEXT, model=None) is None
+
+
+def test_a_declining_reply_is_recognised_despite_surrounding_whitespace(monkeypatch):
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: f"  {NEEDS_INPUT_SENTINEL}\n",
+    )
+    assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
+
+
+def test_an_empty_reply_writes_nothing(monkeypatch):
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: "   "
+    )
+    assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
+
+
+def test_a_partial_question_with_no_resolvable_facts_never_calls_the_model(monkeypatch):
+    # No facts means nothing to ground the answer in. Calling the model
+    # anyway would spend budget to invite a hallucination.
+    def _explode(*args, **kwargs):
+        raise AssertionError("the model must not be called with no facts")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _explode)
+
+    question = _question("partial", ["privacy_declaration.retention_period"])
+
+    assert draft_with_llm(question, _CONTEXT, model=None) is None
+
+
+def test_a_gateway_failure_leaves_the_question_unanswered(monkeypatch):
+    # llm.py is explicit that a caller must NOT fall back to a direct model
+    # call. The degraded outcome is an unanswered question, which a human
+    # can still answer — not a bypassed redactor.
+    def _unavailable(*args, **kwargs):
+        raise llm_module.GatewayUnavailable("gateway returned 429: budget exceeded")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _unavailable)
+
+    assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
+
+
+def test_the_requested_model_is_passed_through(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda caller, messages, *, model, max_tokens, system=None: captured.update(
+            model=model
+        )
+        or "An answer.",
+    )
+
+    draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model="claude-opus-5")
+
+    assert captured["model"] == "claude-opus-5"
+
+
+def test_answer_questions_skips_the_llm_entirely_when_use_llm_is_false(db, monkeypatch):
+    def _explode(*args, **kwargs):
+        raise AssertionError("use_llm=False must not reach the gateway")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _explode)
+
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No LLM DPIA")
+    qid = _seed_question(db, tid, "partial_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'partial', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {"sources": ["system.name"], "id": qid},
+    )
+    db.flush()
+
+    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None) == 0
+
+
+def test_answer_questions_writes_the_llm_answer_when_use_llm_is_true(db, monkeypatch):
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: "Drafted from the record.",
+    )
+
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "LLM DPIA")
+    qid = _seed_question(db, tid, "partial_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'partial', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {"sources": ["system.name"], "id": qid},
+    )
+    db.flush()
+
+    assert answer_questions(db, aid, _CONTEXT, use_llm=True, model=None) == 1
+
+    row = db.execute(
+        sqlalchemy.text(
+            "SELECT av.answer_status, av.answer_source, av.answer_text "
+            "FROM assessment_answer a "
+            "JOIN answer_version av ON av.id = a.current_version_id "
+            "WHERE a.assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).mappings().first()
+    assert row["answer_status"] == "partial"
+    assert row["answer_source"] == "ai_analysis"
+    assert row["answer_text"] == "Drafted from the record."

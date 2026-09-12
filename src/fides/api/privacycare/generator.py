@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.context import resolve_source
+from fides.api.privacycare.llm import DEFAULT_MODEL, GatewayUnavailable, complete
 
 # Every generated answer_version's created_by. answer_version.created_by is
 # free text, and a DPIA's whole value is that every answer names its author
@@ -35,6 +36,34 @@ from fides.api.privacycare.context import resolve_source
 # identity of whoever pressed Generate. A DPO reviewing the assessment can
 # then tell at a glance which answers still need a human's eyes.
 GENERATOR_AUTHOR = "privacycare-generator"
+
+# The model is given one way to say "I cannot answer this from the record".
+# Without it the only options are a guess or an empty string, and a guessed
+# answer in a DPIA is worse than an unanswered question: the unanswered one
+# gets routed to a human, the guess gets filed with the regulator.
+NEEDS_INPUT_SENTINEL = "NEEDS_INPUT"
+
+# Identifies this feature in the gateway's egress audit. PrivacyCare is
+# itself a system processing personal data, so its own LLM traffic is
+# evidence for its own ROPA entry.
+GENERATION_CALLER = "dpia-generation"
+
+_GENERATION_SYSTEM_PROMPT = f"""You are assisting a data protection officer who is \
+completing a Data Protection Impact Assessment.
+
+Answer the question using ONLY the facts in the PROCESSING ACTIVITY RECORD \
+supplied with it. Those facts are the whole of what is known.
+
+Rules:
+- Never state a fact about this organisation that is not in the record.
+- Do not speculate about the organisation's intentions, safeguards or practices.
+- If the record does not contain enough information to answer, reply with \
+exactly {NEEDS_INPUT_SENTINEL} and nothing else.
+- Write two or three sentences of plain prose. No preamble, no headings, no \
+bullet points, no restatement of the question.
+
+This answer will be read by a regulator. An honest {NEEDS_INPUT_SENTINEL} is \
+always better than a plausible guess."""
 
 
 @dataclass(frozen=True)
@@ -135,6 +164,90 @@ def draft_from_context(
     )
 
 
+def _generation_prompt(question: dict, resolved: list[tuple[str, str]]) -> str:
+    facts = "\n".join(f"- {_label(key)}: {value}" for key, value in resolved)
+    guidance = question.get("guidance")
+    guidance_block = f"\n\nGUIDANCE FOR THE ASSESSOR:\n{guidance}" if guidance else ""
+    return (
+        f"PROCESSING ACTIVITY RECORD:\n{facts}{guidance_block}\n\n"
+        f"QUESTION:\n{question['question_text']}"
+    )
+
+
+def draft_with_llm(
+    question: dict,
+    context: dict,
+    *,
+    model: str | None,
+    citation_start: int = 1,
+) -> QuestionDraft | None:
+    """Ask the model to draft a `partial`-coverage answer. None writes nothing.
+
+    Returns None in four cases, all of which leave the question for a human:
+      - the question is not `partial`;
+      - no fides_source resolves, so there is nothing to ground an answer in
+        and calling the model would spend budget to invite a hallucination;
+      - the model declines with the sentinel, or returns nothing usable;
+      - the gateway refuses or is unreachable.
+
+    That last case is deliberately NOT retried against a provider SDK.
+    fides.api.privacycare.llm exists so that every prompt is redacted before
+    egress and audited after; a fallback path would be the exact bypass it
+    was written to prevent. A DPIA platform that leaks personal data to a
+    model is indefensible to the officer it is sold to, and an unanswered
+    question is a recoverable outcome.
+
+    answer_status is "partial", never "complete": the record supplied only
+    part of the answer by the question's own expected_coverage, and a
+    machine draft has not been seen by the DPO who signs the assessment.
+    "partial" is excluded from completeness and answered_count (plan 03b),
+    so a generated draft never makes an assessment look finished.
+    """
+    if question["expected_coverage"] != "partial":
+        return None
+
+    resolved = _resolved_sources(question, context)
+    if not resolved:
+        return None
+
+    try:
+        reply = complete(
+            GENERATION_CALLER,
+            [{"role": "user", "content": _generation_prompt(question, resolved)}],
+            model=model or DEFAULT_MODEL,
+            max_tokens=512,
+            system=_GENERATION_SYSTEM_PROMPT,
+        )
+    except GatewayUnavailable as exc:
+        logger.warning(
+            "PrivacyCare generation left question {} unanswered: {}",
+            question["question_key"],
+            exc,
+        )
+        return None
+
+    answer_text = (reply or "").strip()
+    if not answer_text or answer_text == NEEDS_INPUT_SENTINEL:
+        return None
+
+    items = [
+        _evidence_item(key, value, citation_start + offset)
+        for offset, (key, value) in enumerate(resolved)
+    ]
+    for item in items:
+        # The facts are still the record's; what the model contributed is
+        # the prose. Typing the evidence "ai_analysis" is what tells a
+        # reviewer this answer was drafted rather than read off.
+        item["type"] = "ai_analysis"
+
+    return QuestionDraft(
+        answer_text=answer_text,
+        answer_status="partial",
+        answer_source="ai_analysis",
+        evidence={"items": items},
+    )
+
+
 def answer_questions(
     db: Session,
     assessment_id: str,
@@ -153,11 +266,9 @@ def answer_questions(
     exported DPIA, and two answers both claiming [1] would make the report's
     references ambiguous.
 
-    use_llm and model are unused here — this task implements only the
-    deterministic `full`/`none` branches. They are declared now, not added
-    later, because the `partial` branch (task 4) needs them and changing a
-    public signature one task after every call site adopted it would mean
-    editing every call site twice instead of once.
+    use_llm gates the `partial` branch: when False, only the deterministic
+    `full` branch runs and no call reaches the gateway. model is passed
+    through to draft_with_llm.
     """
     questions = (
         db.execute(_QUESTIONS_FOR_ASSESSMENT_SQL, {"assessment_id": assessment_id})
@@ -168,7 +279,10 @@ def answer_questions(
     written = 0
     next_citation = 1
     for question in questions:
-        draft = draft_from_context(dict(question), context, citation_start=next_citation)
+        q = dict(question)
+        draft = draft_from_context(q, context, citation_start=next_citation)
+        if draft is None and use_llm:
+            draft = draft_with_llm(q, context, model=model, citation_start=next_citation)
         if draft is None:
             continue
         write_answer(
