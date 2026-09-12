@@ -3,6 +3,7 @@ import sqlalchemy
 from fastapi import Depends, HTTPException, Security, status
 from fastapi_pagination import Page, Params, paginate
 from loguru import logger
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
@@ -15,6 +16,7 @@ from fides.api.privacycare.api.schemas import (
     AssessmentQuestionResponse,
     AssessmentResponse,
     AssessmentSummaryResponse,
+    EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionGroup,
     TemplateResponse,
@@ -65,11 +67,12 @@ _ASSESSMENT_SQL = sqlalchemy.text(
 # this join return another client's questions/answers for any assessment id.
 _QUESTION_SQL = sqlalchemy.text(
     """
-    SELECT q.id, q.requirement_key, q.requirement_title, q.group_order,
+    SELECT q.id, q.requirement_key, q.requirement_title,
            q.question_key, q.question_text, q.guidance, q.question_order,
            q.required, q.fides_sources, q.expected_coverage, a.id AS answer_id,
            av.answer_status, av.answer_text, av.answer_source, av.confidence,
-           av.evidence
+           av.evidence, av.created_by AS answer_created_by,
+           av.created_at AS answer_created_at, av.updated_at AS answer_updated_at
     FROM assessment_question q
     JOIN privacy_assessment pa ON pa.template_id = q.template_id
     LEFT JOIN assessment_answer a
@@ -153,7 +156,11 @@ def _questions_for(db: Session, assessment_id: str) -> list[dict]:
             index[key] = {
                 "requirement_key": key,
                 "requirement_title": row["requirement_title"],
-                "group_order": row["group_order"],
+                # No "group_order" here (fix round 2): it was carried into
+                # this dict and never read — q.group_order already does its
+                # one job in _QUESTION_SQL's ORDER BY, which orders `groups`
+                # correctly before this loop ever runs (a column need not be
+                # SELECTed to be used in ORDER BY).
                 "questions": [],
             }
             groups.append(index[key])
@@ -173,6 +180,9 @@ def _questions_for(db: Session, assessment_id: str) -> list[dict]:
                 "answer_source": row["answer_source"],
                 "confidence": row["confidence"],
                 "evidence": row["evidence"],
+                "answer_created_by": row["answer_created_by"],
+                "answer_created_at": row["answer_created_at"],
+                "answer_updated_at": row["answer_updated_at"],
             }
         )
     return groups
@@ -182,15 +192,35 @@ def _as_str(value):
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
-def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
+def _evidence_item_from_payload(
+    payload,
+    *,
+    assessment_id: str,
+    question_id: str,
+    created_at=None,
+    updated_at=None,
+) -> "EvidenceItem | None":
+    # Shared by BOTH evidence-shaping paths (fix round 2 finding): this file
+    # used to validate the `/evidence` endpoint's payload against EvidenceItem
+    # (via this function's predecessor) while `_question_response` injected
+    # the exact same raw `answer_version.evidence` JSONB unvalidated, typed
+    # `List[dict]`. AssessmentDetail.tsx feeds the evidence drawer from the
+    # detail response's per-question `evidence` field, and
+    # EvidenceCardGroup.tsx calls `item.field_name!.replace(...)` on what it
+    # gets — a payload missing a field EvidenceItem requires reached the
+    # browser as a runtime crash instead of being caught here. Both paths now
+    # call this one function, so a malformed payload is skipped identically
+    # (same logged warning) no matter which path it arrived on.
+    #
     # `answer_version.evidence` has no writer in this repo yet (that lands in
     # plan 04) and the live `fides` database has zero answer_version rows, so
     # there is no observed payload to shape this against. Its column default
     # is a JSON *object* (not an array), which matches one EvidenceItem per
     # answer_version rather than a list of them — so each qualifying row is
     # treated as a single EvidenceItem-shaped payload. A payload that lacks
-    # the two fields EvidenceItem requires (`id`, `type`) is skipped rather
-    # than papered over with invented values.
+    # the two fields EvidenceItem requires (`id`, `type`), or otherwise fails
+    # EvidenceItem's own validation, is skipped rather than papered over with
+    # invented values.
     #
     # Fix round 1: this skip was silent — a malformed `evidence` object just
     # vanished, with nothing to say so. Evidence is the thing a DPIA audit
@@ -198,45 +228,69 @@ def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
     # evidence disappear from every assessment with no error, no log, no
     # count. Skipping is still correct (one bad row must not fail the whole
     # endpoint), but it must be loud, not silent.
+    if not isinstance(payload, dict):
+        logger.warning(
+            "Skipped evidence for assessment {} question {}: evidence "
+            "was not a JSON object (got {})",
+            assessment_id,
+            question_id,
+            type(payload).__name__,
+        )
+        return None
+    missing_fields = [f for f in ("id", "type") if f not in payload]
+    if missing_fields:
+        logger.warning(
+            "Skipped evidence for assessment {} question {}: missing "
+            "required field(s) {}",
+            assessment_id,
+            question_id,
+            missing_fields,
+        )
+        return None
+    try:
+        return EvidenceItem(
+            id=payload["id"],
+            type=payload["type"],
+            value=payload.get("value"),
+            created_at=payload.get("created_at")
+            or _as_str(created_at)
+            or _as_str(updated_at),
+            field_name=payload.get("field_name"),
+            source_key=payload.get("source_key"),
+            source_type=payload.get("source_type"),
+            citation_number=payload.get("citation_number"),
+            data=payload.get("data"),
+        )
+    except ValidationError as exc:
+        logger.warning(
+            "Skipped evidence for assessment {} question {}: failed "
+            "EvidenceItem validation ({})",
+            assessment_id,
+            question_id,
+            exc,
+        )
+        return None
+
+
+def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
     items: list[dict] = []
     for row in db.execute(
         _EVIDENCE_SQL, {"assessment_id": assessment_id}
     ).mappings():
-        payload = row["evidence"]
-        if not isinstance(payload, dict):
-            logger.warning(
-                "Skipped evidence for assessment {} question {}: evidence "
-                "was not a JSON object (got {})",
-                assessment_id,
-                row["question_id"],
-                type(payload).__name__,
-            )
-            continue
-        missing_fields = [f for f in ("id", "type") if f not in payload]
-        if missing_fields:
-            logger.warning(
-                "Skipped evidence for assessment {} question {}: missing "
-                "required field(s) {}",
-                assessment_id,
-                row["question_id"],
-                missing_fields,
-            )
-            continue
-        items.append(
-            {
-                "id": payload["id"],
-                "type": payload["type"],
-                "value": payload.get("value"),
-                "created_at": payload.get("created_at")
-                or _as_str(row["created_at"])
-                or _as_str(row["updated_at"]),
-                "field_name": payload.get("field_name"),
-                "source_key": payload.get("source_key"),
-                "source_type": payload.get("source_type"),
-                "citation_number": payload.get("citation_number"),
-                "data": payload.get("data"),
-            }
+        item = _evidence_item_from_payload(
+            row["evidence"],
+            assessment_id=assessment_id,
+            question_id=row["question_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
+        if item is not None:
+            # Returned as a dict, not the EvidenceItem instance itself: this
+            # function's callers (_evidence_for -> AssessmentEvidenceResponse)
+            # and the tests exercising it treat `items` as plain mappings.
+            # The validation this function exists to guarantee already
+            # happened in _evidence_item_from_payload above.
+            items.append(item.model_dump())
     return items
 
 
@@ -249,7 +303,7 @@ def _evidence_for(db: Session, assessment_id: str) -> dict:
     }
 
 
-def _question_response(q: dict) -> AssessmentQuestionResponse:
+def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionResponse:
     # THE NAMING TRAP: `id` is the display label QuestionCard.tsx:43 renders
     # ("{question.id}. {question.question_text}"), sourced from
     # assessment_question.question_key. `question_id` is the real identifier
@@ -266,14 +320,28 @@ def _question_response(q: dict) -> AssessmentQuestionResponse:
     # would carry before anyone touched it. answer_text has no column
     # default, so "" is the empty-string analogue for a required str field.
     #
-    # evidence: List[dict], required. answer_version.evidence is a single
-    # JSONB *object* (verified against the live schema; see _evidence_items_for
-    # above), not an array, with server_default '{}' meaning "answered, no
-    # evidence attached" — same exact-default exclusion already used there.
-    # An unanswered question (no av row at all) has evidence=None. Both cases
-    # collapse to the empty list; a genuinely populated object is wrapped as
-    # the list's single element.
+    # evidence: List[EvidenceItem], required (fix round 2: was List[dict],
+    # unvalidated — see _evidence_item_from_payload above). answer_version.
+    # evidence is a single JSONB *object* (verified against the live schema),
+    # not an array, with server_default '{}' meaning "answered, no evidence
+    # attached" — same exact-default exclusion already used in
+    # _evidence_items_for. An unanswered question (no av row at all) has
+    # evidence=None. Both cases collapse to the empty list; a genuinely
+    # populated, valid object is wrapped as the list's single element; an
+    # invalid one is dropped by the shared normaliser, loudly (logged), not
+    # silently.
     evidence = q["evidence"]
+    item = (
+        _evidence_item_from_payload(
+            evidence,
+            assessment_id=assessment_id,
+            question_id=q["id"],
+            created_at=q["answer_created_at"],
+            updated_at=q["answer_updated_at"],
+        )
+        if evidence
+        else None
+    )
     return AssessmentQuestionResponse(
         id=q["question_key"],
         question_id=q["id"],
@@ -286,7 +354,7 @@ def _question_response(q: dict) -> AssessmentQuestionResponse:
         answer_status=q["answer_status"] or "needs_input",
         answer_source=q["answer_source"] or "system",
         confidence=q["confidence"],
-        evidence=[evidence] if evidence else [],
+        evidence=[item] if item is not None else [],
         # No database source (Plus computes these) — empty forms, not
         # omitted. See the plan's field-by-field source table.
         missing_data=[],
@@ -294,28 +362,45 @@ def _question_response(q: dict) -> AssessmentQuestionResponse:
     )
 
 
-def _question_group_response(group: dict) -> QuestionGroup:
-    questions = [_question_response(q) for q in group["questions"]]
-    # Definition, checked against the UI rather than assumed (fix round 1):
-    # answered_count/total_count is a COMPLETION-PROGRESS indicator, not a
-    # "has this been touched" tally. QuestionGroupPanel.tsx renders
-    # `isGroupCompleted = answeredCount === totalCount` to switch a group's
-    # tag between "Completed" and "Pending", and shows the raw fraction as
-    # "Fields: {answeredCount}/{totalCount}". AssessmentDetail.tsx treats
-    # AnswerStatus.NEEDS_INPUT as explicitly outstanding — it filters
-    # `allQuestions` by that exact status to build `needsInputIds`, the set
-    # sent back out for more input via Slack/Teams. Counting a needs_input
-    # answer as "answered" would show a group as Completed while a question
-    # inside it is still, by its own status, waiting on someone — an
-    # overstatement of completeness this is a regulatory (DPIA) record.
-    # So: "answered" here means the LEFT JOIN to answer_version resolved
-    # (a current answer exists) AND that answer's status is not
-    # "needs_input" — i.e. "complete" or "partial" count, "needs_input"
-    # and "no answer at all" do not.
+def _question_group_response(group: dict, assessment_id: str) -> QuestionGroup:
+    questions = [_question_response(q, assessment_id) for q in group["questions"]]
+    # Definition, checked against the UI rather than assumed (fix round 1,
+    # narrowed further in fix round 2): answered_count/total_count is a
+    # COMPLETION-PROGRESS indicator, not a "has this been touched" tally.
+    # QuestionGroupPanel.tsx renders `isGroupCompleted = answeredCount ===
+    # totalCount` to switch a group's tag between the literal strings
+    # "Completed" and "Pending", and shows the raw fraction as "Fields:
+    # {answeredCount}/{totalCount}".
+    #
+    # Fix round 1 correctly excluded "needs_input" (AssessmentDetail.tsx
+    # filters that exact status into `needsInputIds`, the set still awaiting
+    # a person) but left "partial" counted as answered. Fix round 2: read
+    # AnswerStatusTags.tsx, the component that actually renders a question's
+    # status. It gives COMPLETE its own branch — a plain source-label tag,
+    # no tooltip, no caveat. PARTIAL is rendered by the *fallback* branch
+    # (same code path as NEEDS_INPUT would take if it weren't COMPLETE)
+    # wrapped in a Tooltip whose text is "This answer can be automatically
+    # derived if you populate: ..." or "...if the relevant field is
+    # populated" — i.e. the UI's own copy says a partial answer is NOT yet
+    # what it should be. Two "partial" questions in a group of two must not
+    # read 2/2 under a "Completed" tag while both cards inside still show
+    # that tooltip: that is the exact overstatement-of-completeness failure
+    # mode fix round 1 existed to prevent, just for a different status value.
+    # So: "answered" means the LEFT JOIN to answer_version resolved AND that
+    # answer's status is exactly "complete" — "partial", "needs_input", and
+    # "no answer at all" do not count.
     answered_count = sum(
-        1
-        for q in group["questions"]
-        if q["answer_status"] is not None and q["answer_status"] != "needs_input"
+        1 for q in group["questions"] if q["answer_status"] == "complete"
+    )
+    # last_updated_at/last_updated_by (fix round 2): these DO have a source —
+    # answer_version.updated_at/.created_by, already selected by _QUESTION_SQL
+    # as answer_updated_at/answer_created_by. Derive both from whichever
+    # question in the group has the most recently updated current answer
+    # version; a group with no answered questions at all has neither.
+    latest_answer = max(
+        (q for q in group["questions"] if q["answer_updated_at"] is not None),
+        key=lambda q: q["answer_updated_at"],
+        default=None,
     )
     return QuestionGroup(
         # QuestionGroup.id and .requirement_key are the same value per the
@@ -328,8 +413,10 @@ def _question_group_response(group: dict) -> QuestionGroup:
         total_count=len(questions),
         # No source in the OSS schema — always null for now.
         risk_level=None,
-        last_updated_at=None,
-        last_updated_by=None,
+        last_updated_at=_as_str(latest_answer["answer_updated_at"])
+        if latest_answer
+        else None,
+        last_updated_by=latest_answer["answer_created_by"] if latest_answer else None,
     )
 
 
@@ -342,6 +429,26 @@ def _metadata_for(db: Session, task_id: str | None) -> AssessmentMetadata | None
         # assessment pointed at it) is treated the same as "no task" rather
         # than raising — this endpoint's job is the assessment, not enforcing
         # the task table's referential integrity.
+        return None
+    if row["created_at"] is None:
+        # Fix round 2 (500 risk): AssessmentMetadata.generation_timestamp is
+        # `string` in the TS contract — required AND non-nullable, no `?`,
+        # no `| null` (features/privacy-assessments/types.ts). Making it
+        # Optional here would fix the crash but break that contract (and
+        # test_assessment_metadata_optionality_matches_the_shipped_contract),
+        # so it stays required. privacy_assessment_task.created_at IS
+        # DB-nullable (verified against the live migration) even though
+        # every normal write path server_defaults it to now() — a task row
+        # that genuinely carries no created_at has no generation event to
+        # report, so it is treated the same as "no task" (same precedent as
+        # the dangling-id case above) rather than raising on serialisation
+        # or inventing a timestamp value.
+        logger.warning(
+            "privacy_assessment_task {} has a null created_at; omitting "
+            "metadata rather than violating AssessmentMetadata's required "
+            "generation_timestamp",
+            task_id,
+        )
         return None
     return AssessmentMetadata(
         generation_timestamp=_as_str(row["created_at"]),
@@ -359,7 +466,8 @@ def _assessment_detail(db: Session, assessment_id: str) -> PrivacyAssessmentDeta
     if row is None:
         raise LookupError(f"No assessment with id {assessment_id}")
     question_groups = [
-        _question_group_response(g) for g in _questions_for(db, assessment_id)
+        _question_group_response(g, assessment_id)
+        for g in _questions_for(db, assessment_id)
     ]
     return PrivacyAssessmentDetailResponse(
         id=row["id"],

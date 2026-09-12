@@ -156,7 +156,16 @@ class AssessmentQuestionResponse(BaseModel):
     answer_source: str
     # `confidence: number | null;` — required, nullable; no default.
     confidence: Optional[float]
-    evidence: List[dict]
+    # List[EvidenceItem], not List[dict]: this used to accept the raw JSONB
+    # payload unvalidated (fix round 2 finding). EvidenceCardGroup.tsx reads
+    # `item.field_name!.replace(...)` off exactly this list — a payload
+    # missing a required EvidenceItem field reached the browser as a runtime
+    # crash instead of being caught here. Both this field and
+    # AssessmentEvidenceResponse.items now go through the same
+    # _evidence_item_from_payload() normaliser in api/assessments.py, so a
+    # malformed payload is skipped (with the same logged warning) in both
+    # places instead of only one.
+    evidence: List[EvidenceItem]
     # No database source (Plus computes these). Return empty forms rather
     # than omitting the fields — a missing required field breaks the UI's
     # deserialisation exactly as a wrong one would. Both are required,

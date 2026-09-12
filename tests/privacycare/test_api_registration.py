@@ -73,12 +73,25 @@ def test_every_assessment_route_requires_verify_oauth_client_with_system_read():
         )
 
 
-def test_every_route_declares_a_response_model():
-    # The defect-class fix: a route with no response_model has no schema, no
-    # validation, and no contract test — which is exactly how
-    # GET /{assessment_id}/questions drifted into existing with an invented
-    # shape that nothing called. Every plus/privacy-assessments route, across
-    # every HTTP method sharing a path, must declare one.
+def test_every_route_has_a_response_model_declared_or_inferred():
+    # Rename, fix round 2: this test's old name ("declares a response
+    # model") overstated what it checks. FastAPI sets `route.response_model`
+    # from an explicit `response_model=` kwarg OR, when that kwarg is
+    # omitted, infers it from the endpoint function's return type annotation
+    # (APIRoute.__init__ falls back to the return annotation). Either way
+    # produces a non-None `route.response_model`, and this assertion cannot
+    # tell the two apart — it only proves ONE of them happened. Every route
+    # in this module currently declares response_model explicitly, so
+    # behaviour is unchanged; only the name and this comment now say what is
+    # actually being tested. In a plan about honest contracts, a test whose
+    # name overstates what it checks is the wrong note.
+    #
+    # The defect-class fix this guards: a route with no response_model at
+    # all (neither declared nor inferrable) has no schema, no validation,
+    # and no contract test — which is exactly how GET /{assessment_id}/
+    # questions drifted into existing with an invented shape that nothing
+    # called. Every plus/privacy-assessments route, across every HTTP method
+    # sharing a path, must end up with SOME response_model.
     offenders = [
         r.path
         for r in _app().routes

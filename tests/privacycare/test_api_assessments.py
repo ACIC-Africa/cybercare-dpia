@@ -394,6 +394,7 @@ def _seed_answer_with_evidence(
     answer_source: str = "ai_analysis",
     created_by: str = "ai@cybota.com",
     answer_status: str = "complete",
+    updated_at: str | None = None,
 ) -> str:
     # assessment_answer <-> answer_version is a circular FK (verified against
     # the live migration): the answer row has to exist before a version can
@@ -403,6 +404,12 @@ def _seed_answer_with_evidence(
     # `answer_status` defaults to "complete" (the original hardcoded value)
     # so every existing caller is unaffected; task-3 fix round 1 needs a
     # "needs_input" row to pin answered_count's completion semantics.
+    # `updated_at`, if given, overrides the column's now()-server-default
+    # after insert — fix round 2 needs deterministic, distinguishable
+    # timestamps across two seeded versions to pin
+    # last_updated_at/last_updated_by's "most recently updated" derivation;
+    # relying on real wall-clock ordering between two inserts in the same
+    # test would be flaky.
     answer_id = f"aa_{uuid.uuid4().hex[:8]}"
     version_id = f"av_{uuid.uuid4().hex[:8]}"
     db.execute(
@@ -436,6 +443,13 @@ def _seed_answer_with_evidence(
         ),
         {"version_id": version_id, "id": answer_id},
     )
+    if updated_at is not None:
+        db.execute(
+            sqlalchemy.text(
+                "UPDATE answer_version SET updated_at = :updated_at WHERE id = :id"
+            ),
+            {"updated_at": updated_at, "id": version_id},
+        )
     return answer_id
 
 
@@ -590,6 +604,31 @@ def test_unknown_detail_raises(db):
         _assessment_detail(db, "no-such-assessment")
 
 
+def test_detail_question_evidence_skips_malformed_payload(db, caplog):
+    # Fix round 2: _question_response used to inject answer_version.evidence
+    # into AssessmentQuestionResponse.evidence raw and unvalidated (typed
+    # List[dict]) — a payload missing `id`/`type` sailed straight through to
+    # the detail response, where AssessmentDetail.tsx feeds it to the
+    # evidence drawer and EvidenceCardGroup.tsx calls
+    # `item.field_name!.replace(...)` on it: a missing key there is a
+    # browser crash. Both evidence paths now share
+    # _evidence_item_from_payload, so this must skip identically to (and log
+    # the same way as) the /evidence endpoint's existing
+    # test_evidence_skips_payloads_missing_the_fields_evidenceitem_requires.
+    caplog.set_level("WARNING")
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Malformed Question Evidence DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(db, aid, qid, {"value": "no id or type here"})
+    db.flush()
+    question = _assessment_detail(db, aid).question_groups[0].questions[0]
+    assert question.evidence == [], (
+        "a malformed evidence payload must not reach the detail response — "
+        "EvidenceCardGroup.tsx would crash on a missing required field"
+    )
+    assert aid in caplog.text and qid in caplog.text
+
+
 def test_detail_answered_count_increments_for_some_but_not_all(db):
     # Fix round 1: the only prior test asserted answered_count == 0 with no
     # answers seeded — nothing proved it ever increments. Seed a complete
@@ -636,3 +675,109 @@ def test_detail_answered_count_excludes_needs_input(db):
         "a needs_input answer must not count as answered, "
         "or the group would show Completed while still needing input"
     )
+
+
+def test_detail_answered_count_excludes_partial(db):
+    # Fix round 2: fix round 1 correctly excluded needs_input but left
+    # "partial" counted as answered — the same evidence was not applied to
+    # it. Read AnswerStatusTags.tsx directly: COMPLETE gets its own branch
+    # (a plain source-label tag). PARTIAL falls through to the SAME branch
+    # NEEDS_INPUT would use if it weren't COMPLETE, and is additionally
+    # wrapped in a Tooltip reading "This answer can be automatically derived
+    # if you populate: ..." (or the no-missing-data variant, "...if the
+    # relevant field is populated") — the UI's own copy says a partial
+    # answer is not yet complete. So a group of two "partial" questions must
+    # NOT read 2/2 under QuestionGroupPanel.tsx's literal "Completed" tag
+    # while both cards inside still show that tooltip: that is the exact
+    # overstatement-of-completeness failure this test pins down.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Partial Answers DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_answer_with_evidence(
+        db, aid, q1, {"id": "ev_1", "type": "ai_analysis"}, answer_status="partial"
+    )
+    _seed_answer_with_evidence(
+        db, aid, q2, {"id": "ev_2", "type": "ai_analysis"}, answer_status="partial"
+    )
+    db.flush()
+    group = _assessment_detail(db, aid).question_groups[0]
+    assert group.total_count == 2
+    assert group.answered_count == 0, (
+        "two partial answers must not read 2/2 / 'Completed' — "
+        "AnswerStatusTags.tsx renders partial as its own non-complete tag "
+        "with a tooltip explaining the answer is not yet final"
+    )
+
+
+def test_detail_group_last_updated_derives_from_the_latest_answer_version(db):
+    # Fix round 2: last_updated_at/last_updated_by were hardcoded to None
+    # with a "no source in the OSS schema" comment. That claim was wrong —
+    # answer_version.updated_at and .created_by exist, and _EVIDENCE_SQL
+    # already selects the equivalent columns. Derive both for QuestionGroup
+    # from whichever question in the group has the most recently updated
+    # current answer version, not just the first one seeded.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Last Updated DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_answer_with_evidence(
+        db,
+        aid,
+        q1,
+        {"id": "ev_1", "type": "ai_analysis"},
+        created_by="alice@example.com",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    _seed_answer_with_evidence(
+        db,
+        aid,
+        q2,
+        {"id": "ev_2", "type": "ai_analysis"},
+        created_by="bob@example.com",
+        updated_at="2026-06-01T00:00:00+00:00",
+    )
+    db.flush()
+    group = _assessment_detail(db, aid).question_groups[0]
+    assert group.last_updated_by == "bob@example.com", (
+        "must derive from the MOST RECENTLY updated answer version, not "
+        "simply the first one seeded"
+    )
+    assert group.last_updated_at is not None
+    assert group.last_updated_at.startswith("2026-06-01")
+
+
+def test_detail_group_last_updated_is_null_with_no_answers(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No Answers DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+    group = _assessment_detail(db, aid).question_groups[0]
+    assert group.last_updated_at is None
+    assert group.last_updated_by is None
+
+
+def test_detail_metadata_is_null_not_a_500_when_task_created_at_is_null(db):
+    # Fix round 2 (500 risk): AssessmentMetadata.generation_timestamp is
+    # required and non-nullable in the TS contract
+    # (features/privacy-assessments/types.ts), but
+    # privacy_assessment_task.created_at is DB-nullable (verified against
+    # the live migration) even though every normal write path
+    # server_defaults it to now(). A task row with an explicit null
+    # created_at must not raise on serialisation — it must come back as no
+    # metadata, the same way a dangling task id already does.
+    tid = _seed_template(db)
+    task_id = f"task_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacy_assessment_task "
+            "(id, action_type, status, celery_id, total_count, completed_count, "
+            " assessment_types, use_llm, high_risk_only, created_at) "
+            "VALUES (:id, 'generate', 'complete', :celery_id, 0, 0, "
+            " '{}', false, false, NULL)"
+        ),
+        {"id": task_id, "celery_id": f"celery_{uuid.uuid4().hex[:8]}"},
+    )
+    aid = _seed_assessment(db, tid, "Null Task Timestamp DPIA", task_id=task_id)
+    db.flush()
+    assert _assessment_detail(db, aid).metadata is None

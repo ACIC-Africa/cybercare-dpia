@@ -18,6 +18,7 @@ from fides.api.privacycare.api.schemas import (
     AssessmentSummaryResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
+    QuestionEvidence,
     QuestionGroup,
     TemplateResponse,
     template_key,
@@ -250,12 +251,34 @@ def test_assessment_evidence_response_optionality_matches_the_shipped_contract()
         assert pydantic_required == (not is_optional), field
 
 
+def test_question_evidence_matches_the_shipped_contract():
+    # Fix round 2 gap, surfaced by walking every response_model's nested
+    # types (test_response_model_ts_parity.py): QuestionEvidence is reachable
+    # from AssessmentEvidenceResponse.by_question and has a same-named TS
+    # counterpart in the feature types file, but nothing asserted the two
+    # matched until now — schemas.py's own comment on QuestionEvidence only
+    # noted nothing populates `by_question` yet, not that the type itself
+    # was untested.
+    assert set(QuestionEvidence.model_fields) == _feature_interface_fields(
+        "QuestionEvidence"
+    )
+
+
+def test_question_evidence_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "QuestionEvidence"
+    ).items():
+        pydantic_required = QuestionEvidence.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
 def test_the_evidence_feature_types_were_actually_read():
     # Same guard as test_the_feature_types_file_was_actually_read: a bad
     # path or regex would make the parity tests above compare empty sets
     # and pass vacuously.
     assert len(_feature_interface_fields("EvidenceItem")) == 9
     assert len(_feature_interface_fields("AssessmentEvidenceResponse")) == 5
+    assert len(_feature_interface_fields("QuestionEvidence")) == 3
 
 
 def test_assessment_question_response_matches_the_shipped_contract():
