@@ -7,12 +7,16 @@ This test used to assert the gap (routes absent) and said, in its own
 docstring, to invert the assertion once W1 lands — making the gap closing
 visible in the diff rather than implicit. That inversion happens here.
 
-Only the five READ paths are asserted present. The remaining paths in the
-original gap list (single-question fetch, questionnaire, questionnaire
-reminders, PDF export, tasks, and config) are WRITE-adjacent or not part of
-this read surface — they belong to plan 04 and are still correctly absent.
-That absence is intentional, not a regression: see
-`test_write_and_other_routes_still_absent` below.
+Task 7 adds `GET .../tasks` and `GET .../tasks/{task_id}` (the progress-bar
+polling routes) to the served surface, so those two moved out of
+EXPECTED_STILL_ABSENT_ROUTES and into EXPECTED_READ_ROUTES below — they were
+placeholders for "not built yet", not "never will be".
+
+The remaining paths in the original gap list (single-question fetch,
+questionnaire, questionnaire reminders, PDF export, and config) are
+WRITE-adjacent or not part of this read surface — they belong to plan 04 and
+are still correctly absent. That absence is intentional, not a regression:
+see `test_write_and_other_routes_still_absent` below.
 
 `GET /{assessment_id}/questions` was a sixth READ path here, but nothing
 called it — the UI's slice defines a PUT on that path, never a GET — and
@@ -30,6 +34,8 @@ EXPECTED_READ_ROUTES = [
     "plus/privacy-assessments/templates",
     "plus/privacy-assessments/{assessment_id}",
     "plus/privacy-assessments/{assessment_id}/evidence",
+    "plus/privacy-assessments/tasks",
+    "plus/privacy-assessments/tasks/{task_id}",
 ]
 
 # Not part of this read surface (plan 04, write paths) — still absent, and
@@ -40,8 +46,6 @@ EXPECTED_STILL_ABSENT_ROUTES = [
     "plus/privacy-assessments/{id}/questionnaire",
     "plus/privacy-assessments/{id}/questionnaire/reminders",
     "plus/privacy-assessments/{id}/pdf",
-    "plus/privacy-assessments/tasks",
-    "plus/privacy-assessments/tasks/{task_id}",
     "plus/privacy-assessments/config",
     "plus/privacy-assessments/config/defaults",
 ]

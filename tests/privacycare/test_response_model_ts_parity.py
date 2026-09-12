@@ -103,6 +103,20 @@ ALLOWLIST: dict[str, dict] = {
             "test_grouped_assessments_response_matches_the_shipped_contract."
         ),
     },
+    "Page[AssessmentTaskResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Same precedent as Page[TemplateResponse] above: "
+            "fastapi_pagination.Page[T]'s generic envelope (items/total/"
+            "page/size/pages) is proven once against the TS pagination "
+            "contract by test_grouped_assessments_response_matches_the_"
+            "shipped_contract — not re-asserted per T, even though a "
+            "generated Page_AssessmentTaskResponse_.ts also happens to "
+            "exist and mirrors that same shape field-for-field. "
+            "AssessmentTaskResponse (T itself) is fully recursed into and "
+            "carries its own parity tests in test_api_schemas.py."
+        ),
+    },
 }
 
 

@@ -34,6 +34,24 @@ def register() -> None:
 
     if getattr(app_setup, _REGISTERED_FLAG, False):
         return
+
+    # api/tasks.py binds POST "", GET "/tasks" and GET "/tasks/{task_id}" —
+    # imported BEFORE api/assessments (below) so those routes land in
+    # privacycare_router.routes ahead of assessments' GET "/{assessment_id}".
+    # FastAPI/Starlette match routes in registration order and stop at the
+    # first match: if "/{assessment_id}" registered first, a request for
+    # "/tasks" would match IT instead (assessment_id="tasks"), and the
+    # progress bar would 404 forever against a route that does exist. This
+    # import order is only sufficient because api/tasks.py itself imports
+    # api/assessments's _created_by_from_client lazily, inside the request
+    # handler rather than at module level — a module-level import there
+    # would force api/assessments to bind its own routes first regardless of
+    # what order these two lines run in.
+    #
+    # Aliased on import: this package already has a top-level `tasks`
+    # module (Task 5's Celery task, imported below) and re-binding that name
+    # here would shadow it.
+    from fides.api.privacycare.api import tasks as api_tasks  # noqa: F401
     from fides.api.privacycare.api import assessments  # noqa: F401  (binds routes)
 
     # Importing the task module registers privacycare.generate_assessments
@@ -41,13 +59,6 @@ def register() -> None:
     # message; the worker process gets it from
     # fides.api.privacycare.worker.
     from fides.api.privacycare import tasks  # noqa: F401
-
-    # api/tasks.py binds POST "" (create_privacy_assessment) — imported
-    # after api/assessments, whose _created_by_from_client it depends on.
-    # Aliased on import: this package already has a top-level `tasks`
-    # module (Task 5's Celery task, imported two lines up) and re-binding
-    # that name here would shadow it.
-    from fides.api.privacycare.api import tasks as api_tasks  # noqa: F401
 
     app_setup.ROUTERS.append(privacycare_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

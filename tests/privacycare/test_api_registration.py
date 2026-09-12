@@ -10,6 +10,8 @@ EXPECTED_READ_PATHS = {
     "/plus/privacy-assessments/templates",
     "/plus/privacy-assessments/{assessment_id}",
     "/plus/privacy-assessments/{assessment_id}/evidence",
+    "/plus/privacy-assessments/tasks",
+    "/plus/privacy-assessments/tasks/{task_id}",
 }
 
 PRIVACYCARE_PATH_PREFIX = "/plus/privacy-assessments"

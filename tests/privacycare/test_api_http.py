@@ -29,6 +29,8 @@ GET_ROUTE_SUFFIXES = [
     "/templates",
     f"/{_ASSESSMENT_ID}",
     f"/{_ASSESSMENT_ID}/evidence",
+    "/tasks",
+    "/tasks/does-not-matter",
 ]
 
 

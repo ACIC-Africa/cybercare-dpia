@@ -19,8 +19,11 @@ from fides.api.privacycare.api.schemas import (
     AssessmentSummaryBlockedGroup,
     AssessmentSummaryOwner,
     AssessmentSummaryResponse,
+    AssessmentTaskResponse,
+    AssessmentTaskSystemInfo,
     BulkUpdateAnswersRequest,
     BulkUpdateAnswersResponse,
+    CreateAssessmentTaskRequest,
     CreateAssessmentTaskResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
@@ -574,6 +577,60 @@ def test_create_assessment_task_response_optionality_matches_the_feature_contrac
 def test_the_create_assessment_task_response_contracts_were_actually_read():
     assert len(_ts_fields("CreateAssessmentTaskResponse")) == 3
     assert len(_feature_interface_fields("CreateAssessmentTaskResponse")) == 3
+
+
+def test_create_assessment_task_request_matches_the_generated_contract():
+    # Task 7: CreateAssessmentTaskRequest has no feature-file override — the
+    # feature types.ts file re-exports the generated type directly
+    # (`export type { CreateAssessmentTaskRequest, ... }`) rather than
+    # redeclaring it, so the generated file is the only contract to pin
+    # against.
+    assert set(CreateAssessmentTaskRequest.model_fields) == _ts_fields(
+        "CreateAssessmentTaskRequest"
+    )
+
+
+def test_the_create_assessment_task_request_contract_was_actually_read():
+    assert len(_ts_fields("CreateAssessmentTaskRequest")) == 5
+
+
+def test_assessment_task_response_matches_the_generated_contract():
+    # Parity is pinned against the GENERATED file, not the feature-folder
+    # override: the generated file is Ethyca's published OpenAPI contract,
+    # so matching it means a future regeneration produces no diff against
+    # us. The feature override (`AssessmentTaskResponse` in
+    # features/privacy-assessments/types.ts) is missing `high_risk_only`
+    # entirely — see
+    # test_assessment_task_response_keeps_high_risk_only_the_feature_override_omits
+    # below — so asserting equality against it here would fail on a field
+    # this schema is required to keep.
+    assert set(AssessmentTaskResponse.model_fields) == _ts_fields(
+        "AssessmentTaskResponse"
+    )
+
+
+def test_assessment_task_response_keeps_high_risk_only_the_feature_override_omits():
+    # Explicit decision from the task brief: AssessmentTaskResponse keeps
+    # high_risk_only (present in the generated contract) even though the
+    # hand-written feature override omits it. Populate-every-field wins over
+    # narrowing to the feature file's subset.
+    assert "high_risk_only" in AssessmentTaskResponse.model_fields
+    assert "high_risk_only" in _ts_fields("AssessmentTaskResponse")
+    assert "high_risk_only" not in _feature_interface_fields("AssessmentTaskResponse")
+
+
+def test_the_assessment_task_response_contract_was_actually_read():
+    assert len(_ts_fields("AssessmentTaskResponse")) == 17
+
+
+def test_assessment_task_system_info_matches_the_generated_contract():
+    assert set(AssessmentTaskSystemInfo.model_fields) == _ts_fields(
+        "AssessmentTaskSystemInfo"
+    )
+
+
+def test_the_assessment_task_system_info_contract_was_actually_read():
+    assert len(_ts_fields("AssessmentTaskSystemInfo")) == 2
 
 
 def test_update_privacy_assessment_request_matches_the_shipped_contract():

@@ -3,11 +3,23 @@ import uuid
 import pytest
 import sqlalchemy
 from fastapi import HTTPException
+from fastapi_pagination import Params, paginate
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.schemas import CreateAssessmentTaskRequest
-from fides.api.privacycare.api.tasks import create_privacy_assessment
-from tests.privacycare.test_api_assessments import _fake_client
+from fides.api.privacycare.api.tasks import (
+    _list_tasks,
+    _task_detail,
+    create_privacy_assessment,
+    get_assessment_task,
+)
+from tests.privacycare.test_api_assessments import (
+    _fake_client,
+    _seed_assessment,
+    _seed_template,
+)
+from tests.privacycare.test_context import _seed_system
+from tests.privacycare.test_tasks import _seed_task
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -163,3 +175,152 @@ def test_the_response_names_the_task_and_says_it_is_queued(db, queued, monkeypat
     assert response.status == "pending"
     assert response.message
     assert response.task_id
+
+
+def test_task_detail_reports_progress_as_a_percentage(db):
+    # AssessmentTaskStatusIndicator.tsx renders
+    # `Math.round(activeTask.progress)`%, so progress is 0-100, not 0-1. A
+    # fraction here renders as "0%" through an entire run.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task "
+            "SET total_count = 4, completed_count = 1 WHERE id = :id"
+        ),
+        {"id": task_id},
+    )
+    db.flush()
+
+    assert _task_detail(db, task_id).progress == 25.0
+
+
+def test_progress_is_zero_when_nothing_is_counted_yet(db):
+    # total_count is 0 until the task starts. Deriving progress must not
+    # divide by zero — the Ethyca model's own property guards this.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.flush()
+
+    assert _task_detail(db, task_id).progress == 0.0
+
+
+def test_task_detail_lists_the_assessments_it_produced(db):
+    # There is no assessment_ids column; the field is derived from
+    # privacy_assessment.privacy_assessment_task_id.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    tid = _seed_template(db)
+    first = _seed_assessment(db, tid, "A", task_id=task_id)
+    second = _seed_assessment(db, tid, "B", task_id=task_id)
+    _seed_assessment(db, tid, "Unrelated")
+    db.flush()
+
+    assert sorted(_task_detail(db, task_id).assessment_ids) == sorted([first, second])
+
+
+def test_task_detail_resolves_the_systems_it_was_asked_about(db):
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_system(db, key, name="CRM")
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"], system_fides_keys=[key])
+    db.flush()
+
+    systems = _task_detail(db, task_id).systems
+
+    assert [(s.fides_key, s.name) for s in systems] == [(key, "CRM")]
+
+
+def test_a_system_key_with_no_matching_system_still_appears(db):
+    # A system deleted after the task ran must not vanish from the task's
+    # record of what it was asked to assess.
+    task_id = _seed_task(
+        db, assessment_types=["gdpr_dpia"], system_fides_keys=["deleted-system"]
+    )
+    db.flush()
+
+    systems = _task_detail(db, task_id).systems
+
+    assert [(s.fides_key, s.name) for s in systems] == [("deleted-system", None)]
+
+
+def test_systems_is_none_when_the_task_targeted_every_system(db):
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"], system_fides_keys=None)
+    db.flush()
+
+    detail = _task_detail(db, task_id)
+
+    assert detail.system_fides_keys is None
+    assert detail.systems is None
+
+
+def test_task_detail_404s_for_an_unknown_id(db):
+    with pytest.raises(LookupError):
+        _task_detail(db, "no-such-task")
+
+
+def test_the_task_detail_route_maps_an_unknown_id_to_404(db):
+    with pytest.raises(HTTPException) as exc_info:
+        get_assessment_task("no-such-task", db=db)
+    assert exc_info.value.status_code == 404
+
+
+def test_list_tasks_is_newest_first(db):
+    # The UI reads items[0] to find the active task. Oldest-first would make
+    # it watch a run that finished last week.
+    older = _seed_task(db, assessment_types=["gdpr_dpia"])
+    newer = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task SET created_at = now() - interval '1 day' "
+            "WHERE id = :id"
+        ),
+        {"id": older},
+    )
+    db.flush()
+
+    ids = [item.id for item in _list_tasks(db)]
+
+    assert ids.index(newer) < ids.index(older)
+
+
+def test_list_tasks_filters_by_status(db):
+    done = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task SET status = 'complete' WHERE id = :id"
+        ),
+        {"id": done},
+    )
+    pending = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.flush()
+
+    ids = [item.id for item in _list_tasks(db, status="complete")]
+
+    assert done in ids
+    assert pending not in ids
+
+
+def test_list_tasks_returns_an_items_envelope(db):
+    # Page_AssessmentTaskResponse_ is {items,total,page,size,pages}. Three
+    # screens in this module have already shipped empty because a route
+    # returned a bare list where the UI read `.items`.
+    _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.flush()
+
+    page = paginate(_list_tasks(db), Params(page=1, size=50))
+
+    assert hasattr(page, "items")
+    assert page.total >= 1
+
+
+def test_the_tasks_route_is_matched_before_the_assessment_id_route():
+    # /tasks would otherwise be swallowed by /{assessment_id}, and the
+    # progress bar would 404 forever against a route that exists.
+    #
+    # route.path on this router carries the full "/plus/privacy-assessments"
+    # prefix (Fides' APIRouter subclass applies it at add_api_route time,
+    # confirmed by inspection — it is not the bare suffix passed to
+    # @privacycare_router.get), so the paths compared here must match that.
+    from fides.api.privacycare.api.router import privacycare_router
+
+    paths = [route.path for route in privacycare_router.routes]
+    assert paths.index("/plus/privacy-assessments/tasks") < paths.index(
+        "/plus/privacy-assessments/{assessment_id}"
+    )
