@@ -3,6 +3,7 @@
 # helpers rather than duplicated here).
 import pytest
 import sqlalchemy
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.answers import (
@@ -279,4 +280,78 @@ def test_foreign_question_raises_rather_than_writing(db):
 
     assert _answer_row(db, aid, foreign_qid) is None, (
         "rule 4: a foreign question must be a client error, not a silent no-op"
+    )
+
+
+def _captured_statements(db):
+    # Fix round 1: proves the lock is actually taken, not just documented.
+    # `before_cursor_execute` fires for every statement sent to this
+    # session's engine, so collecting them and asserting "FOR UPDATE"
+    # appears is a direct check on the emitted SQL, not on our own source.
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    return statements, engine, _capture
+
+
+def test_write_answer_locks_the_parent_assessment_row(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Lock DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    statements, engine, capture = _captured_statements(db)
+    try:
+        write_answer(db, aid, qid, "Locked answer.", "alice@example.com")
+        db.flush()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert any("FOR UPDATE" in s for s in statements), (
+        "write_answer must take a FOR UPDATE lock on the parent "
+        "privacy_assessment row before its handle/version reads — "
+        "closing the three read-then-write races fix round 1 found"
+    )
+
+
+def test_recompute_completeness_locks_the_parent_assessment_row(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Recompute Lock DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    statements, engine, capture = _captured_statements(db)
+    try:
+        recompute_completeness(db, aid)
+        db.flush()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert any("FOR UPDATE" in s for s in statements), (
+        "recompute_completeness must take its own lock — it is also called "
+        "on its own, not only right after write_answer in the same "
+        "transaction"
+    )
+
+
+def test_write_answer_against_nonexistent_assessment_raises_without_inserting(db):
+    with pytest.raises(LookupError):
+        write_answer(
+            db, "no-such-assessment", "no-such-question", "text", "alice@example.com"
+        )
+    db.flush()
+
+    count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": "no-such-assessment"},
+    ).scalar()
+    assert count == 0, (
+        "a write against a nonexistent assessment must raise before any "
+        "insert, not leave an orphaned assessment_answer row behind"
     )

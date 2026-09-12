@@ -35,8 +35,29 @@ class QuestionNotInTemplateError(ValueError):
     """
 
 
-_ASSESSMENT_TEMPLATE_SQL = sqlalchemy.text(
-    "SELECT template_id FROM privacy_assessment WHERE id = :assessment_id"
+# Fix round 1 (coordinator review, MAJOR finding): write_answer used to be
+# read-then-write in three unlocked places —
+#   1. SELECT assessment_answer handle -> INSERT: two concurrent writes for
+#      the same (assessment, question) could each see no handle and both
+#      insert one, breaking the one-handle rule.
+#   2. SELECT MAX(version_number) -> INSERT at max+1: two concurrent writes
+#      to the same answer could read the same max and collide on the same
+#      version_number, corrupting the audit trail's ordering.
+#   3. recompute_completeness's read-then-write of
+#      privacy_assessment.completeness: a classic lost update between two
+#      concurrent recomputes.
+# `assessment_answer`/`answer_version` are Ethyca-authored tables (per this
+# module's own no-ORM-coupling convention above) — adding a unique
+# constraint there would put this app's Alembic chain into their schema,
+# exactly what fides.api.privacycare.migrations.include_object exists to
+# keep separate. Instead, every write/recompute takes a FOR UPDATE row lock
+# on the PARENT privacy_assessment row before any read. That serializes any
+# two transactions touching the same assessment_id — the second blocks here
+# until the first commits and releases the lock, then re-reads fresh state —
+# which closes all three races at once without touching either table's
+# schema.
+_LOCK_ASSESSMENT_SQL = sqlalchemy.text(
+    "SELECT template_id FROM privacy_assessment WHERE id = :assessment_id FOR UPDATE"
 )
 
 _QUESTION_TEMPLATE_SQL = sqlalchemy.text(
@@ -114,19 +135,36 @@ class AnswerWriteResult(BaseModel):
     created_by: str | None
 
 
-def _require_question_in_template(
-    db: Session, assessment_id: str, question_id: str
-) -> None:
-    assessment_row = db.execute(
-        _ASSESSMENT_TEMPLATE_SQL, {"assessment_id": assessment_id}
-    ).first()
-    if assessment_row is None:
-        raise LookupError(f"No assessment with id {assessment_id}")
+def _lock_assessment_and_get_template_id(db: Session, assessment_id: str) -> str:
+    """Lock the parent privacy_assessment row FOR UPDATE and return its
+    template_id, or raise LookupError if the assessment does not exist.
 
+    Called first, before any other read, by both write_answer and
+    recompute_completeness — see _LOCK_ASSESSMENT_SQL's comment for why. The
+    lock is a plain Postgres row lock: re-acquiring it a second time in the
+    same transaction (e.g. write_answer, then recompute_completeness called
+    right after in the same request) does not block — it's already held by
+    this transaction — so it is safe for either function to call this
+    unconditionally regardless of what the caller already holds.
+
+    Raising here (rather than proceeding) matters as much as the lock
+    itself: writing or recomputing against a nonexistent assessment_id would
+    otherwise insert/update orphaned rows with nothing to ever read them
+    back.
+    """
+    row = db.execute(_LOCK_ASSESSMENT_SQL, {"assessment_id": assessment_id}).first()
+    if row is None:
+        raise LookupError(f"No assessment with id {assessment_id}")
+    return row[0]
+
+
+def _require_question_in_template(
+    db: Session, assessment_id: str, question_id: str, template_id: str
+) -> None:
     question_row = db.execute(
         _QUESTION_TEMPLATE_SQL, {"question_id": question_id}
     ).first()
-    if question_row is None or question_row[0] != assessment_row[0]:
+    if question_row is None or question_row[0] != template_id:
         raise QuestionNotInTemplateError(
             f"question {question_id} does not belong to assessment "
             f"{assessment_id}'s template"
@@ -166,8 +204,16 @@ def write_answer(
     change_type/answer_source are NOT part of that decision — they are
     fixed by the task brief itself for a human-typed save: change_type is
     always "human_edited", answer_source is always "user_input".
+
+    Concurrency (fix round 1): the very first thing this function does is
+    lock the parent assessment row FOR UPDATE — see
+    _lock_assessment_and_get_template_id — before the handle lookup, the
+    version-number lookup, or any write below. The caller owns the
+    transaction (this function never commits); the lock is held until the
+    caller's transaction ends.
     """
-    _require_question_in_template(db, assessment_id, question_id)
+    template_id = _lock_assessment_and_get_template_id(db, assessment_id)
+    _require_question_in_template(db, assessment_id, question_id, template_id)
 
     existing = db.execute(
         _FIND_ANSWER_HANDLE_SQL,
@@ -238,12 +284,18 @@ def recompute_completeness(db: Session, assessment_id: str) -> float:
     _COMPLETE_ANSWERS_SQL's comment above. If the two definitions ever
     diverge, the detail screen and this write's response tell a DPO two
     different numbers for the same assessment.
+
+    Concurrency (fix round 1): this is a read-then-write of
+    privacy_assessment.completeness on its own (race 3 in
+    _LOCK_ASSESSMENT_SQL's comment), so it takes the same FOR UPDATE lock
+    itself rather than trusting a caller to hold one. That makes this
+    function correct both call shapes it's actually used in: called right
+    after write_answer in the same transaction (re-acquiring a lock this
+    transaction already holds — a no-op, not a block), and called on its
+    own with no pre-existing lock (e.g. a standalone recompute/reconciliation
+    pass), where this is the only thing protecting it.
     """
-    assessment_row = db.execute(
-        _ASSESSMENT_TEMPLATE_SQL, {"assessment_id": assessment_id}
-    ).first()
-    if assessment_row is None:
-        raise LookupError(f"No assessment with id {assessment_id}")
+    _lock_assessment_and_get_template_id(db, assessment_id)
 
     total = db.execute(_TOTAL_QUESTIONS_SQL, {"assessment_id": assessment_id}).scalar()
     complete = db.execute(
