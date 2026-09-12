@@ -17,6 +17,7 @@
 # only fires on an ORM-level INSERT — a raw db.execute(text(...)) bypasses it
 # — matching the "aa_"/"av_" prefix convention already used by
 # tests/privacycare/test_api_assessments.py's _seed_answer_with_evidence.
+import json
 import uuid
 
 import sqlalchemy
@@ -78,13 +79,26 @@ _MAX_VERSION_NUMBER_SQL = sqlalchemy.text(
     "WHERE answer_id = :answer_id"
 )
 
+# `evidence` is JSONB and a bound text parameter has no implicit cast to
+# JSONB in Postgres, so the CAST is required — the same reason
+# _seed_answer_with_evidence in test_api_assessments.py already casts it.
 _INSERT_ANSWER_VERSION_SQL = sqlalchemy.text(
     "INSERT INTO answer_version "
     "(id, answer_id, version_number, answer_text, answer_status, "
-    " answer_source, change_type, created_by) "
+    " answer_source, change_type, created_by, evidence) "
     "VALUES (:id, :answer_id, :version_number, :answer_text, :answer_status, "
-    " :answer_source, :change_type, :created_by)"
+    " :answer_source, :change_type, :created_by, CAST(:evidence AS JSONB))"
 )
+
+# The three PG enums answer_version's columns are typed against (verified
+# against pg_enum on the live database). Validated here rather than left to
+# Postgres because this function's newest caller is a Celery task: a
+# DataError raised inside a worker surfaces as an opaque task failure with
+# the bad value buried in a driver traceback, while a ValueError raised here
+# names the parameter at the call site that chose it.
+_ANSWER_STATUSES = frozenset({"complete", "partial", "needs_input"})
+_ANSWER_SOURCES = frozenset({"system", "ai_analysis", "user_input", "team_input"})
+_CHANGE_TYPES = frozenset({"ai_generated", "human_edited", "approved", "rejected"})
 
 _REPOINT_CURRENT_VERSION_SQL = sqlalchemy.text(
     "UPDATE assessment_answer SET current_version_id = :version_id "
@@ -212,6 +226,11 @@ def write_answer(
     question_id: str,
     answer_text: str,
     created_by: str | None,
+    *,
+    answer_status: str = "complete",
+    answer_source: str = "user_input",
+    change_type: str = "human_edited",
+    evidence: dict | None = None,
 ) -> None:
     """Append a new answer_version for (assessment_id, question_id) and
     repoint the assessment_answer handle at it. Never overwrites a prior
@@ -250,7 +269,30 @@ def write_answer(
     version-number lookup, or any write below. The caller owns the
     transaction (this function never commits); the lock is held until the
     caller's transaction ends.
+
+    The four keyword-only parameters exist for the generation path (plan
+    05). Their DEFAULTS are the human-typed save this function was written
+    for and must not change: plan 04 settled answer_status="complete" from
+    QuestionCard.tsx (which posts only answer_text and renders no status
+    control), and the brief fixed answer_source="user_input" /
+    change_type="human_edited" for a person's edit. They are keyword-only
+    so that no positional call site can supply one by accident, and so that
+    reading any call tells you immediately whether it is a human save or a
+    generated one.
+
+    Generation writes through THIS function rather than its own INSERT so
+    that a DPO correcting a machine draft appends version 2 of the same
+    answer. One writer means the row lock, the one-handle rule and the
+    version numbering cannot drift between the two paths.
     """
+    for name, value, allowed in (
+        ("answer_status", answer_status, _ANSWER_STATUSES),
+        ("answer_source", answer_source, _ANSWER_SOURCES),
+        ("change_type", change_type, _CHANGE_TYPES),
+    ):
+        if value not in allowed:
+            raise ValueError(f"{name}={value!r} is not one of {sorted(allowed)}")
+
     template_id = _lock_assessment_and_get_template_id(db, assessment_id)
     _require_question_in_template(db, assessment_id, question_id, template_id)
 
@@ -276,9 +318,6 @@ def write_answer(
     max_version = db.execute(_MAX_VERSION_NUMBER_SQL, {"answer_id": answer_id}).scalar()
     version_number = (max_version or 0) + 1
     version_id = f"av_{uuid.uuid4().hex[:8]}"
-    answer_status = "complete"
-    answer_source = "user_input"
-    change_type = "human_edited"
 
     db.execute(
         _INSERT_ANSWER_VERSION_SQL,
@@ -291,6 +330,7 @@ def write_answer(
             "answer_source": answer_source,
             "change_type": change_type,
             "created_by": created_by,
+            "evidence": json.dumps(evidence or {}),
         },
     )
     # Rule 1: repoint the handle at the new version. The row just inserted

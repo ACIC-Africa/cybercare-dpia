@@ -42,7 +42,7 @@ def _version_row(db, version_id: str):
     return db.execute(
         sqlalchemy.text(
             "SELECT id, answer_id, version_number, answer_text, answer_status, "
-            " answer_source, change_type, created_by "
+            " answer_source, change_type, created_by, evidence "
             "FROM answer_version WHERE id = :id"
         ),
         {"id": version_id},
@@ -68,7 +68,8 @@ def _versions(db, assessment_id: str, question_id: str):
     return db.execute(
         sqlalchemy.text(
             "SELECT av.id, av.answer_id, av.version_number, av.answer_text, "
-            " av.answer_status, av.answer_source, av.change_type, av.created_by "
+            " av.answer_status, av.answer_source, av.change_type, av.created_by, "
+            " av.evidence "
             "FROM answer_version av "
             "JOIN assessment_answer a ON a.id = av.answer_id "
             "WHERE a.assessment_id = :aid AND a.question_id = :qid "
@@ -484,3 +485,100 @@ def test_write_answer_against_nonexistent_assessment_raises_without_inserting(db
         "a write against a nonexistent assessment must raise before any "
         "insert, not leave an orphaned assessment_answer row behind"
     )
+
+
+def test_write_answer_defaults_are_unchanged_for_a_human_save(db):
+    # The four new keyword parameters must not move the human path. Plan 04
+    # settled these three values from QuestionCard.tsx; a default drifting
+    # here would silently relabel every DPO-typed answer.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Defaults DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    write_answer(db, aid, qid, "Typed by a person.", "alice@example.com")
+
+    version = _current_version(db, aid, qid)
+    assert version["answer_status"] == "complete"
+    assert version["answer_source"] == "user_input"
+    assert version["change_type"] == "human_edited"
+    assert version["evidence"] == {}
+
+
+def test_write_answer_records_a_generated_answer_with_its_source_and_evidence(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Generated DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    evidence = {
+        "items": [
+            {
+                "id": "ev_1",
+                "type": "system",
+                "value": "marketing.advertising",
+                "created_at": "2026-09-12T00:00:00",
+                "field_name": "data_use",
+                "source_key": "privacy_declaration.data_use",
+                "source_type": "privacy_declaration",
+                "citation_number": 1,
+            }
+        ]
+    }
+
+    write_answer(
+        db,
+        aid,
+        qid,
+        "Drafted from the declaration record.",
+        "privacycare-generator",
+        answer_status="partial",
+        answer_source="ai_analysis",
+        change_type="ai_generated",
+        evidence=evidence,
+    )
+
+    version = _current_version(db, aid, qid)
+    assert version["answer_status"] == "partial"
+    assert version["answer_source"] == "ai_analysis"
+    assert version["change_type"] == "ai_generated"
+    assert version["evidence"] == evidence
+
+
+def test_a_generated_answer_and_a_human_edit_share_one_version_chain(db):
+    # The point of routing generation through write_answer: a DPO correcting
+    # a machine draft must produce version 2 of the same answer, not a
+    # second handle. That chain is the "who changed this, and from what"
+    # a regulator asks for.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Chain DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    write_answer(
+        db, aid, qid, "Machine draft.", "privacycare-generator",
+        answer_status="partial", answer_source="ai_analysis",
+        change_type="ai_generated",
+    )
+    write_answer(db, aid, qid, "Corrected by the DPO.", "alice@example.com")
+
+    versions = _versions(db, aid, qid)
+    assert [v["version_number"] for v in versions] == [1, 2]
+    assert versions[0]["answer_source"] == "ai_analysis"
+    assert versions[1]["answer_source"] == "user_input"
+    assert versions[0]["answer_text"] == "Machine draft."
+
+
+def test_write_answer_rejects_a_status_outside_the_enum(db):
+    # answer_status/answer_source/change_type are PG enums. An out-of-enum
+    # value reaching Postgres raises DataError, which surfaces from a Celery
+    # worker as an opaque task failure. Reject it here, where the caller is.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bad Status DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    with pytest.raises(ValueError, match="answer_status"):
+        write_answer(
+            db, aid, qid, "text", "alice@example.com", answer_status="archived"
+        )
