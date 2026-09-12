@@ -133,6 +133,45 @@ def test_null_data_use_forms_its_own_group(db):
     assert aid in {a.id for a in group.assessments}
 
 
+def test_status_filter_returns_only_matching_assessments(db):
+    # Fix round 1: the UI's status filter (statusFilter in
+    # pages/privacy-assessments/index.tsx, passed as {status: statusFilter})
+    # was accepted and silently dropped by FastAPI — the route never read a
+    # status query param. This asserts the filter actually filters.
+    tid = _seed_template(db)
+    completed = _seed_assessment(
+        db, tid, "Completed", status="completed", data_use="essential.service"
+    )
+    in_progress = _seed_assessment(
+        db, tid, "In progress", status="in_progress", data_use="essential.service"
+    )
+    db.flush()
+    groups = _grouped_assessments(db, status="completed")
+    ids = {a.id for g in groups for a in (g.assessments or [])}
+    assert completed in ids
+    assert in_progress not in ids
+
+
+def test_status_filter_omitted_returns_everything(db):
+    tid = _seed_template(db)
+    completed = _seed_assessment(db, tid, "Completed", status="completed")
+    in_progress = _seed_assessment(db, tid, "In progress", status="in_progress")
+    db.flush()
+    groups = _grouped_assessments(db)
+    ids = {a.id for g in groups for a in (g.assessments or [])}
+    assert completed in ids
+    assert in_progress in ids
+
+
+def test_unknown_status_returns_empty_not_an_error(db):
+    tid = _seed_template(db)
+    _seed_assessment(db, tid, "Completed", status="completed")
+    db.flush()
+    groups = _grouped_assessments(db, status="not_a_real_status")
+    ids = {a.id for g in groups for a in (g.assessments or [])}
+    assert ids == set()
+
+
 def test_list_returns_seeded_assessments(db):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Fuel Dealer Onboarding DPIA")

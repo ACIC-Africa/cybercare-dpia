@@ -337,11 +337,23 @@ def _assessment_to_response(row) -> AssessmentResponse:
     )
 
 
-def _grouped_assessments(db: Session) -> list[AssessmentGroupResponse]:
+def _grouped_assessments(
+    db: Session, status: str | None = None
+) -> list[AssessmentGroupResponse]:
     # Groups the client's assessments by data_use, as the list page renders them.
     # Order is deterministic: named data uses alphabetically, the null group last.
+    # `status` filters against privacy_assessment.status (AssessmentStatus in
+    # features/privacy-assessments/types.ts: in_progress, completed, outdated,
+    # generating — confirmed against that file and the assessmentstatus
+    # Postgres enum, xx_2026_02_05_..._add_privacy_assessment_schema.py +
+    # xx_2026_05_04_..._add_generating_to_assessmentstatus.py). Filtering in
+    # Python against already-fetched rows means an unrecognised value simply
+    # matches nothing — it comes back as an empty result, not an error.
+    rows = _list_assessments(db)
+    if status is not None:
+        rows = [r for r in rows if r["status"] == status]
     groups: dict = {}
-    for row in _list_assessments(db):
+    for row in rows:
         key = row["data_use"]
         if key not in groups:
             groups[key] = {
@@ -370,10 +382,16 @@ def _grouped_assessments(db: Session) -> list[AssessmentGroupResponse]:
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
     response_model=Page[AssessmentGroupResponse],
 )
+# `page`/`size` here paginate GROUPS (one item per data_use), not individual
+# assessments — this route used to page assessments before task 2 introduced
+# grouping, so the same params now mean something different to a caller.
 def list_assessments(
-    *, db: Session = Depends(get_db), params: Params = Depends()
+    *,
+    db: Session = Depends(get_db),
+    params: Params = Depends(),
+    status: str | None = None,
 ) -> Page[AssessmentGroupResponse]:
-    return paginate(_grouped_assessments(db), params)
+    return paginate(_grouped_assessments(db, status=status), params)
 
 
 @privacycare_router.get(
