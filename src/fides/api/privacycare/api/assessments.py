@@ -772,6 +772,40 @@ def get_evidence(
     return AssessmentEvidenceResponse(**_evidence_for(db, assessment_id))
 
 
+def _created_by_from_client(client: ClientDetail) -> str:
+    """Every answer_version must name an author — NEVER NULL. An answer
+    version with no author is worthless as the evidence this versioned
+    design exists to produce: a regulator asking "who wrote this" must
+    never get NULL back.
+
+    client.user_id is None on two LEGITIMATE, ordinary paths — not just a
+    hypothetical edge case — so this falls back rather than rejecting the
+    write (fix round 1, MAJOR finding 2):
+
+    1. The root/admin login. user_endpoints.py's user_login, for the root
+       username/password branch, fetches
+       ClientDetail.get(db, object_id=CONFIG.security.oauth_root_client_id,
+       ...) directly — it never calls create_client_and_secret/
+       perform_login, so the root client is never linked to a FidesUser.
+       (Ethyca's own oauth/utils.py _populate_request_context_from_client
+       already treats this client as needing a substitute actor id for its
+       own audit-context purposes, for exactly this reason.)
+    2. Any standalone machine-to-machine API client. POST
+       /api/v1/oauth/client (oauth_endpoints.py's create_client) calls
+       ClientDetail.create_client_and_secret(..., scopes=...) with no
+       user_id argument at all — a fully ordinary, documented way to call
+       this API, not merely possible in theory.
+
+    Both are legitimate ways to reach this route, so a NULL user_id must
+    not be rejected. Falling back to the client's own id, prefixed to mark
+    it as a CLIENT rather than a USER, keeps the two id spaces
+    unambiguous in the audit trail while still naming an author.
+    """
+    if client.user_id:
+        return client.user_id
+    return f"client:{client.id}"
+
+
 def _update_answer(
     db: Session,
     assessment_id: str,
@@ -844,24 +878,27 @@ def update_answer(
     # (e.g. privacy_request_endpoints.py's reviewed_by=client.user_id,
     # imported_by=client.user_id): the linked FidesUser id when this token
     # belongs to a human's personal client, None for a system-to-system API
-    # client with no linked user — which is exactly why write_answer's
-    # created_by is typed str | None.
+    # client with no linked user or the root client (see
+    # _created_by_from_client below for both cases and why neither is
+    # rejected).
     client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
 ) -> UpdateAnswerResponse:
     """PUT one answer. created_by comes from the AUTHENTICATED PRINCIPAL
-    (client.user_id) above, never from `request` — UpdateAnswerRequest
-    carries only answer_text, precisely so a client cannot forge authorship
-    in the answer_version audit trail.
+    (_created_by_from_client(client)) above, never from `request` —
+    UpdateAnswerRequest carries only answer_text, precisely so a client
+    cannot forge authorship in the answer_version audit trail.
 
-    A thin HTTP shell around _update_answer: its only two jobs are (1)
+    A thin HTTP shell around _update_answer: its only three jobs are (1)
+    resolving a never-null author from the authenticated client, (2)
     mapping LookupError (unknown assessment) and QuestionNotInTemplateError
     (unknown/foreign question) to 404 — both are the same client-facing
     fact, "that thing is not there", and neither may escape as a 500 — and
-    (2) committing once _update_answer has succeeded.
+    (3) committing once _update_answer has succeeded.
     """
+    created_by = _created_by_from_client(client)
     try:
         response = _update_answer(
-            db, assessment_id, question_id, request.answer_text, client.user_id
+            db, assessment_id, question_id, request.answer_text, created_by
         )
     except (LookupError, QuestionNotInTemplateError):
         raise HTTPException(

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare.api.assessments import (
     _assessment_detail,
     _assessment_to_response,
+    _created_by_from_client,
     _evidence_for,
     _grouped_assessments,
     _list_assessments,
@@ -813,8 +814,11 @@ def test_detail_metadata_is_null_not_a_500_when_task_created_at_is_null(db):
 # of these tests (same as `db` above, which bypasses Depends(get_db)
 # entirely) — a plain object exposing `.user_id` is all update_answer reads
 # off it.
-def _fake_client(user_id):
-    return types.SimpleNamespace(user_id=user_id)
+def _fake_client(user_id, *, id="client_fake_default"):
+    # `id` matters now too: _created_by_from_client falls back to it when
+    # user_id is None (fix round 1, MAJOR finding 2) — a real ClientDetail
+    # always has one, so a stand-in must too.
+    return types.SimpleNamespace(user_id=user_id, id=id)
 
 
 def _seed_second_template(db) -> str:
@@ -889,16 +893,33 @@ def test_update_answer_status_is_the_assessments_not_the_answers(db):
     assert response.question.answer_status == "complete"
 
 
-def test_update_answer_created_by_comes_from_the_caller_not_the_body(db):
-    # UpdateAnswerRequest carries only answer_text — created_by is an
-    # argument _update_answer/write_answer take directly, never read off
-    # the request body, so a client cannot forge authorship.
+def test_update_answer_created_by_comes_from_the_caller_not_the_body(db, monkeypatch):
+    # Fix round 1, MAJOR finding 1: the original version of this test called
+    # _update_answer directly, which proves the CORE records whatever
+    # created_by it's handed — it proves nothing about where the ROUTE gets
+    # that value from. A regression that wired the route's created_by to
+    # the request body, or to a hardcoded string, would have shipped green
+    # under that version. This now goes through the actual PUT route
+    # (update_answer) with an authenticated client, and asserts the
+    # PERSISTED author is that client's user_id — a value that appears
+    # NOWHERE in the request body, so it could only have come from the
+    # client. Commit is monkeypatched (same reason as
+    # test_update_answer_route_commits_on_success below): a real commit
+    # would persist this test's rows past the `db` fixture's rollback.
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Created By DPIA")
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    _update_answer(db, aid, qid, "Answered.", "carol@example.com")
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    update_answer(
+        aid,
+        qid,
+        UpdateAnswerRequest(answer_text="Answered."),
+        db=db,
+        client=_fake_client("carol@example.com", id="client_should_not_be_used"),
+    )
 
     created_by = db.execute(
         sqlalchemy.text(
@@ -908,7 +929,64 @@ def test_update_answer_created_by_comes_from_the_caller_not_the_body(db):
         ),
         {"aid": aid, "qid": qid},
     ).scalar()
-    assert created_by == "carol@example.com"
+    assert created_by == "carol@example.com", (
+        "created_by must be the AUTHENTICATED CLIENT's user, not the "
+        "request body (which has no created_by field at all) and not a "
+        "hardcoded/forged value"
+    )
+
+
+def test_created_by_from_client_uses_the_linked_user_when_present():
+    client = _fake_client("alice@example.com", id="client_irrelevant")
+    assert _created_by_from_client(client) == "alice@example.com"
+
+
+def test_created_by_from_client_falls_back_to_a_marked_client_id_when_unlinked():
+    # Fix round 1, MAJOR finding 2: a SYSTEM_READ client with no linked
+    # FidesUser (client.user_id is None) is a LEGITIMATE, ordinary caller —
+    # the root client, and any standalone machine-to-machine API client
+    # created via POST /api/v1/oauth/client, both reach this route with
+    # user_id=None (see _created_by_from_client's own docstring for the
+    # file:line evidence). Neither is rejected; both must still produce a
+    # non-null, attributable author.
+    client = _fake_client(None, id="api_client_abc123")
+    result = _created_by_from_client(client)
+    assert result == "client:api_client_abc123"
+    assert result is not None
+
+
+def test_update_answer_route_never_persists_a_null_author(db, monkeypatch):
+    # End-to-end version of the unit test above: a client with no linked
+    # user must still produce a non-null, marked-as-client author in the
+    # actual persisted answer_version row — not NULL, which
+    # answer_version.created_by's column permits at the DB level (an
+    # Ethyca migration made it nullable) but this feature's audit-trail
+    # contract forbids.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Unlinked Client DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    update_answer(
+        aid,
+        qid,
+        UpdateAnswerRequest(answer_text="Answered by a bare API client."),
+        db=db,
+        client=_fake_client(None, id="api_client_no_user"),
+    )
+
+    created_by = db.execute(
+        sqlalchemy.text(
+            "SELECT av.created_by FROM assessment_answer a "
+            "JOIN answer_version av ON av.id = a.current_version_id "
+            "WHERE a.assessment_id = :aid AND a.question_id = :qid"
+        ),
+        {"aid": aid, "qid": qid},
+    ).scalar()
+    assert created_by == "client:api_client_no_user"
+    assert created_by is not None
 
 
 def test_update_answer_route_maps_unknown_assessment_to_404(db):
