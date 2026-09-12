@@ -643,7 +643,7 @@ def test_detail_question_evidence_skips_malformed_payload(db, caplog):
     # evidence drawer and EvidenceCardGroup.tsx calls
     # `item.field_name!.replace(...)` on it: a missing key there is a
     # browser crash. Both evidence paths now share
-    # _evidence_item_from_payload, so this must skip identically to (and log
+    # _evidence_items_from_payload, so this must skip identically to (and log
     # the same way as) the /evidence endpoint's existing
     # test_evidence_skips_payloads_missing_the_fields_evidenceitem_requires.
     caplog.set_level("WARNING")

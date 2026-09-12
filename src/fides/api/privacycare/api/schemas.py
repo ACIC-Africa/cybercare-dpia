@@ -211,7 +211,7 @@ class AssessmentQuestionResponse(BaseModel):
     # missing a required EvidenceItem field reached the browser as a runtime
     # crash instead of being caught here. Both this field and
     # AssessmentEvidenceResponse.items now go through the same
-    # _evidence_item_from_payload() normaliser in api/assessments.py, so a
+    # _evidence_items_from_payload() normaliser in api/assessments.py, so a
     # malformed payload is skipped (with the same logged warning) in both
     # places instead of only one.
     evidence: List[EvidenceItem]

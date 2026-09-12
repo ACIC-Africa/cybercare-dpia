@@ -236,14 +236,14 @@ def _as_str(value):
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
-def _evidence_item_from_payload(
+def _evidence_items_from_payload(
     payload,
     *,
     assessment_id: str,
     question_id: str,
     created_at=None,
     updated_at=None,
-) -> "EvidenceItem | None":
+) -> list:
     # Shared by BOTH evidence-shaping paths (fix round 2 finding): this file
     # used to validate the `/evidence` endpoint's payload against EvidenceItem
     # (via this function's predecessor) while `_question_response` injected
@@ -256,22 +256,25 @@ def _evidence_item_from_payload(
     # call this one function, so a malformed payload is skipped identically
     # (same logged warning) no matter which path it arrived on.
     #
-    # `answer_version.evidence` has no writer in this repo yet (that lands in
-    # plan 04) and the live `fides` database has zero answer_version rows, so
-    # there is no observed payload to shape this against. Its column default
-    # is a JSON *object* (not an array), which matches one EvidenceItem per
-    # answer_version rather than a list of them — so each qualifying row is
-    # treated as a single EvidenceItem-shaped payload. A payload that lacks
-    # the two fields EvidenceItem requires (`id`, `type`), or otherwise fails
-    # EvidenceItem's own validation, is skipped rather than papered over with
-    # invented values.
+    # Fix round 1 (task 3, coordinator ruling): this function used to treat
+    # the whole payload as ONE EvidenceItem, on the theory that the column's
+    # '{}' default implied one-object-per-answer_version. That theory was an
+    # inference from a column default with zero observed data behind it, and
+    # plan 05's generator supplies the fact that breaks it: a single
+    # `full`-coverage answer legitimately cites two or more fides_sources
+    # paths (e.g. privacy_declaration.data_use AND data_use.name), and one
+    # EvidenceItem per version cannot represent that. The generator writes
+    # {"items": [...]} — still a JSON *object*, so '{}' (no "items" key)
+    # keeps meaning "no evidence recorded", and the existing
+    # `av.evidence != '{}'::jsonb` exclusion in _EVIDENCE_SQL is untouched.
+    # A payload with no "items" key is still accepted as a single bare
+    # EvidenceItem-shaped object — the only shape ever actually written
+    # before this task — so a hand-written or legacy row is not silently
+    # dropped.
     #
-    # Fix round 1: this skip was silent — a malformed `evidence` object just
-    # vanished, with nothing to say so. Evidence is the thing a DPIA audit
-    # asks for; once plan 04's writer exists, a shape bug there would make
-    # evidence disappear from every assessment with no error, no log, no
-    # count. Skipping is still correct (one bad row must not fail the whole
-    # endpoint), but it must be loud, not silent.
+    # Each candidate item is validated independently by
+    # _validated_evidence_item: one bad item is skipped (logged), never
+    # discarding its siblings or failing the whole endpoint.
     if not isinstance(payload, dict):
         logger.warning(
             "Skipped evidence for assessment {} question {}: evidence "
@@ -280,8 +283,57 @@ def _evidence_item_from_payload(
             question_id,
             type(payload).__name__,
         )
+        return []
+
+    if "items" in payload:
+        candidates = payload["items"]
+        if not isinstance(candidates, list):
+            logger.warning(
+                "Skipped evidence for assessment {} question {}: "
+                "'items' was not a JSON array (got {})",
+                assessment_id,
+                question_id,
+                type(candidates).__name__,
+            )
+            return []
+    else:
+        candidates = [payload]
+
+    items = []
+    for candidate in candidates:
+        item = _validated_evidence_item(
+            candidate,
+            assessment_id=assessment_id,
+            question_id=question_id,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+        if item is not None:
+            items.append(item)
+    return items
+
+
+def _validated_evidence_item(
+    candidate,
+    *,
+    assessment_id: str,
+    question_id: str,
+    created_at=None,
+    updated_at=None,
+) -> "EvidenceItem | None":
+    # One candidate object -> one validated EvidenceItem, or None (logged).
+    # Split out of _evidence_items_from_payload so that function's job is
+    # purely "find the candidates" and this one's is purely "validate one".
+    if not isinstance(candidate, dict):
+        logger.warning(
+            "Skipped evidence item for assessment {} question {}: item "
+            "was not a JSON object (got {})",
+            assessment_id,
+            question_id,
+            type(candidate).__name__,
+        )
         return None
-    missing_fields = [f for f in ("id", "type") if f not in payload]
+    missing_fields = [f for f in ("id", "type") if f not in candidate]
     if missing_fields:
         logger.warning(
             "Skipped evidence for assessment {} question {}: missing "
@@ -293,17 +345,17 @@ def _evidence_item_from_payload(
         return None
     try:
         return EvidenceItem(
-            id=payload["id"],
-            type=payload["type"],
-            value=payload.get("value"),
-            created_at=payload.get("created_at")
+            id=candidate["id"],
+            type=candidate["type"],
+            value=candidate.get("value"),
+            created_at=candidate.get("created_at")
             or _as_str(created_at)
             or _as_str(updated_at),
-            field_name=payload.get("field_name"),
-            source_key=payload.get("source_key"),
-            source_type=payload.get("source_type"),
-            citation_number=payload.get("citation_number"),
-            data=payload.get("data"),
+            field_name=candidate.get("field_name"),
+            source_key=candidate.get("source_key"),
+            source_type=candidate.get("source_type"),
+            citation_number=candidate.get("citation_number"),
+            data=candidate.get("data"),
         )
     except ValidationError as exc:
         logger.warning(
@@ -319,19 +371,21 @@ def _evidence_item_from_payload(
 def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
     items: list[dict] = []
     for row in db.execute(_EVIDENCE_SQL, {"assessment_id": assessment_id}).mappings():
-        item = _evidence_item_from_payload(
+        # Fix round 1 (task 3): one row can now yield MULTIPLE evidence
+        # items — a {"items": [...]} payload citing two or more
+        # fides_sources paths — not just one.
+        for item in _evidence_items_from_payload(
             row["evidence"],
             assessment_id=assessment_id,
             question_id=row["question_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
-        )
-        if item is not None:
+        ):
             # Returned as a dict, not the EvidenceItem instance itself: this
             # function's callers (_evidence_for -> AssessmentEvidenceResponse)
             # and the tests exercising it treat `items` as plain mappings.
             # The validation this function exists to guarantee already
-            # happened in _evidence_item_from_payload above.
+            # happened in _validated_evidence_item above.
             items.append(item.model_dump())
     return items
 
@@ -363,18 +417,20 @@ def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionRespons
     # default, so "" is the empty-string analogue for a required str field.
     #
     # evidence: List[EvidenceItem], required (fix round 2: was List[dict],
-    # unvalidated — see _evidence_item_from_payload above). answer_version.
+    # unvalidated — see _evidence_items_from_payload above). answer_version.
     # evidence is a single JSONB *object* (verified against the live schema),
-    # not an array, with server_default '{}' meaning "answered, no evidence
+    # holding a {"items": [...]} container (fix round 1, task 3 — see that
+    # function's docstring for why a single-EvidenceItem-per-version shape
+    # was wrong), with server_default '{}' meaning "answered, no evidence
     # attached" — same exact-default exclusion already used in
     # _evidence_items_for. An unanswered question (no av row at all) has
     # evidence=None. Both cases collapse to the empty list; a genuinely
-    # populated, valid object is wrapped as the list's single element; an
-    # invalid one is dropped by the shared normaliser, loudly (logged), not
-    # silently.
+    # populated, valid container yields every item it validly holds — one
+    # or many; an invalid item is dropped by the shared normaliser, loudly
+    # (logged), not silently, without discarding its siblings.
     evidence = q["evidence"]
-    item = (
-        _evidence_item_from_payload(
+    items = (
+        _evidence_items_from_payload(
             evidence,
             assessment_id=assessment_id,
             question_id=q["id"],
@@ -382,7 +438,7 @@ def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionRespons
             updated_at=q["answer_updated_at"],
         )
         if evidence
-        else None
+        else []
     )
     return AssessmentQuestionResponse(
         id=q["question_key"],
@@ -396,7 +452,7 @@ def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionRespons
         answer_status=q["answer_status"] or "needs_input",
         answer_source=q["answer_source"] or "system",
         confidence=q["confidence"],
-        evidence=[item] if item is not None else [],
+        evidence=items,
         # No database source (Plus computes these) — empty forms, not
         # omitted. See the plan's field-by-field source table.
         missing_data=[],
