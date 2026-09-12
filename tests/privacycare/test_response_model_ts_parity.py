@@ -30,7 +30,10 @@ import typing
 
 from pydantic import BaseModel
 
-from fides.api.privacycare.api.router import PRIVACYCARE_PREFIX
+from fides.api.privacycare.api.router import (
+    PRIVACYCARE_PREFIX,
+    PRIVACYCARE_PROCESSES_PREFIX,
+)
 from fides.api.privacycare.asgi import app
 
 TS_DIR = (
@@ -62,6 +65,45 @@ _TEST_SOURCE = "\n".join(
 # "Page[TemplateResponse]"). value: {"ts_name": <expected TS name, or None
 # if there genuinely is no TS counterpart>, "reason": <why>}.
 ALLOWLIST: dict[str, dict] = {
+    # The business-process ROPA surface. These four have NO TypeScript
+    # counterpart, and that is a fact about the product rather than an
+    # omission: Fides has no business-process concept, so the shipped admin UI
+    # ships no screen that could call these routes. The surface exists for the
+    # consultant workflow the SOW describes ("Business Process Assessment and
+    # Data Mapping"), for export, and for the phase-3 projection onto
+    # process_node. If a UI is ever built for it, these entries come out and
+    # real parity tests go in.
+    "BusinessProcessResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: Fides has no business-process entity, so no "
+            "shipped admin-UI screen calls this route. Carol's method and the "
+            "SOW start from a business process; Fides' map starts from a "
+            "system. See api/processes.py's module docstring."
+        ),
+    },
+    "RopaDeclarationResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as BusinessProcessResponse. Note "
+            "Fides DOES ship a ROPA CSV export, but it is driven by the "
+            "plus/data-purpose/* family against a different, purpose-centric "
+            "model — not this one."
+        ),
+    },
+    "RopaEntryResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as BusinessProcessResponse."
+        ),
+    },
+    "Page[BusinessProcessResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Generic pagination wrapper over a model that itself has no TS "
+            "counterpart; there is nothing to be in parity with."
+        ),
+    },
     "AssessmentQuestionResponse": {
         "ts_name": "AssessmentQuestion",
         "reason": (
@@ -124,11 +166,20 @@ ALLOWLIST: dict[str, dict] = {
 }
 
 
+# Every router this module registers. Listing them rather than filtering on a
+# single prefix is deliberate: the business-process ROPA surface lives under
+# its own namespace (/api/v1/privacycare/...) because no shipped UI calls it,
+# and a walk anchored on the assessments prefix alone would have skipped that
+# whole router in silence — a passing test measuring nothing, which is exactly
+# the failure this file exists to catch.
+PRIVACYCARE_PATH_PREFIXES = (PRIVACYCARE_PREFIX, PRIVACYCARE_PROCESSES_PREFIX)
+
+
 def _privacycare_response_models():
     return [
         r.response_model
         for r in app.routes
-        if getattr(r, "path", "").startswith(PRIVACYCARE_PATH_PREFIX)
+        if getattr(r, "path", "").startswith(PRIVACYCARE_PATH_PREFIXES)
         and getattr(r, "response_model", None) is not None
     ]
 

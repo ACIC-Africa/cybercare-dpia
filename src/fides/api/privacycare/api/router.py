@@ -31,6 +31,17 @@ PRIVACYCARE_PREFIX = f"{V1_URL_PREFIX}/plus/privacy-assessments"
 
 privacycare_router = APIRouter(prefix=PRIVACYCARE_PREFIX, tags=["PrivacyCare"])
 
+# The business-process ROPA surface gets its own router and its own namespace.
+# PRIVACYCARE_PREFIX squats Ethyca's `plus` namespace because the shipped admin
+# UI calls those exact paths and the UI's path is the requirement. Nothing in
+# the shipped UI calls these, so taking a `plus` path here would only risk
+# colliding with a real Plus endpoint later.
+PRIVACYCARE_PROCESSES_PREFIX = f"{V1_URL_PREFIX}/privacycare/business-processes"
+
+privacycare_processes_router = APIRouter(
+    prefix=PRIVACYCARE_PROCESSES_PREFIX, tags=["PrivacyCare"]
+)
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -87,6 +98,8 @@ def register() -> None:
     # exactly what happened once already, and why identity.py exists.
     importlib.import_module("fides.api.privacycare.api.tasks")
     importlib.import_module("fides.api.privacycare.api.assessments")
+    importlib.import_module("fides.api.privacycare.api.processes")
 
     app_setup.ROUTERS.append(privacycare_router)
+    app_setup.ROUTERS.append(privacycare_processes_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

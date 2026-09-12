@@ -50,3 +50,32 @@ def test_unauthenticated_get_is_rejected(client, suffix):
         f"{PRIVACYCARE_PREFIX}{suffix} did not reject an unauthenticated "
         f"request: got {response.status_code} {response.text!r}"
     )
+
+
+# The business-process ROPA surface, under its own namespace. Same bar as the
+# assessment routes: a privacy product must not serve a record of processing
+# to an unauthenticated caller.
+PROCESS_GET_SUFFIXES = ["", "/bp_does_not_matter/ropa"]
+
+
+@pytest.mark.parametrize("suffix", PROCESS_GET_SUFFIXES)
+def test_unauthenticated_business_process_get_is_rejected(client, suffix):
+    from fides.api.privacycare.api.router import PRIVACYCARE_PROCESSES_PREFIX
+
+    response = client.get(f"{PRIVACYCARE_PROCESSES_PREFIX}{suffix}")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"{PRIVACYCARE_PROCESSES_PREFIX}{suffix} did not reject an "
+        f"unauthenticated caller (got {response.status_code})"
+    )
+
+
+def test_unauthenticated_business_process_write_is_rejected(client):
+    from fides.api.privacycare.api.router import PRIVACYCARE_PROCESSES_PREFIX
+
+    response = client.post(
+        PRIVACYCARE_PROCESSES_PREFIX, json={"name": "Should not be created"}
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"POST {PRIVACYCARE_PROCESSES_PREFIX} did not reject an "
+        f"unauthenticated caller (got {response.status_code})"
+    )
