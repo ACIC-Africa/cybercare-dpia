@@ -348,6 +348,81 @@ def test_every_target_failing_is_reported_as_an_error(db, monkeypatch):
     assert _task_row(db, task_id)["status"] == "error"
 
 
+def test_a_context_build_failure_does_not_discard_the_others(db, monkeypatch):
+    # Fix round 1 (coordinator review, MAJOR finding): build_context used to
+    # be called OUTSIDE the per-target try/except, so an exception from it
+    # aborted the whole run — every other target's assessments were never
+    # attempted, and the task row was never finished (stuck `in_processing`
+    # forever, the UI polling a run that would never report). This pins
+    # that build_context failing for ONE target still lets every other
+    # target complete, and the run still finishes and names the failure.
+    from fides.api.privacycare import tasks as tasks_module
+
+    bad_key = f"sys-{uuid.uuid4().hex[:6]}"
+    good_key = f"sys-{uuid.uuid4().hex[:6]}"
+    real_build_context = tasks_module.build_context
+
+    def _fail_for_bad_target(db_, target):
+        if target.system_fides_key == bad_key:
+            raise RuntimeError("simulated context-build failure")
+        return real_build_context(db_, target)
+
+    monkeypatch.setattr(tasks_module, "build_context", _fail_for_bad_target)
+
+    _seed_declaration(db, _seed_system(db, bad_key), "marketing.advertising")
+    _seed_declaration(db, _seed_system(db, good_key), "marketing.advertising")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(
+        db, assessment_types=[atype], system_fides_keys=[bad_key, good_key]
+    )
+    db.flush()
+
+    run_generation(db, task_id)
+
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete", "the run must finish, not hang in_processing"
+    assert row["total_count"] == 2
+    assert row["completed_count"] == 1
+    assert bad_key in row["message"], "the message must name which target failed"
+    assert _assessments_for_task(db, task_id)[0]["system_fides_key"] == good_key
+
+
+def test_a_wrapper_level_failure_preserves_the_real_progress_count(db):
+    # Fix round 1 (coordinator review, MAJOR finding): the Celery wrapper's
+    # except path used to call _finish(..., "error", 0, 0, ...)
+    # unconditionally, overwriting whatever total_count/completed_count
+    # run_generation had already committed with zero — a run that produced
+    # forty assessments before dying would report having produced none.
+    # _fail_task is the extracted, directly-testable version of that path;
+    # this pins that it reads the row's own last-committed counts rather
+    # than assuming zero.
+    from fides.api.privacycare.tasks import _fail_task
+
+    task_id = _seed_task(db, assessment_types=["irrelevant"])
+    db.flush()
+    # Simulate run_generation having made real progress and committed it
+    # before some later, unrelated exception escaped to the wrapper.
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task "
+            "SET status = 'in_processing', total_count = 40, completed_count = 37 "
+            "WHERE id = :id"
+        ),
+        {"id": task_id},
+    )
+    db.commit()
+
+    _fail_task(db, task_id, RuntimeError("connection dropped mid-run"))
+
+    row = _task_row(db, task_id)
+    assert row["status"] == "error"
+    assert row["total_count"] == 40, "must not be clobbered to 0"
+    assert row["completed_count"] == 37, "must not be clobbered to 0"
+    assert "connection dropped mid-run" in row["message"]
+
+
 def test_the_celery_task_is_registered_under_its_stable_name():
     # A task the worker cannot find is a Generate button that spins forever
     # with nothing in the logs. Importing the worker entry module is what

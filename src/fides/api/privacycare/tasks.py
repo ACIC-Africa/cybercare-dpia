@@ -82,6 +82,11 @@ _SET_TASK_STATUS_SQL = sqlalchemy.text(
     "WHERE id = :task_id"
 )
 
+_TASK_COUNTS_SQL = sqlalchemy.text(
+    "SELECT total_count, completed_count FROM privacy_assessment_task "
+    "WHERE id = :task_id"
+)
+
 
 def _assessment_name(target: GenerationTarget) -> str:
     """What the DPO sees on the assessment card.
@@ -227,7 +232,37 @@ def run_generation(db: Session, task_id: str) -> None:
     completed = 0
     failures: list[str] = []
     for target in targets:
-        context = build_context(db, target)
+        # Fix round 1 (coordinator review, MAJOR finding): build_context used
+        # to sit OUTSIDE this loop's try/except, so a single target's
+        # exception (a malformed declaration, a query timeout) aborted the
+        # entire run for every remaining target and never reached _finish —
+        # the task row stayed `in_processing` forever, with the UI polling a
+        # run that would never report. That defeated the whole point of the
+        # per-(target, template) try/except below: "one failing target does
+        # not discard the others."
+        #
+        # Guarded here, once per target rather than once per template
+        # (context does not depend on template_id, so recomputing it per
+        # template would be wasted queries) — a context-building failure is
+        # recorded as a failure for every assessment_type this target would
+        # have produced, since none of them can proceed without it, and the
+        # run moves on to the next target.
+        try:
+            context = build_context(db, target)
+        except Exception as exc:  # noqa: BLE001 - a bad target must not abort the run
+            db.rollback()
+            for assessment_type in templates:
+                failures.append(
+                    f"{target.system_fides_key}/{target.data_use}/{assessment_type}: "
+                    f"context build failed: {exc}"
+                )
+            logger.warning(
+                "PrivacyCare generation could not build context for {}: {}",
+                target.system_fides_key,
+                exc,
+            )
+            continue
+
         for assessment_type, template_id in templates.items():
             try:
                 assessment_id = _create_assessment(
@@ -327,6 +362,43 @@ def _finish(db, task_id, status, total, completed, message) -> None:
     db.commit()
 
 
+def _current_counts(db: Session, task_id: str) -> tuple[int, int]:
+    """The task row's most recently COMMITTED (total_count, completed_count).
+
+    run_generation commits after every assessment (see its own docstring),
+    so by the time an exception escapes it to the Celery wrapper below,
+    whatever progress the run actually made is already durable in this row.
+    Used only by the wrapper's failure path, to avoid clobbering that real
+    progress with zeros. Falls back to (0, 0) if the row is somehow gone —
+    it should always exist by this point, but a missing row is not worth
+    raising a second exception over.
+    """
+    row = db.execute(_TASK_COUNTS_SQL, {"task_id": task_id}).mappings().first()
+    if row is None:
+        return 0, 0
+    return row["total_count"], row["completed_count"]
+
+
+def _fail_task(db: Session, task_id: str, exc: Exception) -> None:
+    """What the Celery wrapper does when run_generation raises instead of
+    returning normally — extracted so it is testable directly against the
+    database, the same way run_generation itself is, with no Celery/broker
+    involved.
+
+    Fix round 1 (coordinator review, MAJOR finding): this used to call
+    _finish(db, task_id, "error", 0, 0, ...) unconditionally — overwriting
+    whatever total_count/completed_count the run had already committed with
+    zero. A run that produced forty assessments before an unhandled
+    exception (a DB connection drop, a bug outside every per-target guard
+    run_generation itself has) would then report having produced NONE. The
+    counts are re-read from the row (see _current_counts) rather than
+    assumed, and preserved in the error message.
+    """
+    db.rollback()
+    total, completed = _current_counts(db, task_id)
+    _finish(db, task_id, "error", total, completed, f"Generation failed: {exc}")
+
+
 @celery_app.task(base=DatabaseTask, bind=True, name=GENERATION_TASK_NAME)
 def generate_assessments(self: DatabaseTask, task_id: str) -> None:
     """Celery entry point. All behaviour is in run_generation."""
@@ -337,6 +409,5 @@ def generate_assessments(self: DatabaseTask, task_id: str) -> None:
             # A task that dies without updating its row leaves the UI
             # polling `in_processing` forever with nothing to show for it.
             logger.exception("PrivacyCare generation task {} failed", task_id)
-            db.rollback()
-            _finish(db, task_id, "error", 0, 0, f"Generation failed: {exc}")
+            _fail_task(db, task_id, exc)
             raise
