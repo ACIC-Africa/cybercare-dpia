@@ -225,8 +225,13 @@ def run_generation(db: Session, task_id: str) -> None:
         raise LookupError(f"No privacy_assessment_task with id {task_id}")
 
     assessment_types = list(task["assessment_types"] or [])
+    # `is not None`: NULL means "every system" (select_targets' contract),
+    # an empty array means "no systems". Collapsing the second into the
+    # first would run a caller's explicit "none" over the whole estate.
     system_fides_keys = (
-        list(task["system_fides_keys"]) if task["system_fides_keys"] else None
+        list(task["system_fides_keys"])
+        if task["system_fides_keys"] is not None
+        else None
     )
 
     try:

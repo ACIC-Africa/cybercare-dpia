@@ -158,6 +158,54 @@ def test_a_machine_client_is_still_named(db, queued, monkeypatch):
     assert _task_row(db, response.task_id)["created_by"] == "client:api_client_abc123"
 
 
+def test_an_empty_system_fides_keys_list_is_stored_as_empty_not_null(db, queued, monkeypatch):
+    # SQL NULL is how this column says "every system". An empty list is
+    # falsy, so `[]` used to be written as NULL — and a caller who
+    # explicitly asked for zero systems got a DPIA generated over the whole
+    # estate, with nothing logged to say the narrowing had been discarded.
+    # The admin UI never sends `[]`, but this is a public API and `[]` is
+    # the natural serialisation of "no selection" for any other client.
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    response = create_privacy_assessment(
+        CreateAssessmentTaskRequest(assessment_types=["gdpr_dpia"], system_fides_keys=[]),
+        db=db,
+        client=_fake_client("alice@example.com"),
+    )
+
+    assert _task_row(db, response.task_id)["system_fides_keys"] == []
+
+
+def test_omitting_system_fides_keys_still_means_every_system(db, queued, monkeypatch):
+    # The other half of the distinction: absent stays NULL.
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    response = create_privacy_assessment(
+        CreateAssessmentTaskRequest(assessment_types=["gdpr_dpia"]),
+        db=db,
+        client=_fake_client("alice@example.com"),
+    )
+
+    assert _task_row(db, response.task_id)["system_fides_keys"] is None
+
+
+def test_the_task_record_reads_back_an_empty_scope_as_empty(db, queued, monkeypatch):
+    # AssessmentTaskResponse must report whichever request was actually
+    # made; rendering `[]` as None would relabel "no systems" as "all
+    # systems" on the screen a DPO audits.
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    response = create_privacy_assessment(
+        CreateAssessmentTaskRequest(assessment_types=["gdpr_dpia"], system_fides_keys=[]),
+        db=db,
+        client=_fake_client("alice@example.com"),
+    )
+
+    detail = _task_detail(db, response.task_id)
+    assert detail.system_fides_keys == []
+    assert detail.systems == []
+
+
 def test_an_empty_assessment_types_list_is_rejected_by_the_schema():
     with pytest.raises(ValueError):
         CreateAssessmentTaskRequest(assessment_types=[])

@@ -274,6 +274,26 @@ def test_a_run_with_no_targets_completes_rather_than_erroring(db):
     assert "no" in (row["message"] or "").lower()
 
 
+def test_an_empty_system_scope_generates_nothing_rather_than_everything(db):
+    # NULL system_fides_keys means "every system"; an empty array means
+    # "none". Reading the second as the first ran a caller's explicit
+    # narrowing over the entire estate.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_declaration(db, _seed_system(db, key), "marketing.advertising")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["total_count"] == 0
+    assert _assessments_for_task(db, task_id) == []
+
+
 def test_an_unknown_assessment_type_errors_with_a_message_naming_it(db):
     key = f"sys-{uuid.uuid4().hex[:6]}"
     _seed_declaration(db, _seed_system(db, key), "marketing.advertising")

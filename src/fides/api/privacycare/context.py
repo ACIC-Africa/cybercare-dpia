@@ -74,7 +74,10 @@ def select_targets(
     """Every declaration to assess, in a deterministic order.
 
     system_fides_keys=None means "every system" — the request contract says
-    so explicitly ("None = all systems").
+    so explicitly ("None = all systems"). An EMPTY list is the opposite
+    request and returns nothing: `= ANY(ARRAY[])` matches no row. The two
+    must not be conflated anywhere upstream; see _create_task in
+    api/tasks.py for the place they once were.
 
     high_risk_only filters on ctl_systems.requires_data_protection_assessments
     and nothing else. See OQ-PRIVACY-10: that column's name states its own

@@ -60,9 +60,21 @@ def _create_task(
             "id": task_row_id,
             "celery_id": celery_id,
             "assessment_types": list(request.assessment_types),
+            # `is not None`, not truthiness. An empty list is falsy, so `[]`
+            # used to be stored as SQL NULL — and NULL is how this column
+            # says "every system" (select_targets adds its fides_key filter
+            # only when the value is not None). A caller who explicitly
+            # asked for zero systems therefore got a DPIA generated for the
+            # entire estate, with nothing logged to say the narrowing had
+            # been discarded. The admin UI never sends `[]`
+            # (GenerateAssessmentsModal.tsx normalises it to undefined), but
+            # this is a public API and `[]` is the natural serialisation of
+            # "no selection" for any other client. Stored as an empty array,
+            # it selects no targets and the run finishes honestly with "No
+            # processing activities matched this request".
             "system_fides_keys": (
                 list(request.system_fides_keys)
-                if request.system_fides_keys
+                if request.system_fides_keys is not None
                 else None
             ),
             "created_by": created_by,
@@ -159,8 +171,11 @@ def _task_response(db: Session, row) -> AssessmentTaskResponse:
         db.execute(_ASSESSMENT_IDS_SQL, {"task_id": row["id"]}).scalars().all()
     )
 
+    # `is not None` throughout: "asked for no systems" and "asked for every
+    # system" are different requests and the task record must read back as
+    # whichever one was made. See _create_task for the whole story.
     systems = None
-    if row["system_fides_keys"]:
+    if row["system_fides_keys"] is not None:
         keys = list(row["system_fides_keys"])
         named = {
             r["fides_key"]: r["name"]
@@ -186,7 +201,9 @@ def _task_response(db: Session, row) -> AssessmentTaskResponse:
         message=row["message"],
         assessment_types=list(row["assessment_types"] or []),
         system_fides_keys=(
-            list(row["system_fides_keys"]) if row["system_fides_keys"] else None
+            list(row["system_fides_keys"])
+            if row["system_fides_keys"] is not None
+            else None
         ),
         systems=systems,
         created_by=row["created_by"],

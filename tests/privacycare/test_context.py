@@ -185,6 +185,18 @@ def test_select_targets_returns_nothing_when_no_system_matches(db):
     assert select_targets(db, ["no-such-system"], high_risk_only=False) == []
 
 
+def test_select_targets_treats_an_empty_list_as_no_systems_not_all_systems(db):
+    # None and [] are opposite requests. None = "every system"; [] = "none".
+    # Collapsing the second into the first runs a caller's explicit
+    # narrowing over the whole estate.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_declaration(db, _seed_system(db, key), "marketing.advertising")
+    db.flush()
+
+    assert select_targets(db, [], high_risk_only=False) == []
+    assert select_targets(db, None, high_risk_only=False) != []
+
+
 def test_build_context_carries_the_declaration_and_its_data_use(db):
     # ctl_data_uses ships pre-seeded with the real Fides default taxonomy
     # (56 rows including "marketing.advertising" itself), so a fresh
