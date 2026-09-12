@@ -5,6 +5,7 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare import llm as llm_module
+from fides.api.privacycare.api.answers import recompute_completeness
 from fides.api.privacycare.api.assessments import _assessment_detail, _evidence_for
 from fides.api.privacycare.generator import (
     _SOURCE_ROOT_LABELS,
@@ -115,6 +116,41 @@ def test_full_coverage_skips_sources_that_do_not_resolve():
 
     assert len(draft.evidence["items"]) == 1
     assert "retention_period" not in draft.answer_text
+
+
+def test_a_full_answer_built_from_half_its_sources_is_partial_not_complete():
+    # "complete" means the record answered the question. An answer assembled
+    # from one of two sources did not: the missing line is simply absent, and
+    # a reader cannot tell "the record was silent" from "the question never
+    # asked for it". "partial" is excluded from completeness and
+    # answered_count, so this also stops a half-answer raising the percentage
+    # the DPO signs off.
+    question = _question(
+        "full",
+        ["privacy_declaration.data_use", "privacy_declaration.retention_period"],
+    )
+
+    draft = draft_from_context(question, _CONTEXT)
+
+    assert draft.answer_status == "partial"
+    assert draft.missing_data == ["privacy_declaration.retention_period"]
+    assert draft.evidence["missing_data"] == [
+        "privacy_declaration.retention_period"
+    ]
+
+
+def test_a_full_answer_with_every_source_resolved_is_complete_and_has_no_gap():
+    question = _question(
+        "full", ["privacy_declaration.data_use", "data_use.name"]
+    )
+
+    draft = draft_from_context(question, _CONTEXT)
+
+    assert draft.answer_status == "complete"
+    assert draft.missing_data == []
+    # The payload an answer with no gap carries is unchanged: "missing_data"
+    # is added only when there IS one.
+    assert "missing_data" not in draft.evidence
 
 
 def test_a_label_names_the_subject_the_fact_belongs_to():
@@ -325,6 +361,95 @@ def test_full_coverage_evidence_round_trips_through_both_reader_paths(db):
         ("privacy_declaration.data_use", 1),
         ("data_use.name", 2),
     ]
+
+
+def test_the_gap_in_a_partial_full_answer_reaches_the_detail_response(db):
+    # missing_data was hardcoded [] in _question_response, so the UI's own
+    # gap field was empty for every question ever. End to end: generate a
+    # `full` answer whose second source the record does not hold, then read
+    # it back through the real detail route and assert the unresolved key
+    # arrives, and that the answer is NOT filed as complete.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Gap DPIA")
+    qid = _seed_question(db, tid, "gap_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'full', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {
+            "sources": [
+                "privacy_declaration.data_use",
+                "privacy_declaration.retention_period",
+            ],
+            "id": qid,
+        },
+    )
+    db.flush()
+
+    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None) == 1
+
+    detail = _assessment_detail(db, aid)
+    question = detail.question_groups[0].questions[0]
+    assert question.missing_data == ["privacy_declaration.retention_period"]
+    assert question.answer_status == "partial"
+    # The gap does not corrupt the evidence the same payload carries.
+    assert [item.source_key for item in question.evidence] == [
+        "privacy_declaration.data_use"
+    ]
+
+
+def test_an_answer_with_no_gap_reports_no_missing_data(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No Gap Missing DPIA")
+    qid = _seed_question(db, tid, "full_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'full', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {"sources": ["privacy_declaration.data_use", "data_use.name"], "id": qid},
+    )
+    db.flush()
+
+    answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
+
+    question = _assessment_detail(db, aid).question_groups[0].questions[0]
+    assert question.missing_data == []
+    assert question.answer_status == "complete"
+
+
+def test_a_partial_answer_with_a_gap_does_not_count_toward_completeness(db):
+    # The half-answer used to be written "complete", so it counted in
+    # _COMPLETE_ANSWERS_SQL and raised the percentage the DPO signs off.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Completeness Gap DPIA")
+    qid = _seed_question(db, tid, "gap_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'full', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {
+            "sources": [
+                "privacy_declaration.data_use",
+                "privacy_declaration.retention_period",
+            ],
+            "id": qid,
+        },
+    )
+    db.flush()
+
+    answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
+    recompute_completeness(db, aid)
+
+    completeness = db.execute(
+        sqlalchemy.text(
+            "SELECT completeness FROM privacy_assessment WHERE id = :id"
+        ),
+        {"id": aid},
+    ).scalar()
+    assert completeness == 0.0
 
 
 def test_citation_counter_holds_when_a_middle_question_drafts_nothing(db):

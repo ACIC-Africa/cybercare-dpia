@@ -19,7 +19,7 @@ own.
               human; the detail route already renders an unanswered question
               as needs_input.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import sqlalchemy
@@ -72,6 +72,11 @@ class QuestionDraft:
     answer_status: str
     answer_source: str
     evidence: dict
+    # The fides_sources this question asked for that the record could not
+    # supply. Carried on the draft AND stored inside the evidence payload
+    # (see _evidence_payload) so the gap travels with the answer rather
+    # than living only in a log line.
+    missing_data: list[str] = field(default_factory=list)
 
 
 _QUESTIONS_FOR_ASSESSMENT_SQL = sqlalchemy.text(
@@ -122,6 +127,43 @@ def _resolved_sources(question: dict, context: dict) -> list[tuple[str, str]]:
         if value is not None:
             pairs.append((source_key, value))
     return pairs
+
+
+def _unresolved_sources(
+    question: dict, resolved: list[tuple[str, str]]
+) -> list[str]:
+    """The source keys this question asked for that the record did not hold.
+
+    Named separately from _resolved_sources because the ABSENCE is a fact a
+    DPIA has to carry: a question the record answers half of must not be
+    indistinguishable, in the artifact or in the completeness percentage,
+    from one it answers in full.
+    """
+    answered = {key for key, _ in resolved}
+    return [
+        source_key
+        for source_key in question["fides_sources"] or []
+        if source_key not in answered
+    ]
+
+
+def _evidence_payload(items: list[dict], missing: list[str]) -> dict:
+    """The answer_version.evidence JSONB object.
+
+    {"items": [...]} is the shape plan 05 already writes and
+    _evidence_items_from_payload already reads. "missing_data" is a SIBLING
+    key, added only when there is a gap, so an answer with none keeps the
+    exact payload it had before and the '{}'-means-no-evidence convention in
+    _EVIDENCE_SQL is untouched. It is a JSON key, not a column: the
+    answer_version table is Ethyca's, and its evidence column is ours to
+    fill. _question_response reads the key back into
+    AssessmentQuestionResponse.missing_data, which the UI already declares
+    and which was hardcoded [] until now.
+    """
+    payload: dict = {"items": items}
+    if missing:
+        payload["missing_data"] = list(missing)
+    return payload
 
 
 # The subject each fides_sources root speaks about, in the words a DPO uses.
@@ -187,6 +229,17 @@ def draft_from_context(
     expected_coverage is a claim about what the record CAN supply; when the
     record turns out not to hold the fact, the honest outcome is an
     unanswered question, not a confident answer assembled from nothing.
+
+    A `full` question whose sources resolve only PARTLY is answered, but as
+    "partial", not "complete", and the unresolved keys are recorded in the
+    evidence payload's missing_data. Writing it "complete" used to make an
+    answer built from half its sources indistinguishable from a finished one:
+    the missing line was simply absent (a reader cannot tell "the record was
+    silent" from "the question never asked"), missing_data was hardcoded []
+    in the API response, and the answer counted toward the completeness
+    percentage the DPO signs off. "partial" is excluded from completeness and
+    answered_count (plan 03b), so only an all-sources-resolved answer now
+    raises that number.
     """
     if question["expected_coverage"] != "full":
         return None
@@ -195,6 +248,7 @@ def draft_from_context(
     if not resolved:
         return None
 
+    missing = _unresolved_sources(question, resolved)
     lines = [f"{_label(key)}: {value}" for key, value in resolved]
     items = [
         _evidence_item(key, value, citation_start + offset)
@@ -202,9 +256,10 @@ def draft_from_context(
     ]
     return QuestionDraft(
         answer_text="\n".join(lines),
-        answer_status="complete",
+        answer_status="complete" if not missing else "partial",
         answer_source="system",
-        evidence={"items": items},
+        evidence=_evidence_payload(items, missing),
+        missing_data=missing,
     )
 
 
@@ -284,11 +339,16 @@ def draft_with_llm(
         # reviewer this answer was drafted rather than read off.
         item["type"] = "ai_analysis"
 
+    # Same gap signal as the deterministic path: what the record could not
+    # supply travels with the answer, so the UI's missing_data field says
+    # which facts a human still has to bring.
+    missing = _unresolved_sources(question, resolved)
     return QuestionDraft(
         answer_text=answer_text,
         answer_status="partial",
         answer_source="ai_analysis",
-        evidence={"items": items},
+        evidence=_evidence_payload(items, missing),
+        missing_data=missing,
     )
 
 

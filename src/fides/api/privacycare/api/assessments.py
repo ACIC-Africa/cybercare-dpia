@@ -314,6 +314,39 @@ def _evidence_items_from_payload(
     return items
 
 
+def _missing_data_from_payload(payload, *, assessment_id: str, question_id: str) -> list:
+    """The unresolved fides_sources this answer's generator recorded.
+
+    AssessmentQuestionResponse.missing_data is a field the UI already
+    declares (types.ts: `missing_data: string[]`) and that this file used to
+    hardcode `[]` on every question. That made a generated answer built from
+    half its sources look, in the artifact, exactly like one built from all
+    of them — see generator._evidence_payload for why the gap is written as
+    a sibling key of "items" in the existing evidence JSONB rather than as a
+    new column (answer_version is Ethyca's table; its evidence column is
+    ours to fill).
+
+    Anything that is not a list of strings is discarded loudly, the same way
+    a malformed evidence item is: a half-understood gap list is worse than
+    an empty one, because the UI renders it as fact.
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("missing_data")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(k, str) for k in raw):
+        logger.warning(
+            "Skipped missing_data for assessment {} question {}: expected a "
+            "list of source keys, got {}",
+            assessment_id,
+            question_id,
+            type(raw).__name__,
+        )
+        return []
+    return list(raw)
+
+
 def _validated_evidence_item(
     candidate,
     *,
@@ -441,6 +474,9 @@ def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionRespons
         if evidence
         else []
     )
+    missing_data = _missing_data_from_payload(
+        evidence, assessment_id=assessment_id, question_id=q["id"]
+    )
     return AssessmentQuestionResponse(
         id=q["question_key"],
         question_id=q["id"],
@@ -454,9 +490,13 @@ def _question_response(q: dict, assessment_id: str) -> AssessmentQuestionRespons
         answer_source=q["answer_source"] or "system",
         confidence=q["confidence"],
         evidence=items,
-        # No database source (Plus computes these) — empty forms, not
-        # omitted. See the plan's field-by-field source table.
-        missing_data=[],
+        # The fides_sources this question asked for that the record could
+        # not supply, read back out of the answer's own evidence payload
+        # (generator._evidence_payload writes them). Empty for an
+        # unanswered question and for an answer with no gap — the two cases
+        # the hardcoded [] used to conflate with "answered, but missing a
+        # fact nobody was told about".
+        missing_data=missing_data,
         sme_prompt=None,
     )
 
