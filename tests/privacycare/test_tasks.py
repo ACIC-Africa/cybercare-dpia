@@ -582,3 +582,86 @@ def test_the_task_is_routed_to_the_privacy_assessments_queue():
     from fides.api.tasks import PRIVACY_ASSESSMENTS_QUEUE_NAME
 
     assert GENERATION_QUEUE == PRIVACY_ASSESSMENTS_QUEUE_NAME
+
+
+def _run_wrapper(session, task_id):
+    """Invoke the real Celery task body with a session we control.
+
+    generate_assessments is bound (bind=True), so `self` is the task instance
+    and `self.get_new_session()` is what supplies its session in production.
+    Patching that method on DatabaseTask — the base the task actually resolves
+    it from — exercises the wrapper's own code (the context-manager use, the
+    try/except, the _fail_task call, the re-raise) against a transaction this
+    test can roll back. Calling run_generation directly, as every other test
+    in this file does, skips all of it.
+
+    The task object itself is a Celery PromiseProxy until first use, which is
+    why the patch goes on the base class rather than on the task.
+    """
+    import contextlib
+
+    from fides.api.privacycare.tasks import generate_assessments
+    from fides.api.tasks import DatabaseTask
+
+    @contextlib.contextmanager
+    def _session(_self):
+        yield session
+
+    original = DatabaseTask.get_new_session
+    DatabaseTask.get_new_session = _session
+    try:
+        return generate_assessments.run(task_id)
+    finally:
+        DatabaseTask.get_new_session = original
+
+
+def test_the_celery_wrapper_runs_a_generation_end_to_end(db):
+    # Nothing exercised this wrapper. Replacing get_new_session with a method
+    # that does not exist left the whole suite green — the only code that runs
+    # a real generation was the least tested code in the module.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_declaration(db, _seed_system(db, key), "marketing.advertising")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    _run_wrapper(db, task_id)
+
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete", row
+    assert row["completed_count"] == 1
+    assert len(_assessments_for_task(db, task_id)) == 1
+
+
+def test_the_celery_wrapper_records_a_failure_and_re_raises(db, monkeypatch):
+    # A task that dies without updating its row leaves the UI polling
+    # `in_processing` forever with nothing to show for it. The wrapper must do
+    # BOTH: mark the row, and re-raise so Celery itself sees the failure.
+    from fides.api.privacycare import tasks as tasks_module
+
+    monkeypatch.setattr(
+        tasks_module,
+        "run_generation",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    # Committed, not just flushed, because that is the real ordering: the
+    # route commits the task row BEFORE queueing the job (a worker can consume
+    # the message the instant it is published). _fail_task opens with
+    # db.rollback() to clear a poisoned transaction before writing the error
+    # row, so an uncommitted seed would vanish here and the test would be
+    # asserting against a fixture artefact rather than the wrapper.
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _run_wrapper(db, task_id)
+
+    row = _task_row(db, task_id)
+    assert row["status"] == "error", (
+        "the wrapper must mark the row, or the progress bar polls a run that "
+        f"will never report: {row}"
+    )
+    assert "boom" in (row["message"] or "")
