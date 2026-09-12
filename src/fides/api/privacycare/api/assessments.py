@@ -347,6 +347,36 @@ def _missing_data_from_payload(payload, *, assessment_id: str, question_id: str)
     return list(raw)
 
 
+def _field_name_for(candidate: dict) -> str:
+    """A never-empty field_name, derived from source_key when absent.
+
+    EvidenceCardGroup.tsx:27-28 renders
+    `FIELD_NAME_LABELS[item.field_name!] ?? item.field_name!.replace(/_/g," ")`
+    — a non-null assertion on a field its own TypeScript types as OPTIONAL
+    (`field_name?: string`). So an item without one does not degrade: it
+    throws, and takes the whole evidence drawer down with it, for every
+    citation on the assessment rather than just its own.
+
+    Everything this repo writes today sets it. The exposure is the payloads it
+    does not write: answer_version.evidence is free-form JSONB, so a row from
+    a future feature, an import, or a hand-fix can reach here without one.
+
+    Deriving beats dropping. source_key is a dotted path
+    ("privacy_declaration.data_use"), and its last segment is exactly what
+    field_name holds elsewhere, so the citation survives intact and renders
+    correctly. Only when there is nothing to derive from does the caller's
+    skip-loudly path take over — losing one citation is bad, losing the whole
+    drawer is worse.
+    """
+    declared = (candidate.get("field_name") or "").strip()
+    if declared:
+        return declared
+    source_key = (candidate.get("source_key") or "").strip()
+    if source_key:
+        return source_key.rsplit(".", 1)[-1]
+    return ""
+
+
 def _validated_evidence_item(
     candidate,
     *,
@@ -368,6 +398,10 @@ def _validated_evidence_item(
         )
         return None
     missing_fields = [f for f in ("id", "type") if f not in candidate]
+    if not _field_name_for(candidate):
+        # Neither field_name nor source_key: nothing to render and
+        # nothing to derive from, so this item would crash the drawer.
+        missing_fields.append("field_name")
     if missing_fields:
         logger.warning(
             "Skipped evidence for assessment {} question {}: missing "
@@ -385,7 +419,7 @@ def _validated_evidence_item(
             created_at=candidate.get("created_at")
             or _as_str(created_at)
             or _as_str(updated_at),
-            field_name=candidate.get("field_name"),
+            field_name=_field_name_for(candidate),
             source_key=candidate.get("source_key"),
             source_type=candidate.get("source_type"),
             citation_number=candidate.get("citation_number"),

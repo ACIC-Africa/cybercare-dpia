@@ -2071,3 +2071,71 @@ def test_delete_assessment_twice_404s_the_second_time(db, monkeypatch):
     with pytest.raises(HTTPException) as exc_info:
         delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
     assert exc_info.value.status_code == 404
+
+
+def test_evidence_without_field_name_is_derived_not_dropped(db):
+    # EvidenceCardGroup.tsx:27-28 non-null-asserts field_name on a field its
+    # own TypeScript marks optional, so an item without one throws and takes
+    # the WHOLE evidence drawer down — every citation on the assessment, not
+    # just its own. source_key's last segment is exactly what field_name holds
+    # elsewhere, so the citation survives and renders.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Derived Field Name DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(
+        db,
+        aid,
+        qid,
+        {
+            "items": [
+                {
+                    "id": "ev_no_field_name",
+                    "type": "system",
+                    "value": "marketing.advertising",
+                    "source_key": "privacy_declaration.data_use",
+                    "citation_number": 1,
+                }
+            ]
+        },
+    )
+    db.flush()
+
+    items = _evidence_for(db, aid)["items"]
+
+    assert len(items) == 1, "the citation must survive, not be dropped"
+    assert items[0]["field_name"] == "data_use", (
+        "field_name must be derived from source_key's last segment so the "
+        f"drawer renders: {items[0]!r}"
+    )
+
+
+def test_evidence_with_nothing_to_derive_a_field_name_from_is_skipped(db):
+    # No field_name and no source_key: nothing to render and nothing to derive
+    # from. Skipping ONE citation is bad; letting it crash the drawer loses
+    # every citation on the assessment.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Underivable Field Name DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_answer_with_evidence(
+        db,
+        aid,
+        qid,
+        {
+            "items": [
+                {"id": "ev_bad", "type": "system", "citation_number": 1},
+                {
+                    "id": "ev_good",
+                    "type": "system",
+                    "field_name": "data_use",
+                    "citation_number": 2,
+                },
+            ]
+        },
+    )
+    db.flush()
+
+    items = _evidence_for(db, aid)["items"]
+
+    assert [i["id"] for i in items] == ["ev_good"], (
+        "the underivable item is skipped and its sibling still renders"
+    )
