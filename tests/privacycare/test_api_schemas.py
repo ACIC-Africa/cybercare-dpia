@@ -16,6 +16,7 @@ from fides.api.privacycare.api.schemas import (
     AssessmentSummaryBlockedGroup,
     AssessmentSummaryOwner,
     AssessmentSummaryResponse,
+    BulkUpdateAnswersResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionEvidence,
@@ -418,6 +419,7 @@ def test_the_dpia_envelope_feature_types_were_actually_read():
     assert len(_feature_interface_fields("GroupedAssessmentsResponse")) == 5
     assert len(_feature_interface_fields("PrivacyAssessmentDetailResponse")) == 4
     assert len(_feature_interface_fields("UpdateAnswerResponse")) == 3
+    assert len(_feature_interface_fields("BulkUpdateAnswersResponse")) == 4
 
 
 def test_update_answer_response_matches_the_shipped_contract():
@@ -440,6 +442,31 @@ def test_update_answer_response_optionality_matches_the_shipped_contract():
         assert pydantic_required == (not is_optional), field
     _assert_admits_none_where_ts_nullable(
         UpdateAnswerResponse, _feature_interface_raw_specs("UpdateAnswerResponse")
+    )
+
+
+def test_bulk_update_answers_response_matches_the_shipped_contract():
+    # Task 3: BulkUpdateAnswersResponse mirrors the same-named interface in
+    # types.ts — {updated_count, completeness, status, questions}.
+    # `questions` reuses AssessmentQuestionResponse (asserted above to match
+    # AssessmentQuestion field-for-field) rather than a second question
+    # schema — same precedent as UpdateAnswerResponse.question.
+    assert set(BulkUpdateAnswersResponse.model_fields) == _feature_interface_fields(
+        "BulkUpdateAnswersResponse"
+    )
+
+
+def test_bulk_update_answers_response_optionality_matches_the_shipped_contract():
+    # All four fields are required and non-nullable in the shipped contract
+    # (no `?`, no `| null`) — none carry a Pydantic default.
+    for field, is_optional in _feature_interface_field_specs(
+        "BulkUpdateAnswersResponse"
+    ).items():
+        pydantic_required = BulkUpdateAnswersResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        BulkUpdateAnswersResponse,
+        _feature_interface_raw_specs("BulkUpdateAnswersResponse"),
     )
 
 

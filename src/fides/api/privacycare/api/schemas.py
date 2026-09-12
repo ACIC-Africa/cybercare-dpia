@@ -279,6 +279,46 @@ class UpdateAnswerResponse(BaseModel):
     status: str
 
 
+class AnswerUpdate(BaseModel):
+    # Mirrors AnswerUpdate in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. Both
+    # fields are required, non-nullable (no `?`) in that contract.
+    question_id: str
+    answer_text: str
+
+
+class BulkUpdateAnswersRequest(BaseModel):
+    # Mirrors BulkUpdateAnswersRequest in the same feature types.ts file.
+    # `created_by` is deliberately absent here too, same reasoning as
+    # UpdateAnswerRequest above: authorship comes from the authenticated
+    # principal in api/assessments.py's bulk_update_answers route, never
+    # from this body.
+    answers: List[AnswerUpdate]
+
+
+class BulkUpdateAnswersResponse(BaseModel):
+    # Mirrors BulkUpdateAnswersResponse in the same feature types.ts file.
+    # All four fields are required and non-nullable (no `?`, no `| null`)
+    # — no defaults here, same precedent as UpdateAnswerResponse.
+    #
+    # `questions` reuses AssessmentQuestionResponse (not a second question
+    # schema) and carries the assessment's FULL question set, not just the
+    # entries this batch touched — see _all_questions_response's docstring
+    # in api/assessments.py for the evidence (privacy-assessments.slice.ts's
+    # bulkUpdateAssessmentAnswers has no onQueryStarted/updateQueryData of
+    # its own; it invalidates and lets getAssessment's refetch replace
+    # question_groups wholesale, so a subset here would blank out every
+    # question the user did not touch in this batch until that refetch
+    # lands).
+    #
+    # `status` is the ASSESSMENT's status, not any answer's — same
+    # distinction as UpdateAnswerResponse.status above.
+    updated_count: int
+    completeness: float
+    status: str
+    questions: List[AssessmentQuestionResponse]
+
+
 # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
 # Its field set (items/total/page/size/pages) already matches the
 # GroupedAssessmentsResponse TS contract field-for-field — see

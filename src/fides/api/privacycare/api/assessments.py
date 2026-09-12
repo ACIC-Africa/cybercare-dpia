@@ -22,12 +22,15 @@ from fides.api.privacycare.api.answers import (
 )
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
+    AnswerUpdate,
     AssessmentEvidenceResponse,
     AssessmentGroupResponse,
     AssessmentMetadata,
     AssessmentQuestionResponse,
     AssessmentResponse,
     AssessmentSummaryResponse,
+    BulkUpdateAnswersRequest,
+    BulkUpdateAnswersResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionGroup,
@@ -904,6 +907,151 @@ def update_answer(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No question {question_id} on assessment {assessment_id}",
+        )
+    db.commit()
+    return response
+
+
+def _all_questions_response(
+    db: Session, assessment_id: str
+) -> list[AssessmentQuestionResponse]:
+    """Every question on the assessment, flattened out of _questions_for's
+    per-group grouping.
+
+    Used by the bulk-answer route's `questions` field, which carries the
+    assessment's FULL question set — not just the entries a given batch
+    touched. That decision came from checking how the response is actually
+    consumed rather than assuming: privacy-assessments.slice.ts's
+    bulkUpdateAssessmentAnswers mutation declares no
+    onQueryStarted/updateQueryData handler of its own (unlike two other
+    mutations in that same file, which do) — it only invalidatesTags
+    `{type: "Privacy Assessment", id}` / "Privacy Assessment", the same
+    pattern updatePrivacyAssessment already uses. That triggers RTK Query
+    to refetch getAssessment, and AssessmentDetail.tsx reads its questions
+    exclusively off that query's `assessment.question_groups`
+    (useBulkUpdateAssessmentAnswersMutation itself is exported from the
+    slice but not called from any shipped component yet — there is no live
+    consumer of this field today). So nothing currently reads
+    BulkUpdateAnswersResponse.questions to patch state directly. But the
+    contract still requires the field to be a real, correctly-shaped
+    AssessmentQuestion[], and the one shape that can never regress into the
+    brief's named failure mode — a wholesale question-list replacement
+    blanking out every untouched question — is the full set. A subset
+    would only ever be safe by accident (only ever correct for as long as
+    no consumer does exactly what this same slice's sibling mutations
+    already do).
+    """
+    return [
+        _question_response(q, assessment_id)
+        for group in _questions_for(db, assessment_id)
+        for q in group["questions"]
+    ]
+
+
+def _bulk_update_answers(
+    db: Session,
+    assessment_id: str,
+    answers: list[AnswerUpdate],
+    created_by: str | None,
+) -> BulkUpdateAnswersResponse:
+    """Write a batch of answers as ONE atomic unit and assemble the envelope
+    bulk_update_answers (below) hands back to the DPO's browser.
+
+    Atomicity — the whole batch rolls back on any bad entry, never a
+    partial apply. A partially-applied batch that reports success is the
+    worst outcome for a document a regulator will read: the DPO believes
+    all N answers saved, some did, and nothing tells them which. Every
+    write_answer call below takes write_answer's own FOR UPDATE lock on
+    the SAME parent privacy_assessment row (see
+    _lock_assessment_and_get_template_id in api/answers.py) — that already
+    serializes this whole function against any concurrent writer touching
+    this assessment, so this function adds no second lock and never locks
+    any other row (locking several assessments in one transaction would be
+    a deadlock hazard, and this function only ever touches one).
+
+    What the lock does NOT give us for free is atomicity of the BATCH
+    itself: without more, a QuestionNotInTemplateError raised on entry N
+    would leave entries 1..N-1's writes sitting uncommitted-but-VISIBLE in
+    this same transaction — nothing rolls them back just because a later
+    entry failed, and a caller that forgot to abort the whole request
+    would commit them anyway. `db.begin_nested()` opens a SAVEPOINT before
+    the loop; on any exception escaping the `with` block (including
+    write_answer's QuestionNotInTemplateError/LookupError), SQLAlchemy
+    rolls back to that SAVEPOINT automatically, undoing every write this
+    batch made so far — while leaving the assessment-row lock (held by the
+    OUTER transaction, not the savepoint) untouched. The exception then
+    propagates to bulk_update_answers (the route), which maps it to 404
+    and never calls db.commit().
+
+    An empty `answers` list is a no-op, not an error: the loop below simply
+    never executes (updated_count comes back 0), and the response still
+    reflects the assessment's current, unchanged completeness/status/
+    questions.
+
+    Completeness is recomputed ONCE, after the whole batch — not per
+    answer. Recomputing per-write would still be correct but wasteful (N
+    redundant COUNT(*) scans for a batch of size N, all reading the exact
+    same rows for everything but the write each one is meant to reflect);
+    a single recompute after the loop already reflects every write the
+    batch made.
+    """
+    with db.begin_nested():
+        for answer in answers:
+            write_answer(
+                db, assessment_id, answer.question_id, answer.answer_text, created_by
+            )
+
+    completeness = recompute_completeness(db, assessment_id)
+    questions = _all_questions_response(db, assessment_id)
+    assessment_status = db.execute(
+        _ASSESSMENT_STATUS_SQL, {"assessment_id": assessment_id}
+    ).scalar()
+    return BulkUpdateAnswersResponse(
+        updated_count=len(answers),
+        completeness=completeness,
+        status=assessment_status,
+        questions=questions,
+    )
+
+
+@privacycare_router.put(
+    "/{assessment_id}/questions",
+    # Same blanket SYSTEM_READ dependency as every other route in this
+    # module — see update_answer's own comment above for why (no
+    # privacy-assessment-specific scope exists yet; this is being handled
+    # separately and this route's scope must not change independently of
+    # that).
+    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=BulkUpdateAnswersResponse,
+)
+def bulk_update_answers(
+    assessment_id: str,
+    request: BulkUpdateAnswersRequest,
+    *,
+    db: Session = Depends(get_db),
+    client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
+) -> BulkUpdateAnswersResponse:
+    """PUT a batch of answers at once. created_by comes from the
+    AUTHENTICATED PRINCIPAL (_created_by_from_client(client)), never from
+    `request` — same reasoning as update_answer above: BulkUpdateAnswersRequest
+    carries only question_id/answer_text pairs, precisely so a client
+    cannot forge authorship in the answer_version audit trail.
+
+    A thin HTTP shell around _bulk_update_answers: its only three jobs are
+    (1) resolving a never-null author from the authenticated client, (2)
+    mapping LookupError (unknown assessment) and QuestionNotInTemplateError
+    (any unknown/foreign question_id in the batch) to 404 — _bulk_update_answers
+    has already rolled back every write the batch attempted by the time
+    either exception reaches here, so there is nothing left to undo, only
+    to report — and (3) committing once _bulk_update_answers has succeeded.
+    """
+    created_by = _created_by_from_client(client)
+    try:
+        response = _bulk_update_answers(db, assessment_id, request.answers, created_by)
+    except (LookupError, QuestionNotInTemplateError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No assessment {assessment_id}, or one of its questions, was found",
         )
     db.commit()
     return response

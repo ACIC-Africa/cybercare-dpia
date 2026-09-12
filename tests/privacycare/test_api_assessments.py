@@ -8,9 +8,12 @@ import sqlalchemy
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from fides.api.privacycare.api import assessments as assessments_module
+from fides.api.privacycare.api.answers import QuestionNotInTemplateError
 from fides.api.privacycare.api.assessments import (
     _assessment_detail,
     _assessment_to_response,
+    _bulk_update_answers,
     _created_by_from_client,
     _evidence_for,
     _grouped_assessments,
@@ -19,9 +22,14 @@ from fides.api.privacycare.api.assessments import (
     _questions_for,
     _summary,
     _update_answer,
+    bulk_update_answers,
     update_answer,
 )
-from fides.api.privacycare.api.schemas import UpdateAnswerRequest
+from fides.api.privacycare.api.schemas import (
+    AnswerUpdate,
+    BulkUpdateAnswersRequest,
+    UpdateAnswerRequest,
+)
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -1055,3 +1063,283 @@ def test_update_answer_route_commits_on_success(db, monkeypatch):
     )
 
     assert committed, "update_answer must commit once _update_answer succeeds"
+
+
+# --- PUT .../{assessment_id}/questions (task 3: bulk save) ---
+#
+# _bulk_update_answers is the non-committing core (write the whole batch +
+# recompute once + assemble the response) — tested directly here the same
+# way _update_answer is above. bulk_update_answers is the actual HTTP
+# route: a thin shell that maps LookupError/QuestionNotInTemplateError to
+# 404 and commits on success.
+
+
+def test_bulk_update_writes_all_answers_and_reports_the_count(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Two Writes DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+
+    response = _bulk_update_answers(
+        db,
+        aid,
+        [
+            AnswerUpdate(question_id=q1, answer_text="Answer one."),
+            AnswerUpdate(question_id=q2, answer_text="Answer two."),
+        ],
+        "alice@example.com",
+    )
+
+    assert response.updated_count == 2
+    texts = {q.question_id: q.answer_text for q in response.questions}
+    assert texts[q1] == "Answer one."
+    assert texts[q2] == "Answer two."
+
+
+def test_bulk_update_recomputes_completeness_once_not_per_answer(db, monkeypatch):
+    # Fix-round-shaped proof: correctness of the final completeness number
+    # alone can't distinguish "recomputed once" from "recomputed per
+    # answer" (both land on the same value for this batch). Spy on the
+    # actual call count instead.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Recompute Once DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+
+    calls = []
+    original = assessments_module.recompute_completeness
+
+    def _counting_recompute(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        assessments_module, "recompute_completeness", _counting_recompute
+    )
+
+    response = _bulk_update_answers(
+        db,
+        aid,
+        [
+            AnswerUpdate(question_id=q1, answer_text="Answer one."),
+            AnswerUpdate(question_id=q2, answer_text="Answer two."),
+        ],
+        "alice@example.com",
+    )
+
+    assert len(calls) == 1, (
+        "completeness must be recomputed ONCE for the whole batch, not once per answer"
+    )
+    assert response.completeness == pytest.approx(1.0), "both of 2 questions answered"
+
+
+def test_bulk_update_bad_question_id_rolls_back_the_whole_batch(db):
+    # The atomicity decision this plan makes explicit: a batch with one bad
+    # question_id must roll back EVERY write it attempted, including the
+    # good entries that preceded the bad one — a partially-applied batch
+    # that reports success is the worst outcome for a document a regulator
+    # will read.
+    tid = _seed_template(db)
+    other_tid = _seed_second_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Rollback DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    foreign_qid = _seed_question(db, other_tid, "q3", "necessity", 1)
+    db.flush()
+
+    with pytest.raises(QuestionNotInTemplateError):
+        _bulk_update_answers(
+            db,
+            aid,
+            [
+                AnswerUpdate(question_id=q1, answer_text="Good answer 1."),
+                AnswerUpdate(question_id=q2, answer_text="Good answer 2."),
+                AnswerUpdate(question_id=foreign_qid, answer_text="Bad."),
+            ],
+            "alice@example.com",
+        )
+
+    handle_count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert handle_count == 0, (
+        "zero assessment_answer handles must exist — including for q1/q2, "
+        "which succeeded before the bad entry raised"
+    )
+
+    version_count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM answer_version av "
+            "JOIN assessment_answer a ON a.id = av.answer_id "
+            "WHERE a.assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert version_count == 0, (
+        "zero answer_version rows must exist — a bad entry anywhere in the "
+        "batch must undo every write the batch made, not just skip itself"
+    )
+
+    persisted_completeness = db.execute(
+        sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted_completeness in (None, 0.0), (
+        "completeness must not have been recomputed/persisted off a batch that failed"
+    )
+
+
+def test_bulk_update_empty_answers_list_is_a_no_op(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Empty Batch DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    response = _bulk_update_answers(db, aid, [], "alice@example.com")
+
+    assert response.updated_count == 0
+    assert response.completeness == 0.0
+    count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert count == 0, "an empty batch must be a no-op, not write anything"
+
+
+def test_bulk_update_questions_field_carries_the_full_set_not_just_updated(db):
+    # THE DECISION: `questions` returns the assessment's FULL question set,
+    # not only the entries this batch touched. Evidence (see
+    # _all_questions_response's docstring in assessments.py):
+    # bulkUpdateAssessmentAnswers (privacy-assessments.slice.ts) has no
+    # onQueryStarted/updateQueryData of its own — it only invalidatesTags
+    # "Privacy Assessment", which triggers a getAssessment refetch, and
+    # AssessmentDetail.tsx reads its questions exclusively off that query's
+    # question_groups (wholesale replacement). Returning only q1 here would
+    # be the exact failure mode the brief warns about if any future
+    # component reads this field directly instead of waiting on that
+    # refetch: every untouched question blanked out.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Full Set DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+
+    response = _bulk_update_answers(
+        db,
+        aid,
+        [AnswerUpdate(question_id=q1, answer_text="Only q1 touched.")],
+        "alice@example.com",
+    )
+
+    ids = {q.question_id for q in response.questions}
+    assert ids == {q1, q2}, (
+        "questions must carry the assessment's full question set — a "
+        "subset would blank out q2, which this batch never touched"
+    )
+
+
+def test_bulk_update_route_commits_on_success(db, monkeypatch):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Commit DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    committed = []
+    monkeypatch.setattr(db, "commit", lambda: committed.append(True))
+
+    response = bulk_update_answers(
+        aid,
+        BulkUpdateAnswersRequest(
+            answers=[AnswerUpdate(question_id=qid, answer_text="Answered.")]
+        ),
+        db=db,
+        client=_fake_client("alice@example.com"),
+    )
+
+    assert committed, "bulk_update_answers must commit once the batch succeeds"
+    assert response.updated_count == 1
+
+
+def test_bulk_update_route_maps_foreign_question_to_404_and_writes_nothing(db):
+    tid = _seed_template(db)
+    other_tid = _seed_second_template(db)
+    aid = _seed_assessment(db, tid, "Bulk 404 DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    foreign_qid = _seed_question(db, other_tid, "q2", "necessity", 1)
+    db.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        bulk_update_answers(
+            aid,
+            BulkUpdateAnswersRequest(
+                answers=[
+                    AnswerUpdate(question_id=qid, answer_text="Good."),
+                    AnswerUpdate(question_id=foreign_qid, answer_text="Bad."),
+                ]
+            ),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+    assert exc_info.value.status_code == 404
+
+    count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert count == 0, "a 404'd batch must not leave any partial rows behind"
+
+
+def test_bulk_update_route_maps_unknown_assessment_to_404(db):
+    with pytest.raises(HTTPException) as exc_info:
+        bulk_update_answers(
+            "no-such-assessment",
+            BulkUpdateAnswersRequest(
+                answers=[AnswerUpdate(question_id="no-such-question", answer_text="x")]
+            ),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_bulk_update_route_created_by_comes_from_the_caller_not_the_body(
+    db, monkeypatch
+):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Bulk Created By DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    bulk_update_answers(
+        aid,
+        BulkUpdateAnswersRequest(
+            answers=[AnswerUpdate(question_id=qid, answer_text="Answered.")]
+        ),
+        db=db,
+        client=_fake_client("carol@example.com", id="client_should_not_be_used"),
+    )
+
+    created_by = db.execute(
+        sqlalchemy.text(
+            "SELECT av.created_by FROM assessment_answer a "
+            "JOIN answer_version av ON av.id = a.current_version_id "
+            "WHERE a.assessment_id = :aid AND a.question_id = :qid"
+        ),
+        {"aid": aid, "qid": qid},
+    ).scalar()
+    assert created_by == "carol@example.com", (
+        "created_by must be the AUTHENTICATED CLIENT's user, not the "
+        "request body (AnswerUpdate has no created_by field at all) and "
+        "not a hardcoded/forged value"
+    )
