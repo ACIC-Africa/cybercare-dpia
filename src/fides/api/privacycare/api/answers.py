@@ -20,7 +20,6 @@
 import uuid
 
 import sqlalchemy
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 
@@ -152,18 +151,23 @@ _UPDATE_COMPLETENESS_SQL = sqlalchemy.text(
 )
 
 
-class AnswerWriteResult(BaseModel):
-    """What a write produced — enough for a caller (task 2's route) to build
-    an API response without re-querying."""
-
-    answer_id: str
-    version_id: str
-    version_number: int
-    answer_text: str
-    answer_status: str
-    answer_source: str
-    change_type: str
-    created_by: str | None
+# Fix round 3 (whole-range review, finding 7): write_answer used to return an
+# AnswerWriteResult model whose docstring said it existed so a caller "can
+# build an API response without re-querying". It was DELETED rather than
+# wired up, because no caller could ever have honoured that intent: both
+# production callers build an AssessmentQuestionResponse, whose 14 fields
+# (question_text, guidance, evidence, missing_data, sme_prompt, ...) come
+# from assessment_question and are not knowable from a write to
+# answer_version. _update_answer's _question_by_id re-query is therefore not
+# a caller ignoring an available shortcut — it is the only way to produce
+# the response, and AnswerWriteResult was a tested-but-unused production
+# path documenting an intent the code could not follow.
+#
+# What it cost to remove: the tests that read `result.version_id` as a
+# handle now read current_version_id back out of the database instead (see
+# _current_version/_versions in tests/privacycare/test_answers.py), which is
+# a stronger assertion for an append-only audit trail anyway — it pins what
+# was PERSISTED rather than what the function reported.
 
 
 def _lock_assessment_and_get_template_id(db: Session, assessment_id: str) -> str:
@@ -208,7 +212,7 @@ def write_answer(
     question_id: str,
     answer_text: str,
     created_by: str | None,
-) -> AnswerWriteResult:
+) -> None:
     """Append a new answer_version for (assessment_id, question_id) and
     repoint the assessment_answer handle at it. Never overwrites a prior
     version — see the module docstring.
@@ -235,6 +239,10 @@ def write_answer(
     change_type/answer_source are NOT part of that decision — they are
     fixed by the task brief itself for a human-typed save: change_type is
     always "human_edited", answer_source is always "user_input".
+
+    Returns nothing. See the fix-round-3 comment above AnswerWriteResult's
+    former definition for why the result model was deleted rather than
+    consumed: no caller could build its response from it.
 
     Concurrency (fix round 1): the very first thing this function does is
     lock the parent assessment row FOR UPDATE — see
@@ -291,17 +299,6 @@ def write_answer(
     db.execute(
         _REPOINT_CURRENT_VERSION_SQL,
         {"version_id": version_id, "answer_id": answer_id},
-    )
-
-    return AnswerWriteResult(
-        answer_id=answer_id,
-        version_id=version_id,
-        version_number=version_number,
-        answer_text=answer_text,
-        answer_status=answer_status,
-        answer_source=answer_source,
-        change_type=change_type,
-        created_by=created_by,
     )
 
 

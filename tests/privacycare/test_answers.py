@@ -49,27 +49,55 @@ def _version_row(db, version_id: str):
     ).first()
 
 
+def _current_version(db, assessment_id: str, question_id: str):
+    # Fix round 3 (whole-range review, finding 7): write_answer no longer
+    # returns an AnswerWriteResult — the model was deleted as dead in
+    # production (no caller could build its response from it; see the
+    # comment where it used to live in api/answers.py). These helpers read
+    # the same facts back out of the database instead, which is the stronger
+    # assertion for an append-only audit trail: it pins what was PERSISTED,
+    # not what the function reported having written.
+    row = _answer_row(db, assessment_id, question_id)
+    assert row is not None, "no assessment_answer handle for this pair"
+    return _version_row(db, row.current_version_id)
+
+
+def _versions(db, assessment_id: str, question_id: str):
+    # Every version ever written for this (assessment, question), oldest
+    # first — the chain itself.
+    return db.execute(
+        sqlalchemy.text(
+            "SELECT av.id, av.answer_id, av.version_number, av.answer_text, "
+            " av.answer_status, av.answer_source, av.change_type, av.created_by "
+            "FROM answer_version av "
+            "JOIN assessment_answer a ON a.id = av.answer_id "
+            "WHERE a.assessment_id = :aid AND a.question_id = :qid "
+            "ORDER BY av.version_number"
+        ),
+        {"aid": assessment_id, "qid": question_id},
+    ).all()
+
+
 def test_first_write_creates_the_handle_and_version_1(db):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "First Write DPIA")
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    result = write_answer(
-        db, aid, qid, "We collect only what's needed.", "alice@example.com"
-    )
+    write_answer(db, aid, qid, "We collect only what's needed.", "alice@example.com")
     db.flush()
 
-    assert result.version_number == 1
     row = _answer_row(db, aid, qid)
     assert row is not None, "first write must create the assessment_answer handle"
-    assert row.id == result.answer_id
-    assert row.current_version_id == result.version_id, (
+
+    versions = _versions(db, aid, qid)
+    assert len(versions) == 1, "exactly one version after one write"
+    assert versions[0].version_number == 1
+    assert versions[0].answer_id == row.id
+    assert row.current_version_id == versions[0].id, (
         "current_version_id must point at the version just written"
     )
-    version = _version_row(db, result.version_id)
-    assert version.answer_text == "We collect only what's needed."
-    assert version.version_number == 1
+    assert versions[0].answer_text == "We collect only what's needed."
 
 
 def test_second_write_creates_version_2_and_leaves_version_1_readable(db):
@@ -78,28 +106,28 @@ def test_second_write_creates_version_2_and_leaves_version_1_readable(db):
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    first = write_answer(db, aid, qid, "Draft answer.", "alice@example.com")
+    write_answer(db, aid, qid, "Draft answer.", "alice@example.com")
     db.flush()
-    second = write_answer(db, aid, qid, "Revised answer.", "bob@example.com")
+    write_answer(db, aid, qid, "Revised answer.", "bob@example.com")
     db.flush()
 
-    assert second.version_number == 2
-    assert second.version_id != first.version_id
+    # Rule 1: append, never overwrite — BOTH versions must still exist,
+    # version 1 untouched.
+    versions = _versions(db, aid, qid)
+    assert len(versions) == 2, "version 1 must remain readable after version 2"
+    first_version, second_version = versions
+    assert first_version.version_number == 1
+    assert first_version.answer_text == "Draft answer."
+    assert first_version.created_by == "alice@example.com"
+    assert second_version.version_number == 2
+    assert second_version.answer_text == "Revised answer."
+    assert second_version.created_by == "bob@example.com"
+    assert second_version.id != first_version.id
 
     row = _answer_row(db, aid, qid)
-    assert row.current_version_id == second.version_id, (
+    assert row.current_version_id == second_version.id, (
         "current_version_id must be repointed at the newest version"
     )
-
-    # Rule 1: append, never overwrite — the first version's row must still
-    # exist, untouched, readable by id.
-    first_version = _version_row(db, first.version_id)
-    assert first_version is not None, "version 1 must remain readable"
-    assert first_version.answer_text == "Draft answer."
-    assert first_version.version_number == 1
-
-    second_version = _version_row(db, second.version_id)
-    assert second_version.answer_text == "Revised answer."
 
 
 def test_exactly_one_handle_exists_after_two_writes(db):
@@ -129,12 +157,10 @@ def test_change_type_is_human_edited_and_source_is_user_input(db):
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    result = write_answer(db, aid, qid, "An answer.", "alice@example.com")
+    write_answer(db, aid, qid, "An answer.", "alice@example.com")
     db.flush()
 
-    assert result.change_type == "human_edited"
-    assert result.answer_source == "user_input"
-    version = _version_row(db, result.version_id)
+    version = _current_version(db, aid, qid)
     assert version.change_type == "human_edited"
     assert version.answer_source == "user_input"
 
@@ -145,11 +171,10 @@ def test_created_by_is_recorded(db):
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    result = write_answer(db, aid, qid, "An answer.", "carol@example.com")
+    write_answer(db, aid, qid, "An answer.", "carol@example.com")
     db.flush()
 
-    assert result.created_by == "carol@example.com"
-    version = _version_row(db, result.version_id)
+    version = _current_version(db, aid, qid)
     assert version.created_by == "carol@example.com"
 
 
@@ -168,11 +193,10 @@ def test_write_answer_defaults_status_to_complete(db):
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     db.flush()
 
-    result = write_answer(db, aid, qid, "An answer.", "alice@example.com")
+    write_answer(db, aid, qid, "An answer.", "alice@example.com")
     db.flush()
 
-    assert result.answer_status == "complete"
-    version = _version_row(db, result.version_id)
+    version = _current_version(db, aid, qid)
     assert version.answer_status == "complete"
 
 
