@@ -1111,12 +1111,18 @@ def _update_assessment(
     update_assessment, the same split every other core function in this
     module uses.
     """
+    # Not an assert: `python -O` strips asserts, and this is the ONLY thing
+    # standing between a caller-supplied key and an identifier interpolated
+    # straight into the SET clause below. Values are bound; column names
+    # cannot be. UpdatePrivacyAssessmentRequest already closes the set, so
+    # this should be unreachable — which is exactly why it must not be the
+    # kind of guard that vanishes under an optimisation flag.
     unknown_fields = set(updates) - _UPDATABLE_ASSESSMENT_FIELDS
-    assert not unknown_fields, (
-        f"_update_assessment received field(s) outside "
-        f"_UPDATABLE_ASSESSMENT_FIELDS: {unknown_fields} — "
-        "UpdatePrivacyAssessmentRequest should make this impossible"
-    )
+    if unknown_fields:
+        raise ValueError(
+            f"_update_assessment received field(s) outside "
+            f"_UPDATABLE_ASSESSMENT_FIELDS: {sorted(unknown_fields)}"
+        )
 
     if updates:
         set_clause = ", ".join(f"{field} = :{field}" for field in updates)

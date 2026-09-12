@@ -1374,6 +1374,19 @@ def test_update_assessment_changes_only_the_named_field(db):
     assert response.status == "in_progress", "status must be untouched"
 
 
+def test_update_assessment_rejects_a_field_outside_the_allow_list(db):
+    # The SET clause interpolates column NAMES into the SQL string (values
+    # are bound; identifiers cannot be), so the allow-list is the guard
+    # against an arbitrary column reaching it. It used to be an `assert`,
+    # which `python -O` strips. This pins that it raises for real.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Allow-list DPIA")
+    db.flush()
+
+    with pytest.raises(ValueError, match="_UPDATABLE_ASSESSMENT_FIELDS"):
+        _update_assessment(db, aid, {"completeness": 1.0})
+
+
 def test_update_assessment_name_only_leaves_status_and_risk_level_alone(db):
     tid = _seed_template(db)
     aid = _seed_assessment(
