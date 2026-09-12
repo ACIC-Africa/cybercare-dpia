@@ -1925,7 +1925,9 @@ def test_delete_assessment_logs_nothing_for_an_unknown_id(db):
     assert not [m for m in messages if "DELETED" in m], messages
 
 
-def test_delete_assessment_route_names_the_authenticated_client_never_the_body(db, monkeypatch):
+def test_delete_assessment_route_names_the_authenticated_client_never_the_body(
+    db, monkeypatch
+):
     # Same never-null derivation every answer write uses
     # (_created_by_from_client): a machine-to-machine client with no linked
     # FidesUser is still named, as "client:<id>", rather than logged as None.
@@ -1943,7 +1945,9 @@ def test_delete_assessment_route_names_the_authenticated_client_never_the_body(d
     assert "client:api_client_abc123" in logged, logged
 
 
-def test_update_assessment_route_logs_the_actor_and_the_fields_it_changed(db, monkeypatch):
+def test_update_assessment_route_logs_the_actor_and_the_fields_it_changed(
+    db, monkeypatch
+):
     # privacy_assessment has no "who last edited" column, so this is the
     # only place the actor behind a status flip to `completed` — the claim
     # that the §31 assessment was done — is recorded at all.

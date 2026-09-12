@@ -656,7 +656,9 @@ def test_bulk_update_answers_request_element_type_is_the_shipped_answer_update()
     # `List[dict]` or a list of the wrong model, so assert the element type
     # itself — the same type-blindness finding 6 names, on the one request
     # field where it carries a nested contract.
-    element = typing.get_args(BulkUpdateAnswersRequest.model_fields["answers"].annotation)
+    element = typing.get_args(
+        BulkUpdateAnswersRequest.model_fields["answers"].annotation
+    )
     assert element and element[0] is AnswerUpdate
     assert _feature_interface_raw_specs("BulkUpdateAnswersRequest")["answers"] == (
         "AnswerUpdate[]"
