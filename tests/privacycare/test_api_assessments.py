@@ -7,6 +7,7 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.assessments import (
+    _assessment_detail,
     _assessment_to_response,
     _evidence_for,
     _grouped_assessments,
@@ -70,22 +71,23 @@ def _seed_assessment(
     data_use: str | None = None,
     data_use_name: str | None = None,
     system: str | None = "sys_test",
+    task_id: str | None = None,
 ) -> str:
-    # status/risk_level/created_by/data_use/data_use_name/system are all
-    # optional kwargs (defaulting to the original single-status behaviour,
-    # system="sys_test") so the summary tests below can drive every
-    # AssessmentSummarySegment and the blocked_groups/owners aggregation
-    # without a second seed helper, and existing positional/keyword callers
-    # keep working unchanged. `system` is additive: a later task extends
-    # this same helper again.
+    # status/risk_level/created_by/data_use/data_use_name/system/task_id are
+    # all optional kwargs (defaulting to the original single-status
+    # behaviour, system="sys_test") so the summary tests below can drive
+    # every AssessmentSummarySegment and the blocked_groups/owners
+    # aggregation without a second seed helper, and existing
+    # positional/keyword callers keep working unchanged. `task_id` is
+    # additive, same pattern as `system` before it (task 2).
     aid = f"asmt_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO privacy_assessment "
             "(id, template_id, name, status, system_fides_key, risk_level, "
-            " created_by, data_use, data_use_name) "
+            " created_by, data_use, data_use_name, privacy_assessment_task_id) "
             "VALUES (:id, :tid, :name, :status, :system, :risk_level, "
-            " :created_by, :data_use, :data_use_name)"
+            " :created_by, :data_use, :data_use_name, :task_id)"
         ),
         {
             "id": aid,
@@ -97,9 +99,42 @@ def _seed_assessment(
             "created_by": created_by,
             "data_use": data_use,
             "data_use_name": data_use_name,
+            "task_id": task_id,
         },
     )
     return aid
+
+
+def _seed_task(
+    db,
+    *,
+    use_llm: bool = False,
+    llm_model: str | None = None,
+) -> str:
+    # Columns per the brief: id, created_at, updated_at, action_type, status,
+    # celery_id, total_count, completed_count, message, assessment_types,
+    # system_fides_keys, created_by, use_llm, llm_model, high_risk_only.
+    # action_type/status/celery_id/assessment_types are NOT NULL with no
+    # server default for the first three (verified against the live schema);
+    # total_count/completed_count/use_llm/high_risk_only all have defaults,
+    # supplied explicitly here anyway for a self-contained seed row.
+    task_id = f"task_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacy_assessment_task "
+            "(id, action_type, status, celery_id, total_count, completed_count, "
+            " assessment_types, use_llm, llm_model, high_risk_only) "
+            "VALUES (:id, 'generate', 'complete', :celery_id, 0, 0, "
+            " '{}', :use_llm, :llm_model, false)"
+        ),
+        {
+            "id": task_id,
+            "celery_id": f"celery_{uuid.uuid4().hex[:8]}",
+            "use_llm": use_llm,
+            "llm_model": llm_model,
+        },
+    )
+    return task_id
 
 
 def test_assessments_group_by_data_use(db):
@@ -486,3 +521,65 @@ def test_evidence_skip_is_logged_not_silent(db, caplog):
     assert aid in caplog.text
     assert qid in caplog.text
     assert "id" in caplog.text and "type" in caplog.text
+
+
+def test_detail_carries_question_groups(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Detail DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+    detail = _assessment_detail(db, aid)
+    assert detail.name == "Detail DPIA"
+    assert len(detail.question_groups) == 1
+    group = detail.question_groups[0]
+    assert group.requirement_key == "necessity"
+    assert group.total_count == 2
+    assert group.answered_count == 0, "no answers seeded"
+
+
+def test_detail_question_id_is_the_real_id_and_id_is_the_label(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Label DPIA")
+    qid = _seed_question(db, tid, "Q7", "security", 1)
+    db.flush()
+    question = _assessment_detail(db, aid).question_groups[0].questions[0]
+    assert question.question_id == qid, "question_id must be the database id"
+    assert question.id == "Q7", "id is the display label the UI renders"
+
+
+def test_detail_fields_without_a_source_are_empty_not_missing(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Empty Fields DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+    detail = _assessment_detail(db, aid)
+    assert detail.questionnaire is None
+    question = detail.question_groups[0].questions[0]
+    assert question.missing_data == []
+    assert question.sme_prompt is None
+    assert detail.question_groups[0].risk_level is None
+
+
+def test_detail_metadata_comes_from_the_generation_task(db):
+    tid = _seed_template(db)
+    task_id = _seed_task(db, use_llm=True, llm_model="claude-sonnet-5")
+    aid = _seed_assessment(db, tid, "Task DPIA", task_id=task_id)
+    db.flush()
+    meta = _assessment_detail(db, aid).metadata
+    assert meta is not None
+    assert meta.use_llm is True
+    assert meta.model_used == "claude-sonnet-5"
+    assert meta.generation_timestamp
+
+
+def test_detail_without_a_task_has_null_metadata(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No Task DPIA")
+    db.flush()
+    assert _assessment_detail(db, aid).metadata is None
+
+
+def test_unknown_detail_raises(db):
+    with pytest.raises(LookupError):
+        _assessment_detail(db, "no-such-assessment")

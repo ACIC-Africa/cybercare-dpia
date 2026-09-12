@@ -11,8 +11,12 @@ from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
     AssessmentEvidenceResponse,
     AssessmentGroupResponse,
+    AssessmentMetadata,
+    AssessmentQuestionResponse,
     AssessmentResponse,
     AssessmentSummaryResponse,
+    PrivacyAssessmentDetailResponse,
+    QuestionGroup,
     TemplateResponse,
     template_key,
 )
@@ -63,8 +67,9 @@ _QUESTION_SQL = sqlalchemy.text(
     """
     SELECT q.id, q.requirement_key, q.requirement_title, q.group_order,
            q.question_key, q.question_text, q.guidance, q.question_order,
-           q.required, a.id AS answer_id,
-           av.answer_status, av.answer_text, av.answer_source
+           q.required, q.fides_sources, q.expected_coverage, a.id AS answer_id,
+           av.answer_status, av.answer_text, av.answer_source, av.confidence,
+           av.evidence
     FROM assessment_question q
     JOIN privacy_assessment pa ON pa.template_id = q.template_id
     LEFT JOIN assessment_answer a
@@ -72,6 +77,37 @@ _QUESTION_SQL = sqlalchemy.text(
     LEFT JOIN answer_version av ON av.id = a.current_version_id
     WHERE pa.id = :assessment_id
     ORDER BY q.group_order, q.requirement_key, q.question_order, q.id
+    """
+)
+
+# Joins `privacy_assessment` to its template (for assessment_type, which lives
+# on assessment_template — not on privacy_assessment itself) and carries
+# privacy_assessment_task_id through unjoined, since _metadata_for below needs
+# the bare id to decide whether a generation task exists at all before
+# querying privacy_assessment_task. No tenant/organisation filter — same D14
+# basis as _ASSESSMENT_SQL above.
+_ASSESSMENT_DETAIL_SQL = sqlalchemy.text(
+    """
+    SELECT pa.id, pa.template_id, t.name AS template_name, pa.name, pa.status,
+           pa.completeness, pa.risk_level, pa.system_fides_key, pa.system_name,
+           pa.declaration_id, pa.declaration_name, pa.data_use, pa.data_use_name,
+           pa.data_categories, pa.created_by, pa.created_at, pa.updated_at,
+           t.assessment_type, pa.privacy_assessment_task_id
+    FROM privacy_assessment pa
+    LEFT JOIN assessment_template t ON t.id = pa.template_id
+    WHERE pa.id = :assessment_id
+    """
+)
+
+# AssessmentMetadata's three fields all live on privacy_assessment_task,
+# reached via privacy_assessment.privacy_assessment_task_id (see the plan's
+# field-by-field source table). Metadata is None when that id is null —
+# handled by _metadata_for before this query ever runs.
+_TASK_SQL = sqlalchemy.text(
+    """
+    SELECT created_at, use_llm, llm_model
+    FROM privacy_assessment_task
+    WHERE id = :task_id
     """
 )
 
@@ -129,10 +165,14 @@ def _questions_for(db: Session, assessment_id: str) -> list[dict]:
                 "guidance": row["guidance"],
                 "question_order": row["question_order"],
                 "required": row["required"],
+                "fides_sources": row["fides_sources"],
+                "expected_coverage": row["expected_coverage"],
                 "answer_id": row["answer_id"],
                 "answer_status": row["answer_status"],
                 "answer_text": row["answer_text"],
                 "answer_source": row["answer_source"],
+                "confidence": row["confidence"],
+                "evidence": row["evidence"],
             }
         )
     return groups
@@ -207,6 +247,129 @@ def _evidence_for(db: Session, assessment_id: str) -> dict:
         "total_count": len(items),
         "items": items,
     }
+
+
+def _question_response(q: dict) -> AssessmentQuestionResponse:
+    # THE NAMING TRAP: `id` is the display label QuestionCard.tsx:43 renders
+    # ("{question.id}. {question.question_text}"), sourced from
+    # assessment_question.question_key. `question_id` is the real identifier
+    # QuestionCard.tsx:26 passes as questionId, sourced from
+    # assessment_question.id. Do not swap them.
+    #
+    # answer_status/answer_source/answer_text are required, non-nullable
+    # fields in the TS contract, but a question with no assessment_answer row
+    # yet has no answer_version to join — av.* comes back None from the SQL's
+    # LEFT JOIN. "needs_input"/"system" are not invented values: they are the
+    # exact column defaults AnswerVersion.answer_status/answer_source declare
+    # (fides.api.models.privacy_assessment, not imported here per this file's
+    # existing no-ORM-coupling convention) — the same defaults a real row
+    # would carry before anyone touched it. answer_text has no column
+    # default, so "" is the empty-string analogue for a required str field.
+    #
+    # evidence: List[dict], required. answer_version.evidence is a single
+    # JSONB *object* (verified against the live schema; see _evidence_items_for
+    # above), not an array, with server_default '{}' meaning "answered, no
+    # evidence attached" — same exact-default exclusion already used there.
+    # An unanswered question (no av row at all) has evidence=None. Both cases
+    # collapse to the empty list; a genuinely populated object is wrapped as
+    # the list's single element.
+    evidence = q["evidence"]
+    return AssessmentQuestionResponse(
+        id=q["question_key"],
+        question_id=q["id"],
+        question_text=q["question_text"],
+        guidance=q["guidance"],
+        required=q["required"],
+        fides_sources=list(q["fides_sources"] or []),
+        expected_coverage=q["expected_coverage"],
+        answer_text=q["answer_text"] or "",
+        answer_status=q["answer_status"] or "needs_input",
+        answer_source=q["answer_source"] or "system",
+        confidence=q["confidence"],
+        evidence=[evidence] if evidence else [],
+        # No database source (Plus computes these) — empty forms, not
+        # omitted. See the plan's field-by-field source table.
+        missing_data=[],
+        sme_prompt=None,
+    )
+
+
+def _question_group_response(group: dict) -> QuestionGroup:
+    questions = [_question_response(q) for q in group["questions"]]
+    # "current answer" == the LEFT JOIN to answer_version actually resolved
+    # (answer_status only has a value when av joined) — an assessment_answer
+    # row that never got a current_version_id would not count as answered.
+    answered_count = sum(
+        1 for q in group["questions"] if q["answer_status"] is not None
+    )
+    return QuestionGroup(
+        # QuestionGroup.id and .requirement_key are the same value per the
+        # plan's field table — both source from assessment_question.requirement_key.
+        id=group["requirement_key"],
+        title=group["requirement_title"],
+        requirement_key=group["requirement_key"],
+        questions=questions,
+        answered_count=answered_count,
+        total_count=len(questions),
+        # No source in the OSS schema — always null for now.
+        risk_level=None,
+        last_updated_at=None,
+        last_updated_by=None,
+    )
+
+
+def _metadata_for(db: Session, task_id: str | None) -> AssessmentMetadata | None:
+    if task_id is None:
+        return None
+    row = db.execute(_TASK_SQL, {"task_id": task_id}).mappings().first()
+    if row is None:
+        # A dangling privacy_assessment_task_id (task row deleted after the
+        # assessment pointed at it) is treated the same as "no task" rather
+        # than raising — this endpoint's job is the assessment, not enforcing
+        # the task table's referential integrity.
+        return None
+    return AssessmentMetadata(
+        generation_timestamp=_as_str(row["created_at"]),
+        model_used=row["llm_model"],
+        use_llm=row["use_llm"],
+    )
+
+
+def _assessment_detail(db: Session, assessment_id: str) -> PrivacyAssessmentDetailResponse:
+    row = (
+        db.execute(_ASSESSMENT_DETAIL_SQL, {"assessment_id": assessment_id})
+        .mappings()
+        .first()
+    )
+    if row is None:
+        raise LookupError(f"No assessment with id {assessment_id}")
+    question_groups = [
+        _question_group_response(g) for g in _questions_for(db, assessment_id)
+    ]
+    return PrivacyAssessmentDetailResponse(
+        id=row["id"],
+        template_id=row["template_id"],
+        template_name=row["template_name"],
+        name=row["name"],
+        status=row["status"],
+        completeness=row["completeness"],
+        risk_level=row["risk_level"],
+        system_fides_key=row["system_fides_key"],
+        system_name=row["system_name"],
+        declaration_id=row["declaration_id"],
+        declaration_name=row["declaration_name"],
+        data_use=row["data_use"],
+        data_use_name=row["data_use_name"],
+        data_categories=list(row["data_categories"] or []),
+        created_by=row["created_by"],
+        created_at=_as_str(row["created_at"]),
+        updated_at=_as_str(row["updated_at"]),
+        assessment_type=row["assessment_type"],
+        question_groups=question_groups,
+        # The questionnaire is a commercial chat feature with no OSS table.
+        questionnaire=None,
+        metadata=_metadata_for(db, row["privacy_assessment_task_id"]),
+    )
 
 
 def _list_templates(db: Session) -> list[TemplateResponse]:
@@ -422,20 +585,18 @@ def list_templates(
 @privacycare_router.get(
     "/{assessment_id}",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
-    response_model=AssessmentResponse,
+    response_model=PrivacyAssessmentDetailResponse,
 )
 def get_assessment(
     assessment_id: str, *, db: Session = Depends(get_db)
-) -> AssessmentResponse:
-    row = next(
-        (r for r in _list_assessments(db) if r["id"] == assessment_id), None
-    )
-    if row is None:
+) -> PrivacyAssessmentDetailResponse:
+    try:
+        return _assessment_detail(db, assessment_id)
+    except LookupError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No assessment with id {assessment_id}",
         )
-    return _assessment_to_response(row)
 
 
 @privacycare_router.get(
