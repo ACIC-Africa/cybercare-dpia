@@ -328,12 +328,15 @@ def test_completeness_is_recomputed_after_generation(db):
         ),
         {"id": task_id},
     ).scalar()
-    # recompute_completeness (api/answers.py, Task 3/4) returns a 0.0-1.0
-    # fraction, not a percentage — pinned by test_answers.py/
-    # test_api_assessments.py asserting completeness == pytest.approx(1.0)
-    # for "both of 2 questions answered". One question, fully answered, is
-    # 1.0, not 100.0.
-    assert completeness == 1.0
+    # 100.0, not 1.0 (fix round 1, coordinator review): recompute_
+    # completeness returns a 0-100 percentage — see its own docstring in
+    # api/answers.py. This assertion was WRONG in the previous round (it
+    # read 1.0, on the mistaken belief that recompute_completeness returned
+    # a 0.0-1.0 fraction, and "corrected" the brief's original 100.0 to
+    # match that mistaken belief). The brief's 100.0 was right all along;
+    # recompute_completeness was the one that was wrong, and is now fixed
+    # to match its own consumer (AssessmentCard.tsx).
+    assert completeness == 100.0
 
 
 def test_one_failing_target_does_not_discard_the_others(db, monkeypatch):

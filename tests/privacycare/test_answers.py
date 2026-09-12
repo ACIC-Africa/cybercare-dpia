@@ -213,17 +213,50 @@ def test_recompute_completeness_is_complete_only_and_persists(db):
     db.flush()
 
     completeness = recompute_completeness(db, aid)
-    assert completeness == pytest.approx(1 / 3), (
-        "1 of 3 questions has a complete answer"
+    # 0-100 (fix round 1, coordinator review, MAJOR finding): recompute_
+    # completeness used to return the bare 0.0-1.0 fraction; the consumer
+    # (AssessmentCard.tsx: `Math.round(completeness)}%`, `percent=
+    # {completeness}`) always assumed 0-100. See the function's own
+    # docstring for the full story.
+    assert completeness == pytest.approx(33.3), (
+        "1 of 3 questions has a complete answer, rounded to one decimal place"
     )
 
     persisted = db.execute(
         sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
         {"id": aid},
     ).scalar()
-    assert persisted == pytest.approx(1 / 3), (
+    assert persisted == pytest.approx(33.3), (
         "recompute_completeness must write the value, not just return it"
     )
+
+
+def test_recompute_completeness_persists_100_when_fully_answered(db):
+    # Fix round 1 (coordinator review, MAJOR finding): the consumer
+    # (clients/admin-ui/.../AssessmentCard.tsx) does
+    # `Math.round(completeness)}%` and `percent={completeness}` — both
+    # assume a 0-100 scale. Before this fix, a fully-answered assessment
+    # persisted 1.0 and rendered as "1%" on every DPIA card regardless of
+    # actual progress. This pins the unit at the one point where it's
+    # unambiguous: full completion must read 100.0, not 1.0.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Fully Answered DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+
+    write_answer(db, aid, q1, "Answered one.", "alice@example.com")
+    write_answer(db, aid, q2, "Answered two.", "alice@example.com")
+    db.flush()
+
+    completeness = recompute_completeness(db, aid)
+    assert completeness == 100.0, "every question answered must read 100.0, not 1.0"
+
+    persisted = db.execute(
+        sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted == 100.0
 
 
 def test_recompute_completeness_excludes_non_complete_statuses(db):
@@ -353,7 +386,7 @@ def test_recompute_completeness_ignores_answers_whose_question_is_not_on_the_tem
     db.flush()
 
     completeness = recompute_completeness(db, aid)
-    assert completeness == pytest.approx(1 / 2), (
+    assert completeness == pytest.approx(50.0), (
         "only the on-template answer may count: 1 complete of 2 template "
         "questions. The off-template answer must not inflate the numerator"
     )
@@ -362,7 +395,7 @@ def test_recompute_completeness_ignores_answers_whose_question_is_not_on_the_tem
         sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
         {"id": aid},
     ).scalar()
-    assert persisted == pytest.approx(1 / 2)
+    assert persisted == pytest.approx(50.0)
 
 
 def test_recompute_completeness_never_exceeds_one_with_only_off_template_answers(db):

@@ -344,8 +344,23 @@ def write_answer(
 
 def recompute_completeness(db: Session, assessment_id: str) -> float:
     """Recompute privacy_assessment.completeness as
-    (complete answers) / (total questions on the assessment's template),
-    write it, and return it.
+    100 * (complete answers) / (total questions on the assessment's
+    template), rounded to one decimal place, write it, and return it.
+
+    UNIT (fix round 1, coordinator review, MAJOR finding — thank you to the
+    reporter): this is a 0-100 PERCENTAGE, not a 0.0-1.0 fraction. It used to
+    be the bare fraction, undetected because every test in this package
+    that checked a value asserted against pytest.approx(<fraction>) rather
+    than against the consumer. clients/admin-ui/src/features/
+    privacy-assessments/AssessmentCard.tsx does `Math.round(completeness)}%`
+    and feeds `percent={completeness}` to a progress bar — both already
+    assume 0-100. Every fully-answered assessment was rendering "1%" (or,
+    for partial completion, silently rounding to "0%") regardless of actual
+    progress. `PrivacyAssessmentTask.progress` (fides/api/models/
+    privacy_assessment.py) computes the analogous task-level number as
+    `round((completed_count / total_count) * 100, 1)` — this mirrors that
+    exactly, so the one Ethyca-authored percentage field already in this
+    schema and this one use the same convention.
 
     Rule 3: this MUST use the same complete-only definition as
     answered_count in assessments.py's _question_group_response — see
@@ -369,7 +384,7 @@ def recompute_completeness(db: Session, assessment_id: str) -> float:
     complete = db.execute(
         _COMPLETE_ANSWERS_SQL, {"assessment_id": assessment_id}
     ).scalar()
-    completeness = (complete / total) if total else 0.0
+    completeness = round((complete / total) * 100, 1) if total else 0.0
 
     db.execute(
         _UPDATE_COMPLETENESS_SQL,

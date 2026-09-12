@@ -888,14 +888,18 @@ def test_update_answer_completeness_reflects_the_write(db):
 
     response = _update_answer(db, aid, q1, "Answered.", "alice@example.com")
 
-    assert response.completeness == pytest.approx(0.5), (
+    # 0-100, not 0.0-1.0 (fix round 1, coordinator review, MAJOR finding):
+    # AssessmentCard.tsx already assumes a 0-100 percentage
+    # (Math.round(completeness)}%, percent={completeness}) — see
+    # recompute_completeness's own docstring.
+    assert response.completeness == pytest.approx(50.0), (
         "1 of 2 questions now has a complete answer"
     )
     persisted = db.execute(
         sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
         {"id": aid},
     ).scalar()
-    assert persisted == pytest.approx(0.5), (
+    assert persisted == pytest.approx(50.0), (
         "completeness must be persisted, not just returned in the envelope"
     )
 
@@ -1147,7 +1151,7 @@ def test_bulk_update_recomputes_completeness_once_not_per_answer(db, monkeypatch
     assert len(calls) == 1, (
         "completeness must be recomputed ONCE for the whole batch, not once per answer"
     )
-    assert response.completeness == pytest.approx(1.0), "both of 2 questions answered"
+    assert response.completeness == pytest.approx(100.0), "both of 2 questions answered"
 
 
 def test_bulk_update_bad_question_id_rolls_back_the_whole_batch(db):
