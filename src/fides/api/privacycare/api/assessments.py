@@ -296,11 +296,26 @@ def _question_response(q: dict) -> AssessmentQuestionResponse:
 
 def _question_group_response(group: dict) -> QuestionGroup:
     questions = [_question_response(q) for q in group["questions"]]
-    # "current answer" == the LEFT JOIN to answer_version actually resolved
-    # (answer_status only has a value when av joined) — an assessment_answer
-    # row that never got a current_version_id would not count as answered.
+    # Definition, checked against the UI rather than assumed (fix round 1):
+    # answered_count/total_count is a COMPLETION-PROGRESS indicator, not a
+    # "has this been touched" tally. QuestionGroupPanel.tsx renders
+    # `isGroupCompleted = answeredCount === totalCount` to switch a group's
+    # tag between "Completed" and "Pending", and shows the raw fraction as
+    # "Fields: {answeredCount}/{totalCount}". AssessmentDetail.tsx treats
+    # AnswerStatus.NEEDS_INPUT as explicitly outstanding — it filters
+    # `allQuestions` by that exact status to build `needsInputIds`, the set
+    # sent back out for more input via Slack/Teams. Counting a needs_input
+    # answer as "answered" would show a group as Completed while a question
+    # inside it is still, by its own status, waiting on someone — an
+    # overstatement of completeness this is a regulatory (DPIA) record.
+    # So: "answered" here means the LEFT JOIN to answer_version resolved
+    # (a current answer exists) AND that answer's status is not
+    # "needs_input" — i.e. "complete" or "partial" count, "needs_input"
+    # and "no answer at all" do not.
     answered_count = sum(
-        1 for q in group["questions"] if q["answer_status"] is not None
+        1
+        for q in group["questions"]
+        if q["answer_status"] is not None and q["answer_status"] != "needs_input"
     )
     return QuestionGroup(
         # QuestionGroup.id and .requirement_key are the same value per the

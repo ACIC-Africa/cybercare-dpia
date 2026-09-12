@@ -393,12 +393,16 @@ def _seed_answer_with_evidence(
     *,
     answer_source: str = "ai_analysis",
     created_by: str = "ai@cybota.com",
+    answer_status: str = "complete",
 ) -> str:
     # assessment_answer <-> answer_version is a circular FK (verified against
     # the live migration): the answer row has to exist before a version can
     # point back at it via answer_id, and current_version_id has to be
     # backfilled afterward. `evidence` is JSONB — CAST is required because a
     # bound text parameter has no implicit cast to jsonb in Postgres.
+    # `answer_status` defaults to "complete" (the original hardcoded value)
+    # so every existing caller is unaffected; task-3 fix round 1 needs a
+    # "needs_input" row to pin answered_count's completion semantics.
     answer_id = f"aa_{uuid.uuid4().hex[:8]}"
     version_id = f"av_{uuid.uuid4().hex[:8]}"
     db.execute(
@@ -413,12 +417,13 @@ def _seed_answer_with_evidence(
             "INSERT INTO answer_version "
             "(id, answer_id, answer_status, answer_source, change_type, "
             " created_by, evidence) "
-            "VALUES (:id, :answer_id, 'complete', :answer_source, 'ai_generated', "
+            "VALUES (:id, :answer_id, :answer_status, :answer_source, 'ai_generated', "
             " :created_by, CAST(:evidence AS JSONB))"
         ),
         {
             "id": version_id,
             "answer_id": answer_id,
+            "answer_status": answer_status,
             "answer_source": answer_source,
             "created_by": created_by,
             "evidence": json.dumps(evidence),
@@ -583,3 +588,51 @@ def test_detail_without_a_task_has_null_metadata(db):
 def test_unknown_detail_raises(db):
     with pytest.raises(LookupError):
         _assessment_detail(db, "no-such-assessment")
+
+
+def test_detail_answered_count_increments_for_some_but_not_all(db):
+    # Fix round 1: the only prior test asserted answered_count == 0 with no
+    # answers seeded — nothing proved it ever increments. Seed a complete
+    # answer for one of three questions in a group and leave the other two
+    # unanswered: total_count must cover all three, answered_count only the
+    # one actually answered.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Partial Progress DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_question(db, tid, "q3", "necessity", 1)
+    _seed_answer_with_evidence(db, aid, q1, {"id": "ev_1", "type": "ai_analysis"})
+    db.flush()
+    group = _assessment_detail(db, aid).question_groups[0]
+    assert group.total_count == 3
+    assert group.answered_count == 1, "only q1 has a complete answer"
+
+
+def test_detail_answered_count_excludes_needs_input(db):
+    # Fix round 1 semantic question, resolved by reading the UI rather than
+    # assumed: QuestionGroupPanel.tsx renders answered_count/total_count as
+    # completion progress (`isGroupCompleted = answeredCount === totalCount`
+    # switches a "Completed"/"Pending" tag) and AssessmentDetail.tsx treats
+    # AnswerStatus.NEEDS_INPUT as explicitly outstanding (it filters exactly
+    # that status into `needsInputIds`, the set still awaiting a person).
+    # A current answer whose status is "needs_input" must therefore NOT
+    # count toward answered_count — counting it would show a group as
+    # Completed while a question inside it still needs input, an
+    # overstatement of completeness in a regulatory (DPIA) record.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Needs Input DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_answer_with_evidence(
+        db, aid, q1, {"id": "ev_1", "type": "ai_analysis"}, answer_status="complete"
+    )
+    _seed_answer_with_evidence(
+        db, aid, q2, {"id": "ev_2", "type": "ai_analysis"}, answer_status="needs_input"
+    )
+    db.flush()
+    group = _assessment_detail(db, aid).question_groups[0]
+    assert group.total_count == 2
+    assert group.answered_count == 1, (
+        "a needs_input answer must not count as answered, "
+        "or the group would show Completed while still needing input"
+    )
