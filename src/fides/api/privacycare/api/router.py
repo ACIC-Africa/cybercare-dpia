@@ -42,5 +42,12 @@ def register() -> None:
     # fides.api.privacycare.worker.
     from fides.api.privacycare import tasks  # noqa: F401
 
+    # api/tasks.py binds POST "" (create_privacy_assessment) — imported
+    # after api/assessments, whose _created_by_from_client it depends on.
+    # Aliased on import: this package already has a top-level `tasks`
+    # module (Task 5's Celery task, imported two lines up) and re-binding
+    # that name here would shadow it.
+    from fides.api.privacycare.api import tasks as api_tasks  # noqa: F401
+
     app_setup.ROUTERS.append(privacycare_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

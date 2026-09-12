@@ -21,6 +21,7 @@ from fides.api.privacycare.api.schemas import (
     AssessmentSummaryResponse,
     BulkUpdateAnswersRequest,
     BulkUpdateAnswersResponse,
+    CreateAssessmentTaskResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionEvidence,
@@ -534,6 +535,45 @@ def test_bulk_update_answers_response_optionality_matches_the_shipped_contract()
         BulkUpdateAnswersResponse,
         _feature_interface_raw_specs("BulkUpdateAnswersResponse"),
     )
+
+
+def test_create_assessment_task_response_matches_the_generated_contract():
+    # Task 6: CreateAssessmentTaskResponse has BOTH a generated TS type
+    # (CreateAssessmentTaskResponse.ts, task_id/status?/message?) and a
+    # hand-written override in this feature file (all three required) — the
+    # two contracts disagree only on optionality, never on field names, so
+    # one field-set assertion covers both sides.
+    assert set(CreateAssessmentTaskResponse.model_fields) == _ts_fields(
+        "CreateAssessmentTaskResponse"
+    )
+
+
+def test_create_assessment_task_response_matches_the_feature_contract():
+    assert set(CreateAssessmentTaskResponse.model_fields) == _feature_interface_fields(
+        "CreateAssessmentTaskResponse"
+    )
+
+
+def test_create_assessment_task_response_optionality_matches_the_feature_contract():
+    # The generated type marks status/message optional; the hand-written
+    # override the UI components actually compile against marks all three
+    # required. Schemas.py's own docstring on this model states the
+    # resolution: always populate all three, which satisfies the generated
+    # type's weaker (optional) contract while matching the feature file's
+    # stricter (required) one exactly — so required-ness is checked against
+    # the feature file, not the generated file.
+    for field, is_optional in _feature_interface_field_specs(
+        "CreateAssessmentTaskResponse"
+    ).items():
+        pydantic_required = CreateAssessmentTaskResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_create_assessment_task_response_contracts_were_actually_read():
+    assert len(_ts_fields("CreateAssessmentTaskResponse")) == 3
+    assert len(_feature_interface_fields("CreateAssessmentTaskResponse")) == 3
 
 
 def test_update_privacy_assessment_request_matches_the_shipped_contract():

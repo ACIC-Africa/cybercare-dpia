@@ -7,7 +7,7 @@ import re
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # Fix round 3 (whole-range review, MAJOR finding): the two enums that the
@@ -455,6 +455,69 @@ class DeletePrivacyAssessmentResponse(BaseModel):
 
     id: str
     deleted: bool = True
+
+
+class CreateAssessmentTaskRequest(BaseModel):
+    # Mirrors clients/admin-ui/src/types/api/models/CreateAssessmentTaskRequest.ts.
+    #
+    # assessment_types is REQUIRED and must be non-empty: a generation
+    # request naming no type has nothing to generate, and accepting it would
+    # queue a task that completes instantly having done nothing.
+    #
+    # The TS union enumerates eight assessment_type values, but the shipped
+    # database holds thirteen active templates (four are ROPA types absent
+    # from the union) and W2 will add a Kenyan one. Pinning the union here
+    # would reject the Kenyan template the moment Carol authors it, so the
+    # type stays List[str] and the real check is "an active template
+    # exists", made in _resolve_templates where the answer actually lives.
+    assessment_types: List[str] = Field(min_length=1)
+    system_fides_keys: Optional[List[str]] = None
+    use_llm: bool = False
+    model: Optional[str] = None
+    high_risk_only: bool = False
+
+
+class CreateAssessmentTaskResponse(BaseModel):
+    # The generated TS marks status/message optional; the hand-written
+    # override in features/privacy-assessments/types.ts marks both required.
+    # Always populating all three satisfies both.
+    task_id: str
+    status: str
+    message: str
+
+
+class AssessmentTaskSystemInfo(BaseModel):
+    # Mirrors clients/admin-ui/src/types/api/models/AssessmentTaskSystemInfo.ts.
+    # The feature-folder override calls this TaskSystem and types name as
+    # `string | null`; serialising Optional[str] satisfies both readers.
+    fides_key: str
+    name: Optional[str]
+
+
+class AssessmentTaskResponse(BaseModel):
+    # Mirrors clients/admin-ui/src/types/api/models/AssessmentTaskResponse.ts.
+    #
+    # Every field is populated on every response even though the generated
+    # contract marks most of them optional, because the hand-written
+    # override the UI components actually compile against marks them
+    # required. The union of the two contracts is "always send everything".
+    id: str
+    action_type: str
+    status: str
+    total_count: int
+    completed_count: int
+    progress: float
+    message: Optional[str]
+    assessment_types: List[str]
+    system_fides_keys: Optional[List[str]]
+    systems: Optional[List[AssessmentTaskSystemInfo]]
+    created_by: Optional[str]
+    use_llm: bool
+    llm_model: Optional[str]
+    high_risk_only: bool
+    assessment_ids: List[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
 
 
 # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
