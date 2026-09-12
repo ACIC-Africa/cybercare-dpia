@@ -109,9 +109,40 @@ _TOTAL_QUESTIONS_SQL = sqlalchemy.text(
     "WHERE pa.id = :assessment_id"
 )
 
+# Fix round 3 (whole-range review, MAJOR finding): this numerator used to
+# be
+#     SELECT COUNT(*) FROM assessment_answer a
+#     JOIN answer_version av ON av.id = a.current_version_id
+#     WHERE a.assessment_id = :assessment_id AND av.answer_status = 'complete'
+# — identical to answered_count on the STATUS predicate, but not on the ROW
+# SET. It never joined assessment_question and never mentioned template_id,
+# while both _TOTAL_QUESTIONS_SQL (the denominator) above and _QUESTION_SQL
+# (answered_count's source, in api/assessments.py) scope their rows to the
+# assessment's CURRENT template. So any assessment_answer row whose question
+# is not on that template counted in the numerator, contributed nothing to
+# the denominator, and was invisible to answered_count — apples over
+# oranges, and `completeness: float` is unbounded, so >100% was
+# representable and would render on the detail screen next to "Fields: 0/8".
+#
+# That state is not hypothetical: assessment_template is uniquely keyed on
+# (assessment_type, version, revision) and AssessmentStatus carries an
+# `outdated` value whose whole meaning is template drift, so an assessment's
+# template_id moving relative to its existing answers is a first-class
+# concept here. The four routes in this module's range cannot create it
+# (_require_question_in_template blocks every write), but the generation
+# path writing against a prior template version lands in exactly this shape.
+#
+# The two JOINs below scope the numerator the same way the denominator
+# already is: an answer counts only if its question is on the assessment's
+# current template AND its CURRENT version's answer_status is exactly
+# "complete". Pinned by test_recompute_completeness_ignores_answers_whose_
+# question_is_not_on_the_template in tests/privacycare/test_answers.py.
 _COMPLETE_ANSWERS_SQL = sqlalchemy.text(
     "SELECT COUNT(*) FROM assessment_answer a "
     "JOIN answer_version av ON av.id = a.current_version_id "
+    "JOIN assessment_question q ON q.id = a.question_id "
+    "JOIN privacy_assessment pa "
+    "  ON pa.id = a.assessment_id AND pa.template_id = q.template_id "
     "WHERE a.assessment_id = :assessment_id AND av.answer_status = 'complete'"
 )
 

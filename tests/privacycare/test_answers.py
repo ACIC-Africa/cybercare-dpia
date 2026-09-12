@@ -265,6 +265,105 @@ def _seed_second_template(db) -> str:
     return tid
 
 
+def _seed_complete_answer_directly(db, assessment_id: str, question_id: str) -> None:
+    # Insert an assessment_answer + a "complete" current answer_version
+    # WITHOUT going through write_answer. Needed because write_answer's own
+    # _require_question_in_template refuses to write an off-template answer
+    # — the state under test here is one this module's routes cannot create
+    # and only the (out-of-range) generation path or a template_id move can
+    # reach, so it has to be seeded at the SQL level, exactly as
+    # test_recompute_completeness_excludes_non_complete_statuses already
+    # seeds a status write_answer never produces.
+    import uuid
+
+    answer_id = f"aa_{uuid.uuid4().hex[:8]}"
+    version_id = f"av_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO assessment_answer (id, assessment_id, question_id) "
+            "VALUES (:id, :aid, :qid)"
+        ),
+        {"id": answer_id, "aid": assessment_id, "qid": question_id},
+    )
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO answer_version "
+            "(id, answer_id, version_number, answer_text, answer_status, "
+            " answer_source, change_type, created_by) "
+            "VALUES (:id, :answer_id, 1, 'Off-template answer.', 'complete', "
+            " 'user_input', 'human_edited', 'alice@example.com')"
+        ),
+        {"id": version_id, "answer_id": answer_id},
+    )
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_answer SET current_version_id = :vid WHERE id = :id"
+        ),
+        {"vid": version_id, "id": answer_id},
+    )
+
+
+def test_recompute_completeness_ignores_answers_whose_question_is_not_on_the_template(
+    db,
+):
+    # Fix round 3 (whole-range review, MAJOR finding): completeness's
+    # NUMERATOR must be scoped to the assessment's current template exactly
+    # the way its denominator (_TOTAL_QUESTIONS_SQL) and answered_count
+    # (_QUESTION_SQL in api/assessments.py) already are. An answer row whose
+    # question belongs to a DIFFERENT template used to count in the
+    # numerator while contributing nothing to the denominator and staying
+    # invisible to answered_count — so the same document reported two
+    # different numbers, and (with enough off-template answers) a
+    # completeness above 1.0.
+    tid = _seed_template(db)
+    other_tid = _seed_second_template(db)
+    aid = _seed_assessment(db, tid, "Off-Template Numerator DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    foreign_qid = _seed_question(db, other_tid, "q1", "necessity", 1)
+    db.flush()
+
+    write_answer(db, aid, q1, "On-template answer.", "alice@example.com")
+    _seed_complete_answer_directly(db, aid, foreign_qid)
+    db.flush()
+
+    completeness = recompute_completeness(db, aid)
+    assert completeness == pytest.approx(1 / 2), (
+        "only the on-template answer may count: 1 complete of 2 template "
+        "questions. The off-template answer must not inflate the numerator"
+    )
+
+    persisted = db.execute(
+        sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted == pytest.approx(1 / 2)
+
+
+def test_recompute_completeness_never_exceeds_one_with_only_off_template_answers(db):
+    # The unbounded case the review names: every question on the template
+    # unanswered, several complete answers sitting against questions from
+    # another template. Before the fix this returned 2/1 == 2.0 and the
+    # detail screen rendered "Fields: 0/1" beside a completeness of 200%.
+    tid = _seed_template(db)
+    other_tid = _seed_second_template(db)
+    aid = _seed_assessment(db, tid, "Above One Hundred Percent DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    foreign_a = _seed_question(db, other_tid, "fq1", "necessity", 1)
+    foreign_b = _seed_question(db, other_tid, "fq2", "necessity", 2)
+    db.flush()
+
+    _seed_complete_answer_directly(db, aid, foreign_a)
+    _seed_complete_answer_directly(db, aid, foreign_b)
+    db.flush()
+
+    completeness = recompute_completeness(db, aid)
+    assert completeness == 0.0, (
+        "no question on the assessment's own template is answered, so "
+        "completeness is 0 — not 2.0"
+    )
+
+
 def test_foreign_question_raises_rather_than_writing(db):
     tid = _seed_template(db)
     other_tid = _seed_second_template(db)
