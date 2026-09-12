@@ -20,8 +20,11 @@
 # the code under test is concerned, so the per-assessment commit behaviour
 # is genuinely exercised — and the outer transaction.rollback() at teardown
 # discards all of it, including every savepoint, leaving the dev database
-# exactly as it was. See test_run_generation_leaves_no_rows_behind at the
-# bottom of this file for the row-count proof.
+# exactly as it was. (The row-count proof this claim rests on was run
+# manually, outside this suite — see task-5-report.md — rather than as a
+# test in this file, since a passing assertion here would only prove
+# isolation held for THIS run, not across the full-suite run the report
+# actually measured.)
 import uuid
 
 import pytest
@@ -200,6 +203,46 @@ def test_progress_counts_reach_the_total(db):
     assert row["status"] == "complete"
     assert row["total_count"] == 2
     assert row["completed_count"] == 2
+
+
+def test_progress_is_visible_mid_run_not_only_at_the_end(db, monkeypatch):
+    # MINOR (fix round 1): test_progress_counts_reach_the_total above only
+    # checks start/end state, and would pass even if progress were written
+    # once at the very end of the run. Writing it incrementally, after every
+    # assessment, is the entire reason run_generation commits in a loop
+    # instead of once (see its own docstring: the UI polls every 15s and
+    # renders completed_count). This reads completed_count off the task's
+    # own row at each answer_questions call, mid-run, and asserts it climbs
+    # one at a time rather than jumping straight from 0 to the total.
+    from fides.api.privacycare import tasks as tasks_module
+
+    real_answer_questions = tasks_module.answer_questions
+    observed_counts = []
+
+    def _observe_progress(db_, assessment_id, context, **kwargs):
+        observed_counts.append(_task_row(db_, task_id)["completed_count"])
+        return real_answer_questions(db_, assessment_id, context, **kwargs)
+
+    monkeypatch.setattr(tasks_module, "answer_questions", _observe_progress)
+
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    _seed_declaration(db, sid, "marketing.advertising")
+    _seed_declaration(db, sid, "essential.service.payment_processing")
+    _seed_declaration(db, sid, "essential.service")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assert observed_counts == [0, 1, 2], (
+        "completed_count must be visible climbing one assessment at a time "
+        "mid-run, not only readable once the run has already finished"
+    )
+    assert _task_row(db, task_id)["completed_count"] == 3
 
 
 def test_a_run_with_no_targets_completes_rather_than_erroring(db):
@@ -434,6 +477,11 @@ def test_the_celery_task_is_registered_under_its_stable_name():
 
 
 def test_the_task_is_routed_to_the_privacy_assessments_queue():
+    # This only pins that our constant is the same object as Ethyca's — it
+    # does not prove a queued message actually lands on that queue. The real
+    # routing assertion is at the call site that matters: the next task's
+    # `.apply_async(queue=GENERATION_QUEUE)` (Task 6), which is what
+    # actually stamps the queue name onto the message the worker consumes.
     from fides.api.privacycare.tasks import GENERATION_QUEUE
     from fides.api.tasks import PRIVACY_ASSESSMENTS_QUEUE_NAME
 

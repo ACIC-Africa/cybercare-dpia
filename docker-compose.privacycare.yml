@@ -6,14 +6,44 @@
 # needs a worker whose -A points at our entry module.
 #
 # Run with:
-#   docker compose -f docker-compose.yml -f docker-compose.privacycare.yml up worker-privacycare
+#   docker compose -f docker-compose.yml -f docker-compose.privacycare.yml up worker-other worker-privacycare
 services:
+  # Fix round 1 (coordinator review, MAJOR finding): worker-other's own
+  # --exclude-queues list (docker-compose.yml) excludes fides.dsr and five
+  # others by name, but NOT fidesplus.privacy_assessments — an omission,
+  # not a decision, since that queue didn't exist yet when that list was
+  # written. Compose merges a service that appears in both -f files by key
+  # (later file wins per-field) rather than replacing the whole service, so
+  # this block only needs to override `command`; everything else
+  # (image, volumes, healthcheck, env) still comes from docker-compose.yml.
+  # Without this, worker-other would happily dequeue and ack a generation
+  # message — it has never imported fides.api.privacycare.tasks, so the
+  # task is unregistered there — and the message is gone with no error
+  # anywhere and no assessments produced. Our task is registered ONLY in
+  # fides.api.privacycare.worker (see that module and tasks.py), so any
+  # OTHER worker process consuming this queue drops every message it gets
+  # silently. Appended to the existing list rather than replacing it, so
+  # worker-other's other exclusions are preserved.
+  worker-other:
+    command: fides worker --reload --reload-dir src --reload-dir data --exclude-queues=fides.dsr,fides.privacy_preferences,fides.privacy_request_exports,fides.privacy_request_ingestion,fidesplus.discovery_monitors_detection,fidesplus.discovery_monitors_classification,fidesplus.discovery_monitors_promotion,fidesplus.privacy_assessments # exclude DSRs, privacy preferences, discovery monitor queues, and PrivacyCare's own generation queue (worked only by worker-privacycare below)
+
   worker-privacycare:
     extends:
       file: docker-compose.yml
       service: worker-other
+    # `celery` bare (via PATH) fails inside this image: its console-script
+    # shebang is baked at build time as `#!/build/.venv/bin/python3`, a path
+    # that only exists in the build stage, not the runtime one — verified
+    # live: `celery --version` in a running container reports
+    # "/opt/fides/bin/celery: not found" even though the file exists and is
+    # executable, because the shebang interpreter itself is missing. `fides
+    # worker` (worker-other's own command) is unaffected because it's a
+    # different console script. `python -m celery` sidesteps the shebang
+    # entirely, matching the healthcheck below (which already used this
+    # form) — the command was the one place still using the bare, broken
+    # form, found and fixed only by actually running the container.
     command: >
-      celery -A fides.api.privacycare.worker worker
+      /opt/fides/bin/python -m celery -A fides.api.privacycare.worker worker
       --loglevel=info
       --queues=fidesplus.privacy_assessments
     healthcheck:
