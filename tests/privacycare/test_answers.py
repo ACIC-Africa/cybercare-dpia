@@ -311,10 +311,15 @@ def test_write_answer_locks_the_parent_assessment_row(db):
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
-    assert any("FOR UPDATE" in s for s in statements), (
+    # Position, not just presence. A lock taken AFTER the reads closes no
+    # race at all, and an assertion that only looks for the string anywhere
+    # in the statement list would pass that regression unchanged.
+    assert statements, "write_answer emitted no SQL at all"
+    assert "FOR UPDATE" in statements[0], (
         "write_answer must take a FOR UPDATE lock on the parent "
-        "privacy_assessment row before its handle/version reads — "
-        "closing the three read-then-write races fix round 1 found"
+        "privacy_assessment row as its FIRST statement, before its "
+        "handle/version reads — closing the three read-then-write races "
+        f"fix round 1 found. First statement was: {statements[0]!r}"
     )
 
 
@@ -331,10 +336,11 @@ def test_recompute_completeness_locks_the_parent_assessment_row(db):
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
-    assert any("FOR UPDATE" in s for s in statements), (
-        "recompute_completeness must take its own lock — it is also called "
-        "on its own, not only right after write_answer in the same "
-        "transaction"
+    assert statements, "recompute_completeness emitted no SQL at all"
+    assert "FOR UPDATE" in statements[0], (
+        "recompute_completeness must take its own lock FIRST — it is also "
+        "called on its own, not only right after write_answer in the same "
+        f"transaction. First statement was: {statements[0]!r}"
     )
 
 
