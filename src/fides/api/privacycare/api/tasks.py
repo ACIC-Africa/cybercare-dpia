@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
 from fides.api.oauth.utils import verify_oauth_client
+from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
     AssessmentTaskResponse,
@@ -97,15 +98,6 @@ def create_privacy_assessment(
     row means the worker raises "No privacy_assessment_task with id ..." and
     the run is lost before it starts.
     """
-    # Imported here, not at module level: a top-level
-    # `from ...assessments import _created_by_from_client` would force
-    # api.assessments to import (and bind ALL its routes, including GET
-    # /{assessment_id}) the instant this module is imported — before this
-    # module's own GET /tasks route is defined. router.register() relies on
-    # importing api.tasks before api.assessments to get /tasks registered
-    # first; a module-level import here would silently defeat that.
-    from fides.api.privacycare.api.assessments import _created_by_from_client
-
     created_by = _created_by_from_client(client)
     task_row_id, celery_id = _create_task(db, request, created_by)
     db.commit()

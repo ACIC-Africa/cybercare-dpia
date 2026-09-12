@@ -7,6 +7,8 @@
 # collection, `EXCLUDED_TABLES`, which turned out to be dual-purpose and made
 # `fides db reset` drop our tables. Check the consumers before mutating anything
 # of Ethyca's.
+import importlib
+
 from fides.api.util.api_router import APIRouter
 
 PRIVACYCARE_PREFIX = "/plus/privacy-assessments"
@@ -35,30 +37,62 @@ def register() -> None:
     if getattr(app_setup, _REGISTERED_FLAG, False):
         return
 
-    # api/tasks.py binds POST "", GET "/tasks" and GET "/tasks/{task_id}" —
-    # imported BEFORE api/assessments (below) so those routes land in
-    # privacycare_router.routes ahead of assessments' GET "/{assessment_id}".
-    # FastAPI/Starlette match routes in registration order and stop at the
-    # first match: if "/{assessment_id}" registered first, a request for
-    # "/tasks" would match IT instead (assessment_id="tasks"), and the
-    # progress bar would 404 forever against a route that does exist. This
-    # import order is only sufficient because api/tasks.py itself imports
-    # api/assessments's _created_by_from_client lazily, inside the request
-    # handler rather than at module level — a module-level import there
-    # would force api/assessments to bind its own routes first regardless of
-    # what order these two lines run in.
+    # THE ORDER OF THE LAST TWO IMPORTS IS LOAD-BEARING. Do not sort them.
     #
-    # Aliased on import: this package already has a top-level `tasks`
-    # module (Task 5's Celery task, imported below) and re-binding that name
-    # here would shadow it.
-    from fides.api.privacycare.api import tasks as api_tasks  # noqa: F401
-    from fides.api.privacycare.api import assessments  # noqa: F401  (binds routes)
+    # api/tasks.py binds POST "", GET "/tasks" and GET "/tasks/{task_id}";
+    # api/assessments.py binds GET "/{assessment_id}". Starlette matches
+    # routes in registration order and stops at the first match, so if
+    # "/{assessment_id}" bound first, a request for "/tasks" would match IT
+    # (assessment_id="tasks") and the progress bar would 404 forever against
+    # a route that demonstrably exists. api/tasks must therefore import
+    # first. test_the_tasks_route_is_matched_before_the_assessment_id_route
+    # fails if these two lines are swapped.
+    #
+    # This works only because the two route modules do not import each
+    # other: the helper they share, _created_by_from_client, lives in
+    # api/identity.py, which neither depends on. An import of one route
+    # module from the other would bind ALL of that module's routes at import
+    # time and silently defeat the ordering below, whatever order these
+    # lines are in. That is exactly what happened once already, and why
+    # identity.py exists.
+    #
+    # `tasks as api_tasks` is aliased because this package also has a
+    # top-level `tasks` module (the Celery task, imported first below);
+    # re-binding that name here would shadow it. That import is what
+    # registers privacycare.generate_assessments with celery_app — the API
+    # process needs it registered to queue a message, while the worker
+    # process gets it from fides.api.privacycare.worker.
+    # Both route modules decorate the SHARED privacycare_router at import
+    # time, so the order they are imported in IS the order their routes are
+    # registered in — and Starlette matches in registration order, stopping
+    # at the first match. api/assessments.py binds GET "/{assessment_id}";
+    # api/tasks.py binds GET "/tasks". If assessments bound first, a request
+    # for "/tasks" would match IT (assessment_id="tasks") and the progress
+    # bar would 404 forever against a route that demonstrably exists.
+    #
+    # importlib, not `from ... import ...`, precisely BECAUSE the order
+    # matters: ruff's I001 alphabetises an import block and would silently
+    # put assessments first. An `# isort: off` comment does not suppress it
+    # here (verified with `ruff check --diff`). These two imports exist only
+    # for their route-binding side effect (they carried unused-import
+    # suppressions before), so nothing is lost by making the side effect,
+    # and its order, explicit.
+    # test_the_tasks_route_is_matched_before_the_assessment_id_route
+    # fails if these two lines are swapped.
+    #
+    # This works only because the two route modules do not import each
+    # other: the helper they share, _created_by_from_client, lives in
+    # api/identity.py, which neither depends on. An import of one route
+    # module from the other would bind ALL of that module's routes at import
+    # time and defeat the ordering however these lines are written. That is
+    # exactly what happened once already, and why identity.py exists.
+    # Registers privacycare.generate_assessments with celery_app: the API
+    # process needs it registered to queue a message, while the worker
+    # process gets it from fides.api.privacycare.worker.
+    importlib.import_module("fides.api.privacycare.tasks")
 
-    # Importing the task module registers privacycare.generate_assessments
-    # with celery_app. The API process needs it registered to queue a
-    # message; the worker process gets it from
-    # fides.api.privacycare.worker.
-    from fides.api.privacycare import tasks  # noqa: F401
+    importlib.import_module("fides.api.privacycare.api.tasks")
+    importlib.import_module("fides.api.privacycare.api.assessments")
 
     app_setup.ROUTERS.append(privacycare_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
