@@ -978,8 +978,11 @@ def _bulk_update_answers(
     the loop; on any exception escaping the `with` block (including
     write_answer's QuestionNotInTemplateError/LookupError), SQLAlchemy
     rolls back to that SAVEPOINT automatically, undoing every write this
-    batch made so far — while leaving the assessment-row lock (held by the
-    OUTER transaction, not the savepoint) untouched. The exception then
+    batch made so far — while leaving the assessment-row lock untouched.
+    (The lock survives for a plainer reason than nesting: Postgres does not
+    release row locks on ROLLBACK TO SAVEPOINT at all. It is held until the
+    outer transaction ends, whether it was first acquired inside the
+    savepoint region or before it.) The exception then
     propagates to bulk_update_answers (the route), which maps it to 404
     and never calls db.commit().
 
