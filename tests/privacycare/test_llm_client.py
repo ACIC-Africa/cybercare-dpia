@@ -1,11 +1,11 @@
 """W6 classification and W1's questionnaire both call a model over personal
 data. This client is the only sanctioned route, and it must be impossible to
 use it without the gateway."""
+import httpx
 import pytest
 import respx
-import httpx
 
-from fides.api.privacycare.llm import complete, GatewayUnavailable, GATEWAY_URL
+from fides.api.privacycare.llm import GATEWAY_URL, GatewayUnavailable, complete
 
 
 @respx.mock

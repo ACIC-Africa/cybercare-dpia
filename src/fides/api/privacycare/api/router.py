@@ -10,8 +10,24 @@
 import importlib
 
 from fides.api.util.api_router import APIRouter
+from fides.common.urn_registry import V1_URL_PREFIX
 
-PRIVACYCARE_PREFIX = "/plus/privacy-assessments"
+# The path the SHIPPED admin UI calls, not a path of our choosing.
+#
+# clients/admin-ui/.env.test sets NEXT_PUBLIC_FIDESCTL_API=/api/v1 and
+# next.config.js rewrites /api/v1/:path to the API server, so the RTK slice's
+# `url: "plus/privacy-assessments"` reaches us as
+# /api/v1/plus/privacy-assessments. Every one of Fides' own 196 routes lives
+# under that prefix too.
+#
+# This used to be a bare "/plus/privacy-assessments" — mounted at the root of
+# the app, alongside only "/" and "/health". Every route we shipped 404'd for
+# the UI, and nothing caught it for five plans: tests/privacycare/
+# test_api_http.py built its URLs from THIS CONSTANT, so it proved the routes
+# exist where we put them and never that where we put them is where the
+# client looks. V1_URL_PREFIX is imported rather than hardcoded so the two
+# cannot drift.
+PRIVACYCARE_PREFIX = f"{V1_URL_PREFIX}/plus/privacy-assessments"
 
 privacycare_router = APIRouter(prefix=PRIVACYCARE_PREFIX, tags=["PrivacyCare"])
 

@@ -2,19 +2,29 @@
 # These tests prove our routes are registered, correctly pathed, and — in a
 # privacy product, non-negotiably — authenticated with the right scope.
 from fides.api.oauth.utils import verify_oauth_client
+from fides.api.privacycare.api.router import PRIVACYCARE_PREFIX
 from fides.common.scope_registry import SYSTEM_READ
 
-EXPECTED_READ_PATHS = {
-    "/plus/privacy-assessments",
-    "/plus/privacy-assessments/summary",
-    "/plus/privacy-assessments/templates",
-    "/plus/privacy-assessments/{assessment_id}",
-    "/plus/privacy-assessments/{assessment_id}/evidence",
-    "/plus/privacy-assessments/tasks",
-    "/plus/privacy-assessments/tasks/{task_id}",
+# Suffixes, composed against the real prefix below. This file's job is "these
+# routes exist and are authenticated"; proving the PREFIX itself is the one the
+# shipped UI calls is test_ui_paths.py's job, deliberately kept separate — this
+# inventory composing against our own constant is exactly why a wrong prefix
+# went unnoticed for five plans.
+EXPECTED_READ_SUFFIXES = {
+    "",
+    "/summary",
+    "/templates",
+    "/{assessment_id}",
+    "/{assessment_id}/evidence",
+    "/tasks",
+    "/tasks/{task_id}",
 }
 
-PRIVACYCARE_PATH_PREFIX = "/plus/privacy-assessments"
+PRIVACYCARE_PATH_PREFIX = PRIVACYCARE_PREFIX
+
+EXPECTED_READ_PATHS = {
+    f"{PRIVACYCARE_PATH_PREFIX}{suffix}" for suffix in EXPECTED_READ_SUFFIXES
+}
 
 
 def _app():

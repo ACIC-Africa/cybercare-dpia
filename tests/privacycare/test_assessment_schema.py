@@ -2,6 +2,7 @@
 This test pins that fact — if a Fides upgrade ever drops these tables,
 W1 loses its foundation and we want to know immediately."""
 import os
+
 import sqlalchemy
 
 EXPECTED_TABLES = {

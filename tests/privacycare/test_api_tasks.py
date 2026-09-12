@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from fastapi_pagination import Params, paginate
 from sqlalchemy.orm import Session
 
+from fides.api.privacycare.api.router import PRIVACYCARE_PREFIX
 from fides.api.privacycare.api.schemas import CreateAssessmentTaskRequest
 from fides.api.privacycare.api.tasks import (
     _list_tasks,
@@ -362,13 +363,13 @@ def test_the_tasks_route_is_matched_before_the_assessment_id_route():
     # /tasks would otherwise be swallowed by /{assessment_id}, and the
     # progress bar would 404 forever against a route that exists.
     #
-    # route.path on this router carries the full "/plus/privacy-assessments"
+    # route.path on this router carries the full PRIVACYCARE_PREFIX
     # prefix (Fides' APIRouter subclass applies it at add_api_route time,
     # confirmed by inspection — it is not the bare suffix passed to
     # @privacycare_router.get), so the paths compared here must match that.
     from fides.api.privacycare.api.router import privacycare_router
 
     paths = [route.path for route in privacycare_router.routes]
-    assert paths.index("/plus/privacy-assessments/tasks") < paths.index(
-        "/plus/privacy-assessments/{assessment_id}"
+    assert paths.index(f"{PRIVACYCARE_PREFIX}/tasks") < paths.index(
+        f"{PRIVACYCARE_PREFIX}/{{assessment_id}}"
     )

@@ -126,10 +126,10 @@ def test_c1_fides_autogenerate_would_not_drop_privacycare_tables():
     # src/fides/ outside privacycare/ imports this package today, so a bare
     # `fides db generate-migration` invoked from a process that never
     # touches PrivacyCare code is NOT yet protected by this alone.
-    import fides.api.privacycare  # noqa: F401 -- activates fides_exclusion_guard
     from alembic.autogenerate import compare_metadata
     from alembic.runtime import migration
 
+    import fides.api.privacycare  # noqa: F401 -- activates fides_exclusion_guard
     from fides.api.db.base import Base
     from fides.api.db.database import include_object as fides_include_object
 

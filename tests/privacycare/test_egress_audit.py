@@ -12,10 +12,11 @@ exercised, not silently bypassed.
 """
 import os
 import uuid
+
 import pytest
 import sqlalchemy
 
-from fides.api.privacycare.llm import complete, GatewayUnavailable
+from fides.api.privacycare.llm import GatewayUnavailable, complete
 
 pytestmark = pytest.mark.integration
 

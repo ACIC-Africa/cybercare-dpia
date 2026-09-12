@@ -4,9 +4,8 @@ Revision ID: dca42e735806
 Revises: e4ea861eb93c
 Create Date: 2026-09-11 18:08:47.254394
 """
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision = 'dca42e735806'
 down_revision = 'e4ea861eb93c'

@@ -30,6 +30,7 @@ import typing
 
 from pydantic import BaseModel
 
+from fides.api.privacycare.api.router import PRIVACYCARE_PREFIX
 from fides.api.privacycare.asgi import app
 
 TS_DIR = (
@@ -40,7 +41,10 @@ FEATURE_TS_PATH = (
     / "clients/admin-ui/src/features/privacy-assessments/types.ts"
 )
 
-PRIVACYCARE_PATH_PREFIX = "/plus/privacy-assessments"
+# Composed, not hardcoded: the prefix moved to /api/v1/... once the shipped
+# UI's real path was checked, and a literal here would have silently
+# stopped matching any route.
+PRIVACYCARE_PATH_PREFIX = PRIVACYCARE_PREFIX
 
 # Every test module in this package, concatenated, so "a parity test exists
 # referencing it" means something a name could plausibly show up in a real

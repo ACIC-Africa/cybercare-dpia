@@ -33,12 +33,12 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.tasks import run_generation
+from tests.privacycare.test_api_assessments import _seed_question, _seed_template
 from tests.privacycare.test_context import (
     _seed_data_use,
     _seed_declaration,
     _seed_system,
 )
-from tests.privacycare.test_api_assessments import _seed_question, _seed_template
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
