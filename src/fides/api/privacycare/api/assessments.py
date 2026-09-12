@@ -1414,4 +1414,18 @@ def delete_assessment(
             detail=f"No assessment with id {assessment_id}",
         )
     db.commit()
+    # The warning _delete_assessment emits fires BEFORE this commit, which
+    # is the safe direction to fail: a rolled-back delete leaves a log
+    # claiming a destruction that did not happen (misleading, but the data
+    # is still there), whereas logging only after the commit would let a
+    # crash in between destroy the whole §31 history with no trace at all.
+    # Over-logging beats under-logging when the subject is evidence
+    # destruction. This second line is what distinguishes the two cases
+    # after the fact: its absence next to a DELETED warning means the
+    # transaction did not commit.
+    logger.warning(
+        "PrivacyCare DPIA delete COMMITTED by {}: assessment {}",
+        deleted_by,
+        assessment_id,
+    )
     return DeletePrivacyAssessmentResponse(id=assessment_id)

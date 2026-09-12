@@ -1969,6 +1969,53 @@ def test_update_assessment_route_logs_the_actor_and_the_fields_it_changed(
     assert "status" in logged, "the log must say which field(s) changed"
 
 
+def test_delete_assessment_route_confirms_the_commit_in_a_second_log_line(
+    db, monkeypatch
+):
+    # The DELETED warning fires before the commit, deliberately: over-logging
+    # a rolled-back delete is safer than losing the record of a real one.
+    # The COMMITTED line is what tells the two apart afterwards.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Confirmed Delete DPIA")
+    db.flush()
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    with _captured_logs() as messages:
+        delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
+
+    logged = "\n".join(messages)
+    assert "DELETED" in logged, logged
+    assert "COMMITTED" in logged, (
+        "a committed delete must leave a confirmation line — its absence "
+        f"beside a DELETED warning is what marks a rolled-back one. {logged!r}"
+    )
+    assert "alice@example.com" in logged, logged
+
+
+def test_delete_assessment_route_logs_no_commit_confirmation_when_commit_fails(
+    db, monkeypatch
+):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Failed Commit Delete DPIA")
+    db.flush()
+
+    def _boom():
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(db, "commit", _boom)
+
+    with _captured_logs() as messages:
+        with pytest.raises(RuntimeError):
+            delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
+
+    logged = "\n".join(messages)
+    assert "DELETED" in logged, "the attempt is still recorded"
+    assert "COMMITTED" not in logged, (
+        "nothing was destroyed, so nothing may claim it was confirmed — "
+        f"got {logged!r}"
+    )
+
+
 def test_delete_assessment_unknown_id_raises_lookuperror(db):
     with pytest.raises(LookupError):
         _delete_assessment(db, "no-such-assessment", "alice@example.com")
