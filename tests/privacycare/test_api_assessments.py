@@ -1,4 +1,5 @@
 # Endpoint behaviour against real rows. Inserts are rolled back.
+import contextlib
 import json
 import types
 import uuid
@@ -1485,6 +1486,7 @@ def test_update_assessment_route_maps_unknown_id_to_404(db):
             "no-such-assessment",
             UpdatePrivacyAssessmentRequest(name="Doesn't matter"),
             db=db,
+            client=_fake_client("alice@example.com"),
         )
     assert exc_info.value.status_code == 404
 
@@ -1498,7 +1500,10 @@ def test_update_assessment_route_commits_on_success(db, monkeypatch):
     monkeypatch.setattr(db, "commit", lambda: committed.append(True))
 
     response = update_assessment(
-        aid, UpdatePrivacyAssessmentRequest(name="Committed Name"), db=db
+        aid,
+        UpdatePrivacyAssessmentRequest(name="Committed Name"),
+        db=db,
+        client=_fake_client("alice@example.com"),
     )
 
     assert committed, "update_assessment must commit once _update_assessment succeeds"
@@ -1512,7 +1517,10 @@ def test_update_assessment_route_returns_an_assessment_response(db, monkeypatch)
     monkeypatch.setattr(db, "commit", lambda: None)
 
     response = update_assessment(
-        aid, UpdatePrivacyAssessmentRequest(status="completed"), db=db
+        aid,
+        UpdatePrivacyAssessmentRequest(status="completed"),
+        db=db,
+        client=_fake_client("alice@example.com"),
     )
 
     assert response.id == aid
@@ -1634,7 +1642,10 @@ def test_an_out_of_enum_status_is_rejected_before_any_sql_runs(db):
             # The route cannot even be called: FastAPI builds this model
             # from the body first, and that is where the rejection lands.
             update_assessment(
-                aid, UpdatePrivacyAssessmentRequest(status="archived"), db=db
+                aid,
+                UpdatePrivacyAssessmentRequest(status="archived"),
+                db=db,
+                client=_fake_client("alice@example.com"),
             )
     finally:
         sqlalchemy.event.remove(engine, "before_cursor_execute", _capture)
@@ -1657,7 +1668,7 @@ def test_delete_assessment_removes_the_row(db):
     aid = _seed_assessment(db, tid, "To Be Deleted")
     db.flush()
 
-    _delete_assessment(db, aid)
+    _delete_assessment(db, aid, "alice@example.com")
 
     remaining = db.execute(
         sqlalchemy.text("SELECT COUNT(*) FROM privacy_assessment WHERE id = :id"),
@@ -1696,7 +1707,7 @@ def test_delete_assessment_cascades_to_assessment_answer_and_answer_version(db):
     ).scalar()
     assert version_count_before == 2, "sanity: both versions exist before delete"
 
-    _delete_assessment(db, aid)
+    _delete_assessment(db, aid, "alice@example.com")
 
     answer_count_after = db.execute(
         sqlalchemy.text(
@@ -1740,7 +1751,7 @@ def test_delete_assessment_cascade_leaves_no_dangling_answer_version_rows(db):
     ]
     assert len(version_ids) == 2, "sanity: both versions captured before delete"
 
-    _delete_assessment(db, aid)
+    _delete_assessment(db, aid, "alice@example.com")
 
     remaining = db.execute(
         sqlalchemy.text(
@@ -1754,14 +1765,138 @@ def test_delete_assessment_cascade_leaves_no_dangling_answer_version_rows(db):
     )
 
 
+# --- Fix round 3 (whole-range review, MAJOR finding 3): the delete must
+# leave a trace naming who did it ---
+#
+# DELETE is the only call on this surface that destroys evidence, and it was
+# the only write route that captured no authenticated principal and emitted
+# no log. Under Kenya's DPA 2019 §31 the append-only answer history IS the
+# artifact proving the assessment happened; the cascade removes all of it.
+# No column on an Ethyca-authored table can hold a deleted_by, so the
+# application log is the only record that can exist — which makes it worth
+# testing like a feature, not like a debug aid.
+
+
+@contextlib.contextmanager
+def _captured_logs(level="WARNING"):
+    # loguru does not route through the stdlib logging module, so pytest's
+    # caplog fixture sees nothing from `from loguru import logger`. Adding a
+    # list-appending sink is the supported way to observe it.
+    from loguru import logger as loguru_logger
+
+    messages: list[str] = []
+    sink_id = loguru_logger.add(
+        lambda message: messages.append(str(message)), level=level
+    )
+    try:
+        yield messages
+    finally:
+        loguru_logger.remove(sink_id)
+
+
+def test_delete_assessment_logs_a_warning_naming_the_actor(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Logged Delete DPIA")
+    db.flush()
+
+    with _captured_logs() as messages:
+        _delete_assessment(db, aid, "alice@example.com")
+
+    logged = "\n".join(messages)
+    assert "alice@example.com" in logged, (
+        "the actor who destroyed the assessment must be named in the log — "
+        f"got {logged!r}"
+    )
+    assert aid in logged, "the assessment id must be in the log"
+    assert "Logged Delete DPIA" in logged, (
+        "the assessment NAME must be in the log too: the id alone is "
+        "unresolvable once the row it identifies no longer exists"
+    )
+
+
+def test_delete_assessment_logs_how_many_answer_versions_the_cascade_destroyed(db):
+    # The count must be taken BEFORE the delete — afterwards the rows are
+    # gone and there is nothing left to count. Two versions of one answer,
+    # plus one of another, is three.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Counted Cascade DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    q2 = _seed_question(db, tid, "q2", "necessity", 1)
+    write_answer(db, aid, q1, "First.", "alice@example.com")
+    write_answer(db, aid, q1, "Second.", "alice@example.com")
+    write_answer(db, aid, q2, "Only.", "alice@example.com")
+    db.flush()
+
+    with _captured_logs() as messages:
+        _delete_assessment(db, aid, "alice@example.com")
+
+    logged = "\n".join(messages)
+    assert "3 answer_version" in logged, (
+        "the log must say how much history the cascade destroyed, counted "
+        f"before the delete — got {logged!r}"
+    )
+
+
+def test_delete_assessment_logs_nothing_for_an_unknown_id(db):
+    # A 404 destroyed nothing; a warning claiming otherwise would be noise
+    # in exactly the log a regulator enquiry would be read from.
+    with _captured_logs() as messages:
+        with pytest.raises(LookupError):
+            _delete_assessment(db, "no-such-assessment", "alice@example.com")
+
+    assert not [m for m in messages if "DELETED" in m], messages
+
+
+def test_delete_assessment_route_names_the_authenticated_client_never_the_body(db, monkeypatch):
+    # Same never-null derivation every answer write uses
+    # (_created_by_from_client): a machine-to-machine client with no linked
+    # FidesUser is still named, as "client:<id>", rather than logged as None.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Machine Client Delete DPIA")
+    db.flush()
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    with _captured_logs() as messages:
+        delete_assessment(
+            aid, db=db, client=_fake_client(None, id="api_client_abc123")
+        )
+
+    logged = "\n".join(messages)
+    assert "client:api_client_abc123" in logged, logged
+
+
+def test_update_assessment_route_logs_the_actor_and_the_fields_it_changed(db, monkeypatch):
+    # privacy_assessment has no "who last edited" column, so this is the
+    # only place the actor behind a status flip to `completed` — the claim
+    # that the §31 assessment was done — is recorded at all.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Logged Update DPIA")
+    db.flush()
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    with _captured_logs(level="INFO") as messages:
+        update_assessment(
+            aid,
+            UpdatePrivacyAssessmentRequest(status="completed"),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+
+    logged = "\n".join(messages)
+    assert "alice@example.com" in logged and aid in logged, logged
+    assert "status" in logged, "the log must say which field(s) changed"
+
+
 def test_delete_assessment_unknown_id_raises_lookuperror(db):
     with pytest.raises(LookupError):
-        _delete_assessment(db, "no-such-assessment")
+        _delete_assessment(db, "no-such-assessment", "alice@example.com")
 
 
 def test_delete_assessment_route_maps_unknown_id_to_404(db):
     with pytest.raises(HTTPException) as exc_info:
-        delete_assessment("no-such-assessment", db=db)
+        delete_assessment(
+            "no-such-assessment", db=db, client=_fake_client("alice@example.com")
+        )
     assert exc_info.value.status_code == 404
 
 
@@ -1773,7 +1908,9 @@ def test_delete_assessment_route_commits_on_success(db, monkeypatch):
     committed = []
     monkeypatch.setattr(db, "commit", lambda: committed.append(True))
 
-    response = delete_assessment(aid, db=db)
+    response = delete_assessment(
+        aid, db=db, client=_fake_client("alice@example.com")
+    )
 
     assert committed, "delete_assessment must commit once _delete_assessment succeeds"
     assert response.id == aid
@@ -1789,9 +1926,9 @@ def test_delete_assessment_twice_404s_the_second_time(db, monkeypatch):
     db.flush()
     monkeypatch.setattr(db, "commit", lambda: None)
 
-    first = delete_assessment(aid, db=db)
+    first = delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
     assert first.deleted is True
 
     with pytest.raises(HTTPException) as exc_info:
-        delete_assessment(aid, db=db)
+        delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
     assert exc_info.value.status_code == 404

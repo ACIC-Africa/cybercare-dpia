@@ -1182,34 +1182,91 @@ def update_assessment(
     request: UpdatePrivacyAssessmentRequest,
     *,
     db: Session = Depends(get_db),
+    # Fix round 3 (whole-range review, MAJOR finding 3): the two task-4
+    # routes were the only writers on this surface that captured no
+    # authenticated principal at all. Same second-Security(...) shape as
+    # update_answer/bulk_update_answers above (FastAPI's dependency cache
+    # collapses matching calls within one request, so the token is not
+    # verified twice).
+    client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
 ) -> AssessmentResponse:
     """PUT the assessment itself: name/status/risk_level, partial update.
 
-    No `client`/`created_by` here — unlike update_answer/bulk_update_answers,
-    privacy_assessment carries no "who last edited the metadata" column to
-    populate (created_by is set once, at generation time, and this route
-    never touches it).
+    privacy_assessment still carries no "who last edited the metadata"
+    column to populate (created_by is set once, at generation time, and this
+    route never touches it), so there is nowhere to PERSIST an actor. But
+    "nowhere to persist it" is not a reason to know nothing: flipping status
+    to `completed` is the single most consequential assertion in this
+    document — the claim that the §31 assessment was done — and it was being
+    recorded with no actor anywhere, while a one-word answer edit is fully
+    attributed. The log line below is what can exist without adding a column
+    to an Ethyca-authored table. Info, not warning: this changes a field, it
+    destroys nothing (contrast _delete_assessment).
+
+    The actor comes from _created_by_from_client(client) — the authenticated
+    principal, never `request` — the same never-null derivation every answer
+    write uses.
 
     request.model_dump(exclude_unset=True) is the exclude-absent-fields
     mechanism itself: only keys the caller actually sent reach
     _update_assessment. An unknown assessment_id maps LookupError to 404,
     same convention as every other route in this module.
     """
+    updated_by = _created_by_from_client(client)
+    updates = request.model_dump(exclude_unset=True)
     try:
-        response = _update_assessment(
-            db, assessment_id, request.model_dump(exclude_unset=True)
-        )
+        response = _update_assessment(db, assessment_id, updates)
     except LookupError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No assessment with id {assessment_id}",
         )
+    logger.info(
+        "PrivacyCare DPIA updated by {}: assessment {} field(s) {}",
+        updated_by,
+        assessment_id,
+        sorted(updates),
+    )
     db.commit()
     return response
 
 
-def _delete_assessment(db: Session, assessment_id: str) -> None:
+# Fix round 3 (whole-range review, MAJOR finding 3): the two reads
+# _delete_assessment takes BEFORE the DELETE, so the destruction can be
+# recorded at all.
+#
+# The name read doubles as the existence check AND takes the parent row lock
+# — the same FOR UPDATE discipline every other write path on this surface
+# uses (see _lock_assessment_and_get_template_id in api/answers.py). The lock
+# is what makes the version count below TRUTHFUL rather than approximate:
+# without it a concurrent write_answer could append a version between the
+# COUNT and the DELETE, and the log line would under-report what was
+# destroyed by exactly the rows nobody can now go and look at.
+_ASSESSMENT_NAME_FOR_UPDATE_SQL = sqlalchemy.text(
+    "SELECT name FROM privacy_assessment WHERE id = :assessment_id FOR UPDATE"
+)
+
+# Counted BEFORE the delete — afterwards there is nothing left to count.
+_CASCADED_VERSION_COUNT_SQL = sqlalchemy.text(
+    "SELECT COUNT(*) FROM answer_version av "
+    "JOIN assessment_answer a ON a.id = av.answer_id "
+    "WHERE a.assessment_id = :assessment_id"
+)
+
+
+def _delete_assessment(db: Session, assessment_id: str, deleted_by: str) -> None:
     """Hard delete of the privacy_assessment row itself.
+
+    `deleted_by` is REQUIRED, with no default, and is used for one thing:
+    the warning below. Fix round 3 (whole-range review, MAJOR finding 3):
+    this was the one write path on the whole surface that named nobody and
+    left no trace. Every answer write derives a never-null author via
+    _created_by_from_client into a DB-NOT-NULL column; this — the call that
+    destroys all of them at once — derived nothing, and there is no
+    "deleted_by" column on an Ethyca-authored table for it to derive into.
+    A required parameter is what stops a future caller from performing an
+    untraceable delete by omission; the log line is the only record that can
+    exist without adding a column to their schema.
 
     HARD delete, not soft: privacy_assessment carries no deleted_at column
     (verified against the live schema — see the FK/column dump quoted in
@@ -1237,15 +1294,46 @@ def _delete_assessment(db: Session, assessment_id: str) -> None:
     delete_assessment (the route) — same convention as every other core
     function in this module. A second delete of the same id (nothing left
     to match) raises the same LookupError the same way, which is exactly
-    how "deleting twice 404s the second time" falls out of this rowcount
-    check with no extra state to track.
+    how "deleting twice 404s the second time" falls out of the existence
+    check below with no extra state to track. That check is now the locking
+    SELECT rather than the DELETE's rowcount: it has to run first anyway to
+    read the name and count the versions, and reading the row under FOR
+    UPDATE answers "is it there" and "nobody may add versions to it between
+    my count and my delete" in one statement.
+
+    WHAT THE WARNING RECORDS, and why it is warning-level rather than info:
+    this is not one row. Every FK in the chain is ON DELETE CASCADE, so the
+    count below is the number of answer_version rows — the entire
+    append-only history this module exists to build — that this single
+    statement destroys irreversibly. Under Kenya's DPA 2019 §31 that history
+    IS the artifact proving the assessment happened. Nothing else in the
+    system will record that it is gone, or who made it go.
     """
-    result = db.execute(
+    row = db.execute(
+        _ASSESSMENT_NAME_FOR_UPDATE_SQL, {"assessment_id": assessment_id}
+    ).first()
+    if row is None:
+        raise LookupError(f"No assessment with id {assessment_id}")
+    name = row[0]
+
+    version_count = db.execute(
+        _CASCADED_VERSION_COUNT_SQL, {"assessment_id": assessment_id}
+    ).scalar()
+
+    logger.warning(
+        "PrivacyCare DPIA DELETED by {}: assessment {} ({!r}); the cascade "
+        "destroys {} answer_version row(s) — the whole append-only answer "
+        "history for this assessment, irrecoverably",
+        deleted_by,
+        assessment_id,
+        name,
+        version_count,
+    )
+
+    db.execute(
         sqlalchemy.text("DELETE FROM privacy_assessment WHERE id = :assessment_id"),
         {"assessment_id": assessment_id},
     )
-    if result.rowcount == 0:
-        raise LookupError(f"No assessment with id {assessment_id}")
 
 
 @privacycare_router.delete(
@@ -1256,17 +1344,36 @@ def _delete_assessment(db: Session, assessment_id: str) -> None:
     response_model=DeletePrivacyAssessmentResponse,
 )
 def delete_assessment(
-    assessment_id: str, *, db: Session = Depends(get_db)
+    assessment_id: str,
+    *,
+    db: Session = Depends(get_db),
+    # Fix round 3 (whole-range review, MAJOR finding 3): see
+    # update_assessment's own comment. This route is the one that matters
+    # most — it is the only call on this surface that destroys evidence, and
+    # it used to name nobody.
+    client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
 ) -> DeletePrivacyAssessmentResponse:
     """DELETE the assessment. See _delete_assessment's docstring for the
-    hard-vs-soft-delete decision and the FK cascade this relies on.
+    hard-vs-soft-delete decision, the FK cascade this relies on, and what
+    the warning it emits records.
 
-    A thin HTTP shell, same shape as every write route in this module: maps
-    _delete_assessment's LookupError to 404, and commits only once the
-    delete has actually succeeded.
+    A thin HTTP shell, same shape as every write route in this module: (1)
+    resolves the actor from the authenticated principal via
+    _created_by_from_client — never from the request, the same never-null
+    derivation every answer write uses — (2) maps _delete_assessment's
+    LookupError to 404, and (3) commits only once the delete has actually
+    succeeded.
+
+    The scope on this route is deliberately NOT changed here. That a
+    SYSTEM_READ token can reach a destructive call is a real problem and is
+    escalated separately; changing it independently of that escalation is
+    what every other route's scope comment in this module already refuses to
+    do. What this route can fix on its own is the absence of any trace,
+    which is what the actor above is for.
     """
+    deleted_by = _created_by_from_client(client)
     try:
-        _delete_assessment(db, assessment_id)
+        _delete_assessment(db, assessment_id, deleted_by)
     except LookupError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
