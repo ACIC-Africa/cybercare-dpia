@@ -1,0 +1,30 @@
+# PrivacyCare overlay. docker-compose.yml is Ethyca-authored and is not
+# edited; this file adds what PrivacyCare needs on top of it.
+#
+# Fides' own workers start via `fides worker`, which imports only Fides'
+# task modules. PrivacyCare's generation task lives in our package, so it
+# needs a worker whose -A points at our entry module.
+#
+# Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.privacycare.yml up worker-privacycare
+services:
+  worker-privacycare:
+    extends:
+      file: docker-compose.yml
+      service: worker-other
+    command: >
+      celery -A fides.api.privacycare.worker worker
+      --loglevel=info
+      --queues=fidesplus.privacy_assessments
+    healthcheck:
+      test:
+        ["CMD", "/opt/fides/bin/python", "-m", "celery",
+         "-A", "fides.api.privacycare.worker", "inspect", "ping"]
+      start_period: 60s
+      interval: 20s
+      timeout: 20s
+      retries: 10
+    environment:
+      FIDES__CELERY__HEALTHCHECK_PORT: "9002"
+    expose:
+      - 9002

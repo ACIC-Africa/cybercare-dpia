@@ -36,5 +36,11 @@ def register() -> None:
         return
     from fides.api.privacycare.api import assessments  # noqa: F401  (binds routes)
 
+    # Importing the task module registers privacycare.generate_assessments
+    # with celery_app. The API process needs it registered to queue a
+    # message; the worker process gets it from
+    # fides.api.privacycare.worker.
+    from fides.api.privacycare import tasks  # noqa: F401
+
     app_setup.ROUTERS.append(privacycare_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

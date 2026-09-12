@@ -51,18 +51,24 @@ def db():
         session.rollback()
 
 
-def _seed_template(db) -> str:
+def _seed_template(db, *, assessment_type: str = "dpia") -> str:
     # assessment_type and region are NOT NULL on the live table (not
     # mentioned in the task brief's column list) — supply both or the
     # insert violates a not-null constraint.
+    #
+    # assessment_type defaults to "dpia" so every existing caller in this
+    # file is unaffected. test_tasks.py (plan 05) needs a fresh, unique
+    # assessment_type per test — `uq_assessment_template_active_type` allows
+    # only one active template per type — so it passes one explicitly rather
+    # than this helper being copied into a second file.
     tid = f"tpl_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO assessment_template "
             "(id, version, name, assessment_type, region, is_active) "
-            "VALUES (:id, '1.0', 'Kenya DPA 2019 DPIA', 'dpia', 'KE', true)"
+            "VALUES (:id, '1.0', 'Kenya DPA 2019 DPIA', :assessment_type, 'KE', true)"
         ),
-        {"id": tid},
+        {"id": tid, "assessment_type": assessment_type},
     )
     return tid
 
