@@ -23,6 +23,7 @@ from fides.api.privacycare.api.schemas import (
     QuestionGroup,
     TemplateResponse,
     UpdateAnswerResponse,
+    UpdatePrivacyAssessmentRequest,
     template_key,
 )
 
@@ -468,6 +469,32 @@ def test_bulk_update_answers_response_optionality_matches_the_shipped_contract()
         BulkUpdateAnswersResponse,
         _feature_interface_raw_specs("BulkUpdateAnswersResponse"),
     )
+
+
+def test_update_privacy_assessment_request_matches_the_shipped_contract():
+    # Task 4: UpdatePrivacyAssessmentRequest mirrors the same-named
+    # interface in the feature types.ts file — {name?, status?, risk_level?}.
+    assert set(
+        UpdatePrivacyAssessmentRequest.model_fields
+    ) == _feature_interface_fields("UpdatePrivacyAssessmentRequest")
+
+
+def test_update_privacy_assessment_request_optionality_matches_the_shipped_contract():
+    # All three fields carry `?` in the shipped contract — genuinely
+    # optional REQUEST fields, not required-but-nullable (see the model's
+    # own docstring in schemas.py for why this is the one place the usual
+    # TS-`?`/TS-`| null` mapping inverts).
+    for field, is_optional in _feature_interface_field_specs(
+        "UpdatePrivacyAssessmentRequest"
+    ).items():
+        pydantic_required = UpdatePrivacyAssessmentRequest.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_update_privacy_assessment_request_feature_type_was_actually_read():
+    assert len(_feature_interface_fields("UpdatePrivacyAssessmentRequest")) == 3
 
 
 def test_template_key_derives_a_slug_from_a_normal_name():

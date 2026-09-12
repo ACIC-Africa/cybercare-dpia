@@ -31,12 +31,14 @@ from fides.api.privacycare.api.schemas import (
     AssessmentSummaryResponse,
     BulkUpdateAnswersRequest,
     BulkUpdateAnswersResponse,
+    DeletePrivacyAssessmentResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionGroup,
     TemplateResponse,
     UpdateAnswerRequest,
     UpdateAnswerResponse,
+    UpdatePrivacyAssessmentRequest,
     template_key,
 )
 from fides.common.scope_registry import SYSTEM_READ
@@ -1058,3 +1060,211 @@ def bulk_update_answers(
         )
     db.commit()
     return response
+
+
+# --- PUT/DELETE .../{assessment_id} (task 4: update and delete the
+# assessment itself, not its answers) ---
+#
+# Only these three columns are user-editable via this route — everything
+# else on privacy_assessment (system_fides_key, data_use, created_by, the
+# generation-task link, ...) is either set at creation time or derived, and
+# has no field on UpdatePrivacyAssessmentRequest to carry it. This set is
+# also what makes the f-string SET clause in _update_assessment below safe:
+# every key it can ever interpolate as a bare SQL identifier comes from
+# UpdatePrivacyAssessmentRequest.model_fields, a closed, code-defined set —
+# never a request-supplied string.
+_UPDATABLE_ASSESSMENT_FIELDS = {"name", "status", "risk_level"}
+
+
+def _update_assessment(
+    db: Session, assessment_id: str, updates: dict
+) -> AssessmentResponse:
+    """Partial update of privacy_assessment's three editable fields.
+
+    `updates` must already be UpdatePrivacyAssessmentRequest.model_dump(
+    exclude_unset=True) — ONLY the keys the caller actually sent. A field
+    absent from `updates` is left completely alone: this function never
+    writes a column it wasn't explicitly told to. update_assessment (the
+    route) is the only caller and is what enforces that contract; this
+    function trusts its input the same way _bulk_update_answers trusts
+    write_answer's caller-owns-the-transaction convention.
+
+    An empty `updates` (a body with all three fields omitted) is a
+    deliberate no-op WRITE, not a no-op existence check: the row is still
+    looked up and its current, unchanged state is returned — same
+    "still 404s an unknown id, still returns real state for a known one"
+    precedent as _bulk_update_answers's empty-batch handling.
+
+    updated_at is bumped explicitly (`, updated_at = now()`) because this is
+    raw SQL via sqlalchemy.text(), not an ORM UPDATE — PrivacyAssessment's
+    `onupdate=func.now()` (fides.api.db.base_class.Base) is a SQLAlchemy
+    ORM-level Column default that only fires through the ORM's own UPDATE
+    path; a raw db.execute(text(...)) bypasses it entirely, the same bypass
+    already documented for created_at elsewhere in this module. (Contrast
+    recompute_completeness in api/answers.py, which does NOT bump
+    updated_at — that write is a derived, timestamp-agnostic side-effect of
+    an answer edit; this one is a direct edit of a user-facing field, where
+    "when was this assessment last changed" is exactly what a DPO reading
+    the record would expect to move.)
+
+    Raises LookupError if assessment_id does not exist — mapped to 404 by
+    update_assessment, the same split every other core function in this
+    module uses.
+    """
+    unknown_fields = set(updates) - _UPDATABLE_ASSESSMENT_FIELDS
+    assert not unknown_fields, (
+        f"_update_assessment received field(s) outside "
+        f"_UPDATABLE_ASSESSMENT_FIELDS: {unknown_fields} — "
+        "UpdatePrivacyAssessmentRequest should make this impossible"
+    )
+
+    if updates:
+        set_clause = ", ".join(f"{field} = :{field}" for field in updates)
+        result = db.execute(
+            sqlalchemy.text(
+                f"UPDATE privacy_assessment SET {set_clause}, updated_at = now() "
+                "WHERE id = :assessment_id"
+            ),
+            {**updates, "assessment_id": assessment_id},
+        )
+        if result.rowcount == 0:
+            raise LookupError(f"No assessment with id {assessment_id}")
+    else:
+        exists = db.execute(
+            _ASSESSMENT_STATUS_SQL, {"assessment_id": assessment_id}
+        ).first()
+        if exists is None:
+            raise LookupError(f"No assessment with id {assessment_id}")
+
+    # _ASSESSMENT_DETAIL_SQL's column list is a strict superset of what
+    # _assessment_to_response reads (it additionally selects
+    # assessment_type/privacy_assessment_task_id, for the detail-response
+    # caller above) — reused here rather than a fourth near-duplicate
+    # single-row query, same "don't hand-roll a query this file already
+    # has" reasoning as _question_by_id's own docstring.
+    row = (
+        db.execute(_ASSESSMENT_DETAIL_SQL, {"assessment_id": assessment_id})
+        .mappings()
+        .first()
+    )
+    return _assessment_to_response(row)
+
+
+@privacycare_router.put(
+    "/{assessment_id}",
+    # Same blanket SYSTEM_READ dependency as every other route in this
+    # module — see update_answer's own comment for why (no
+    # privacy-assessment-specific scope exists yet; being handled
+    # separately, and this route's scope must not change independently of
+    # that).
+    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    # PrivacyAssessmentResponse (the type the admin-UI's
+    # updatePrivacyAssessment mutation actually declares — checked directly
+    # against privacy-assessments.slice.ts) narrows AssessmentResponse's
+    # `status`/`risk_level` to required-nullable rather than genuinely
+    # optional. AssessmentResponse is reused anyway, per this task's own
+    # brief ("AssessmentResponse already exists in schemas.py. Reuse it; do
+    # not define a second") and the precedent already set by
+    # AssessmentGroupResponse.assessments (typed `PrivacyAssessmentResponse[]`
+    # in TS, `List[AssessmentResponse]` here) — the same acceptable
+    # looseness this codebase already ships, not a new one this route
+    # introduces.
+    response_model=AssessmentResponse,
+)
+def update_assessment(
+    assessment_id: str,
+    request: UpdatePrivacyAssessmentRequest,
+    *,
+    db: Session = Depends(get_db),
+) -> AssessmentResponse:
+    """PUT the assessment itself: name/status/risk_level, partial update.
+
+    No `client`/`created_by` here — unlike update_answer/bulk_update_answers,
+    privacy_assessment carries no "who last edited the metadata" column to
+    populate (created_by is set once, at generation time, and this route
+    never touches it).
+
+    request.model_dump(exclude_unset=True) is the exclude-absent-fields
+    mechanism itself: only keys the caller actually sent reach
+    _update_assessment. An unknown assessment_id maps LookupError to 404,
+    same convention as every other route in this module.
+    """
+    try:
+        response = _update_assessment(
+            db, assessment_id, request.model_dump(exclude_unset=True)
+        )
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No assessment with id {assessment_id}",
+        )
+    db.commit()
+    return response
+
+
+def _delete_assessment(db: Session, assessment_id: str) -> None:
+    """Hard delete of the privacy_assessment row itself.
+
+    HARD delete, not soft: privacy_assessment carries no deleted_at column
+    (verified against the live schema — see the FK/column dump quoted in
+    this task's report) and privacy_assessment is an Ethyca-authored table.
+    Adding one would put this app's Alembic chain into their schema —
+    exactly what fides.api.privacycare.migrations.include_object exists to
+    keep separate, the same "do not add a constraint/column to their
+    table" boundary write_answer's own module docstring already draws for
+    assessment_answer/answer_version. So: implement what the schema
+    supports. Whether that schema SHOULD have offered a soft delete for a
+    regulatory record is a real, separate question — recorded plainly in
+    this task's report, not resolved silently here.
+
+    Every FK from assessment_answer -> privacy_assessment, and from
+    answer_version -> assessment_answer, is ON DELETE CASCADE (verified
+    against the live schema — quoted in the report): deleting this one row
+    removes every assessment_answer and answer_version row for it as an
+    atomic part of THIS statement, inside the same transaction, not as a
+    separate step this function has to orchestrate. There is no
+    partial-delete/orphan case for THIS pair of relationships to handle —
+    Postgres's own cascade already makes it atomic. (`questionnaire` cascades
+    the same way, off a table this OSS repo does not otherwise touch.)
+
+    Raises LookupError if assessment_id does not exist, mapped to 404 by
+    delete_assessment (the route) — same convention as every other core
+    function in this module. A second delete of the same id (nothing left
+    to match) raises the same LookupError the same way, which is exactly
+    how "deleting twice 404s the second time" falls out of this rowcount
+    check with no extra state to track.
+    """
+    result = db.execute(
+        sqlalchemy.text("DELETE FROM privacy_assessment WHERE id = :assessment_id"),
+        {"assessment_id": assessment_id},
+    )
+    if result.rowcount == 0:
+        raise LookupError(f"No assessment with id {assessment_id}")
+
+
+@privacycare_router.delete(
+    "/{assessment_id}",
+    # Same blanket SYSTEM_READ dependency as every other route in this
+    # module — see update_answer's own comment for why.
+    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=DeletePrivacyAssessmentResponse,
+)
+def delete_assessment(
+    assessment_id: str, *, db: Session = Depends(get_db)
+) -> DeletePrivacyAssessmentResponse:
+    """DELETE the assessment. See _delete_assessment's docstring for the
+    hard-vs-soft-delete decision and the FK cascade this relies on.
+
+    A thin HTTP shell, same shape as every write route in this module: maps
+    _delete_assessment's LookupError to 404, and commits only once the
+    delete has actually succeeded.
+    """
+    try:
+        _delete_assessment(db, assessment_id)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No assessment with id {assessment_id}",
+        )
+    db.commit()
+    return DeletePrivacyAssessmentResponse(id=assessment_id)

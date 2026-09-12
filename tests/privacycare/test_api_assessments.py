@@ -6,15 +6,17 @@ import uuid
 import pytest
 import sqlalchemy
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api import assessments as assessments_module
-from fides.api.privacycare.api.answers import QuestionNotInTemplateError
+from fides.api.privacycare.api.answers import QuestionNotInTemplateError, write_answer
 from fides.api.privacycare.api.assessments import (
     _assessment_detail,
     _assessment_to_response,
     _bulk_update_answers,
     _created_by_from_client,
+    _delete_assessment,
     _evidence_for,
     _grouped_assessments,
     _list_assessments,
@@ -22,13 +24,17 @@ from fides.api.privacycare.api.assessments import (
     _questions_for,
     _summary,
     _update_answer,
+    _update_assessment,
     bulk_update_answers,
+    delete_assessment,
     update_answer,
+    update_assessment,
 )
 from fides.api.privacycare.api.schemas import (
     AnswerUpdate,
     BulkUpdateAnswersRequest,
     UpdateAnswerRequest,
+    UpdatePrivacyAssessmentRequest,
 )
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -1343,3 +1349,354 @@ def test_bulk_update_route_created_by_comes_from_the_caller_not_the_body(
         "request body (AnswerUpdate has no created_by field at all) and "
         "not a hardcoded/forged value"
     )
+
+
+# --- PUT .../{assessment_id} (task 4: update the assessment itself) ---
+#
+# _update_assessment is the non-committing core (build a partial UPDATE off
+# exclude_unset, re-read, assemble AssessmentResponse) — tested directly
+# here the same way _update_answer/_bulk_update_answers are above.
+# update_assessment is the actual HTTP route: a thin shell that maps
+# LookupError to 404 and commits on success.
+
+
+def test_update_assessment_changes_only_the_named_field(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(
+        db, tid, "Original Name", status="in_progress", risk_level="low"
+    )
+    db.flush()
+
+    response = _update_assessment(db, aid, {"risk_level": "high"})
+
+    assert response.risk_level == "high"
+    assert response.name == "Original Name", "name must be untouched"
+    assert response.status == "in_progress", "status must be untouched"
+
+
+def test_update_assessment_name_only_leaves_status_and_risk_level_alone(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(
+        db, tid, "Old Name", status="outdated", risk_level="medium"
+    )
+    db.flush()
+
+    response = _update_assessment(db, aid, {"name": "New Name"})
+
+    assert response.name == "New Name"
+    assert response.status == "outdated"
+    assert response.risk_level == "medium"
+
+
+def test_update_assessment_can_change_all_three_fields_at_once(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(
+        db, tid, "Old Name", status="in_progress", risk_level="low"
+    )
+    db.flush()
+
+    response = _update_assessment(
+        db, aid, {"name": "New Name", "status": "completed", "risk_level": "high"}
+    )
+
+    assert response.name == "New Name"
+    assert response.status == "completed"
+    assert response.risk_level == "high"
+
+
+def test_update_assessment_persists_not_just_returns(db):
+    # The envelope alone can't distinguish "wrote it" from "just echoed the
+    # request back" — read the row back from the database independently.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Persist Check", status="in_progress")
+    db.flush()
+
+    _update_assessment(db, aid, {"name": "Persisted Name"})
+
+    persisted_name = db.execute(
+        sqlalchemy.text("SELECT name FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted_name == "Persisted Name"
+
+
+def test_update_assessment_empty_updates_is_a_no_op_but_returns_current_state(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Untouched", status="in_progress", risk_level="low")
+    db.flush()
+
+    response = _update_assessment(db, aid, {})
+
+    assert response.name == "Untouched"
+    assert response.status == "in_progress"
+    assert response.risk_level == "low"
+
+
+def test_update_assessment_explicit_null_risk_level_clears_it(db):
+    # The one field of the three that IS DB-nullable — an explicit
+    # `risk_level: null` is accepted and applied literally, clearing a
+    # previously-set risk level. See
+    # UpdatePrivacyAssessmentRequest._reject_explicit_null_for_not_null_columns
+    # for why name/status do NOT get this same treatment.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Risk Assessed", risk_level="high")
+    db.flush()
+
+    response = _update_assessment(db, aid, {"risk_level": None})
+
+    assert response.risk_level is None
+    persisted = db.execute(
+        sqlalchemy.text("SELECT risk_level FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted is None, "must be persisted, not just returned in the envelope"
+
+
+def test_update_assessment_unknown_id_raises_lookuperror(db):
+    with pytest.raises(LookupError):
+        _update_assessment(db, "no-such-assessment", {"name": "Doesn't matter"})
+
+
+def test_update_assessment_unknown_id_raises_lookuperror_even_with_empty_updates(db):
+    # An empty body against an unknown id must still 404 — "nothing to
+    # write" must not be mistaken for "nothing to check".
+    with pytest.raises(LookupError):
+        _update_assessment(db, "no-such-assessment", {})
+
+
+def test_update_assessment_route_maps_unknown_id_to_404(db):
+    with pytest.raises(HTTPException) as exc_info:
+        update_assessment(
+            "no-such-assessment",
+            UpdatePrivacyAssessmentRequest(name="Doesn't matter"),
+            db=db,
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_update_assessment_route_commits_on_success(db, monkeypatch):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Commit Update DPIA")
+    db.flush()
+
+    committed = []
+    monkeypatch.setattr(db, "commit", lambda: committed.append(True))
+
+    response = update_assessment(
+        aid, UpdatePrivacyAssessmentRequest(name="Committed Name"), db=db
+    )
+
+    assert committed, "update_assessment must commit once _update_assessment succeeds"
+    assert response.name == "Committed Name"
+
+
+def test_update_assessment_route_returns_an_assessment_response(db, monkeypatch):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Response Shape DPIA")
+    db.flush()
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    response = update_assessment(
+        aid, UpdatePrivacyAssessmentRequest(status="completed"), db=db
+    )
+
+    assert response.id == aid
+    assert response.status == "completed"
+    assert response.template_name == "Kenya DPA 2019 DPIA", (
+        "the PUT response must be a real AssessmentResponse, joined with "
+        "the template, not a bare echo of the request"
+    )
+
+
+# --- UpdatePrivacyAssessmentRequest's own explicit-null contract ---
+#
+# These exercise the Pydantic model directly, independent of the route/core
+# above: the request-shape decision task 4's brief asks for, pinned at the
+# layer that actually enforces it.
+
+
+def test_update_request_omitted_fields_are_absent_from_the_dump():
+    request = UpdatePrivacyAssessmentRequest(name="Only Name")
+    dumped = request.model_dump(exclude_unset=True)
+    assert dumped == {"name": "Only Name"}, (
+        "status/risk_level were never sent — they must not appear at all, "
+        "not even as null"
+    )
+
+
+def test_update_request_explicit_null_risk_level_is_present_in_the_dump():
+    request = UpdatePrivacyAssessmentRequest(risk_level=None)
+    dumped = request.model_dump(exclude_unset=True)
+    assert dumped == {"risk_level": None}, (
+        "an explicit null must be a DIFFERENT dump than omitting the field "
+        "entirely — the key is present with value None, not absent"
+    )
+
+
+def test_update_request_rejects_explicit_null_name():
+    with pytest.raises(ValidationError):
+        UpdatePrivacyAssessmentRequest(name=None)
+
+
+def test_update_request_rejects_explicit_null_status():
+    with pytest.raises(ValidationError):
+        UpdatePrivacyAssessmentRequest(status=None)
+
+
+def test_update_request_omitting_name_entirely_does_not_raise():
+    # Contrast with the two tests above: omission is fine for every field,
+    # including name/status — only an EXPLICIT null on those two is rejected.
+    request = UpdatePrivacyAssessmentRequest(risk_level="high")
+    assert request.model_dump(exclude_unset=True) == {"risk_level": "high"}
+
+
+# --- DELETE .../{assessment_id} (task 4: delete the assessment) ---
+#
+# _delete_assessment is the non-committing core; delete_assessment is the
+# HTTP route. See _delete_assessment's own docstring in assessments.py for
+# the hard-delete decision and the FK-cascade reasoning these tests pin.
+
+
+def test_delete_assessment_removes_the_row(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "To Be Deleted")
+    db.flush()
+
+    _delete_assessment(db, aid)
+
+    remaining = db.execute(
+        sqlalchemy.text("SELECT COUNT(*) FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert remaining == 0
+
+
+def test_delete_assessment_cascades_to_assessment_answer_and_answer_version(db):
+    # The FK chain (verified against the live schema, quoted in the task
+    # report): assessment_answer.assessment_id -> privacy_assessment.id ON
+    # DELETE CASCADE, and answer_version.answer_id -> assessment_answer.id
+    # ON DELETE CASCADE. Deleting the assessment must therefore leave ZERO
+    # rows behind in either table for it — not an error, not an orphan.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Cascade DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, "An answer with a version history.", "alice@example.com")
+    write_answer(db, aid, qid, "A second version of the same answer.", "alice@example.com")
+    db.flush()
+
+    answer_count_before = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert answer_count_before == 1, "sanity: the handle exists before delete"
+    version_count_before = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM answer_version av "
+            "JOIN assessment_answer a ON a.id = av.answer_id "
+            "WHERE a.assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert version_count_before == 2, "sanity: both versions exist before delete"
+
+    _delete_assessment(db, aid)
+
+    answer_count_after = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalar()
+    assert answer_count_after == 0, (
+        "assessment_answer rows must be gone via ON DELETE CASCADE, not "
+        "orphaned pointing at a deleted assessment_id"
+    )
+    # Whether the answer_version rows themselves are actually gone (not
+    # just unreachable via a join through the now-deleted assessment_answer
+    # row) is asserted by
+    # test_delete_assessment_cascade_leaves_no_dangling_answer_version_rows
+    # below, which captures their ids BEFORE the delete.
+
+
+def test_delete_assessment_cascade_leaves_no_dangling_answer_version_rows(db):
+    # Belt-and-braces version of the cascade test above: capture the actual
+    # answer_version ids BEFORE deleting the assessment, then assert none of
+    # them still exist afterward — proves the versions themselves are gone,
+    # not merely unreachable via a join.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Dangling Version Check DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, "First version.", "alice@example.com")
+    write_answer(db, aid, qid, "Second version.", "alice@example.com")
+    db.flush()
+
+    version_ids = [
+        row[0]
+        for row in db.execute(
+            sqlalchemy.text(
+                "SELECT av.id FROM answer_version av "
+                "JOIN assessment_answer a ON a.id = av.answer_id "
+                "WHERE a.assessment_id = :aid"
+            ),
+            {"aid": aid},
+        )
+    ]
+    assert len(version_ids) == 2, "sanity: both versions captured before delete"
+
+    _delete_assessment(db, aid)
+
+    remaining = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM answer_version WHERE id = ANY(:ids)"
+        ),
+        {"ids": version_ids},
+    ).scalar()
+    assert remaining == 0, (
+        "every answer_version row that belonged to the deleted assessment's "
+        "answers must be gone, not left dangling"
+    )
+
+
+def test_delete_assessment_unknown_id_raises_lookuperror(db):
+    with pytest.raises(LookupError):
+        _delete_assessment(db, "no-such-assessment")
+
+
+def test_delete_assessment_route_maps_unknown_id_to_404(db):
+    with pytest.raises(HTTPException) as exc_info:
+        delete_assessment("no-such-assessment", db=db)
+    assert exc_info.value.status_code == 404
+
+
+def test_delete_assessment_route_commits_on_success(db, monkeypatch):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Commit Delete DPIA")
+    db.flush()
+
+    committed = []
+    monkeypatch.setattr(db, "commit", lambda: committed.append(True))
+
+    response = delete_assessment(aid, db=db)
+
+    assert committed, "delete_assessment must commit once _delete_assessment succeeds"
+    assert response.id == aid
+    assert response.deleted is True
+
+
+def test_delete_assessment_twice_404s_the_second_time(db, monkeypatch):
+    # THE double-delete case the brief calls out by name: the first call
+    # must succeed, the second call — same id, now gone — must 404, not
+    # silently succeed again or 500.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Double Delete DPIA")
+    db.flush()
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    first = delete_assessment(aid, db=db)
+    assert first.deleted is True
+
+    with pytest.raises(HTTPException) as exc_info:
+        delete_assessment(aid, db=db)
+    assert exc_info.value.status_code == 404

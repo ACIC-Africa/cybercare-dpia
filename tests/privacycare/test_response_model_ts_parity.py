@@ -80,6 +80,18 @@ ALLOWLIST: dict[str, dict] = {
             "still recursed into and checked on its own below."
         ),
     },
+    "DeletePrivacyAssessmentResponse": {
+        "ts_name": None,
+        "reason": (
+            "Task 4: deletePrivacyAssessment types its RTK Query mutation "
+            "as build.mutation<void, string> (privacy-assessments.slice.ts) "
+            "— the admin-UI reads nothing from the DELETE response body, "
+            "only invalidatesTags. This model exists solely to satisfy "
+            "test_every_route_has_a_response_model_declared_or_inferred, "
+            "which requires a non-None response_model on every "
+            "plus/privacy-assessments route regardless of HTTP method."
+        ),
+    },
     "Page[AssessmentGroupResponse]": {
         "ts_name": "GroupedAssessmentsResponse",
         "reason": (

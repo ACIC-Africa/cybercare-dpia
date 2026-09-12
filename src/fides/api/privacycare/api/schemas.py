@@ -6,7 +6,7 @@
 import re
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class AssessmentResponse(BaseModel):
@@ -279,6 +279,62 @@ class UpdateAnswerResponse(BaseModel):
     status: str
 
 
+class UpdatePrivacyAssessmentRequest(BaseModel):
+    # Mirrors UpdatePrivacyAssessmentRequest in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts:
+    #   { name?: string; status?: AssessmentStatus; risk_level?: RiskLevel; }
+    # All three fields carry `?` — genuinely OPTIONAL, not required-but-
+    # nullable. `Optional[str] = None` is the right shape for exactly that
+    # reason: this is a REQUEST schema (contrast UpdateAnswerResponse.status,
+    # a RESPONSE field, which is required-non-nullable with no default) —
+    # task 4's brief calls this out by name as the one place the usual
+    # "TS `?` -> Pydantic default" / "TS `| null` -> Pydantic Optional, no
+    # default" rule doesn't invert.
+    #
+    # The partial-update mechanism this whole model exists to support:
+    # update_assessment (api/assessments.py) calls
+    # `request.model_dump(exclude_unset=True)`, so "the client never sent
+    # this key" (leave the column untouched) is distinguishable from "the
+    # client sent this key with value null" (see the validator below for
+    # what each of the three fields does with an explicit null).
+    name: Optional[str] = None
+    status: Optional[str] = None
+    risk_level: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _reject_explicit_null_for_not_null_columns(
+        self,
+    ) -> "UpdatePrivacyAssessmentRequest":
+        # THE DECISION task 4's brief asks for, stated plainly: privacy_
+        # assessment.name and .status are NOT NULL at the DB level (verified
+        # against the live schema, and against
+        # fides.api.models.privacy_assessment.PrivacyAssessment: both columns
+        # declare `nullable=False`) — .risk_level is the only DB-nullable
+        # field of the three (`nullable=True`). An explicit `name: null` or
+        # `status: null` in the request body can therefore never be applied
+        # without violating that constraint. Rather than let that surface as
+        # a raw Postgres IntegrityError bubbling out of the route as a 500,
+        # it is rejected HERE, at validation time, as a 422 — the same class
+        # of client error FastAPI already returns for any other malformed
+        # request body.
+        #
+        # `risk_level: null` is the opposite case and is accepted, applied
+        # literally: it clears a previously-set risk level, a legitimate
+        # state a DPO can reach (an assessment can go from "high risk" back
+        # to "not yet assessed"). See
+        # test_update_assessment_explicit_null_risk_level_clears_it.
+        #
+        # `self.model_fields_set` (not `getattr(self, field) is None` alone)
+        # is what makes "sent as null" distinguishable from "never sent" at
+        # THIS layer too — a field absent from the body is absent from
+        # model_fields_set even though its resolved value is also None (the
+        # field's own default).
+        for field in ("name", "status"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} may be omitted, but must not be null")
+        return self
+
+
 class AnswerUpdate(BaseModel):
     # Mirrors AnswerUpdate in
     # clients/admin-ui/src/features/privacy-assessments/types.ts. Both
@@ -317,6 +373,24 @@ class BulkUpdateAnswersResponse(BaseModel):
     completeness: float
     status: str
     questions: List[AssessmentQuestionResponse]
+
+
+class DeletePrivacyAssessmentResponse(BaseModel):
+    """Task 4's DELETE response envelope.
+
+    NO TypeScript counterpart — deletePrivacyAssessment types its RTK Query
+    mutation as `build.mutation<void, string>`
+    (privacy-assessments.slice.ts): the admin-UI reads nothing from the
+    response body, only `invalidatesTags`. This model exists purely because
+    test_every_route_has_a_response_model_declared_or_inferred
+    (test_api_registration.py) requires every plus/privacy-assessments
+    route, across every HTTP method, to carry a non-None response_model —
+    see test_response_model_ts_parity.py's ALLOWLIST entry (ts_name=None)
+    for the matching, explicitly-reasoned decision on that side.
+    """
+
+    id: str
+    deleted: bool = True
 
 
 # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
