@@ -1,6 +1,7 @@
 # Our response schemas must match the generated TypeScript types the shipped
 # admin-UI is compiled against. These tests parse those .ts files directly, so
 # a Fides upgrade that changes the contract fails here rather than in a browser.
+import enum
 import pathlib
 import re
 import typing
@@ -8,6 +9,7 @@ import typing
 from fastapi_pagination import Page
 
 from fides.api.privacycare.api.schemas import (
+    AnswerUpdate,
     AssessmentEvidenceResponse,
     AssessmentGroupResponse,
     AssessmentMetadata,
@@ -15,13 +17,17 @@ from fides.api.privacycare.api.schemas import (
     AssessmentResponse,
     AssessmentSummaryBlockedGroup,
     AssessmentSummaryOwner,
+    AssessmentStatus,
     AssessmentSummaryResponse,
+    BulkUpdateAnswersRequest,
     BulkUpdateAnswersResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionEvidence,
     QuestionGroup,
+    RiskLevel,
     TemplateResponse,
+    UpdateAnswerRequest,
     UpdateAnswerResponse,
     UpdatePrivacyAssessmentRequest,
     template_key,
@@ -135,6 +141,65 @@ def _narrowed_fields(name: str) -> set[str]:
     match = re.search(rf"export interface {name}\b(.*?)\{{", text, re.S)
     assert match, f"{name} extends-clause not found in {FEATURE_TS_PATH}"
     return set(re.findall(r'"([a-z_]+)"', match.group(1)))
+
+
+def _ts_enum_values(name: str) -> set[str]:
+    # Parse an `export enum Name { KEY = "value", ... }` block out of the
+    # hand-authored feature types.ts. Fix round 3 (whole-range review, MAJOR
+    # finding): UpdatePrivacyAssessmentRequest.status/risk_level are now
+    # typed against Python enums, and the ONLY thing that keeps those
+    # members from drifting away from what the UI can actually send is this
+    # parse — the same "read the shipped contract, don't restate it"
+    # discipline every other test in this file already applies to
+    # interfaces.
+    text = FEATURE_TS_PATH.read_text()
+    match = re.search(rf"export enum {name}\s*\{{(.*?)\n\}}", text, re.S)
+    assert match, f"{name} enum not found in {FEATURE_TS_PATH}"
+    return set(re.findall(r'=\s*"([^"]+)"', match.group(1)))
+
+
+def _ts_named_type(type_text: str) -> str | None:
+    # The non-null, non-array part of a TS field type, if it is a single
+    # named type: "AssessmentStatus" -> "AssessmentStatus",
+    # "RiskLevel | null" -> "RiskLevel", "AnswerUpdate[]" -> "AnswerUpdate",
+    # "string" -> "string".
+    parts = [p.strip() for p in type_text.split("|") if p.strip() != "null"]
+    if len(parts) != 1:
+        return None
+    return parts[0].removesuffix("[]").strip()
+
+
+def _assert_enum_typed_where_ts_is_an_enum(model, name):
+    # THE type-awareness gap finding 6 names: the field-set and optionality
+    # tests compare names and `?` markers only, never TYPES — which is
+    # exactly how `status: Optional[str]` sat unnoticed against
+    # `status?: AssessmentStatus` until an "archived" value 500'd out of
+    # Postgres. For every field whose TS type is one of the enums declared
+    # in the same types.ts file, assert the Pydantic annotation is a real
+    # Python Enum whose values match that TS enum member-for-member.
+    text = FEATURE_TS_PATH.read_text()
+    ts_enum_names = set(re.findall(r"export enum ([A-Za-z0-9_]+)", text))
+    checked = []
+    for field, type_text in _feature_interface_raw_specs(name).items():
+        named = _ts_named_type(type_text)
+        if named not in ts_enum_names:
+            continue
+        annotation = model.model_fields[field].annotation
+        candidates = [annotation, *typing.get_args(annotation)]
+        enums = [
+            c for c in candidates if isinstance(c, type) and issubclass(c, enum.Enum)
+        ]
+        assert enums, (
+            f"{name}.{field}: TS types this as the enum {named!r}, but the "
+            f"Pydantic annotation {annotation!r} is not an Enum — a value "
+            f"outside {named} would pass validation and reach the database"
+        )
+        assert {member.value for member in enums[0]} == _ts_enum_values(named), (
+            f"{name}.{field}: {enums[0].__name__} members have drifted from "
+            f"the shipped {named} enum"
+        )
+        checked.append(field)
+    return checked
 
 
 def test_assessment_response_matches_the_shipped_contract():
@@ -495,6 +560,113 @@ def test_update_privacy_assessment_request_optionality_matches_the_shipped_contr
 
 def test_the_update_privacy_assessment_request_feature_type_was_actually_read():
     assert len(_feature_interface_fields("UpdatePrivacyAssessmentRequest")) == 3
+
+
+def test_assessment_status_enum_matches_the_shipped_contract():
+    # Fix round 3: the Python enum UpdatePrivacyAssessmentRequest.status is
+    # typed against must carry exactly the values the UI's AssessmentStatus
+    # can send — no more (the UI could not produce it) and no fewer (a
+    # legitimate value would 422). Both sets also match the live Postgres
+    # `assessmentstatus` labels.
+    assert {s.value for s in AssessmentStatus} == _ts_enum_values("AssessmentStatus")
+
+
+def test_risk_level_enum_matches_the_shipped_contract():
+    assert {r.value for r in RiskLevel} == _ts_enum_values("RiskLevel")
+
+
+def test_the_shipped_enums_were_actually_read():
+    assert len(_ts_enum_values("AssessmentStatus")) == 4
+    assert len(_ts_enum_values("RiskLevel")) == 3
+
+
+def test_update_privacy_assessment_request_enum_fields_are_enum_typed():
+    # The type-aware half of parity, and the specific hole finding 1 of the
+    # whole-range review fell through: `status?: AssessmentStatus` used to be
+    # satisfied by `Optional[str]`, so an out-of-enum label reached a native
+    # Postgres enum column and surfaced as a 500.
+    checked = _assert_enum_typed_where_ts_is_an_enum(
+        UpdatePrivacyAssessmentRequest, "UpdatePrivacyAssessmentRequest"
+    )
+    assert set(checked) == {"status", "risk_level"}, (
+        "both enum-typed fields of this request must be covered by the "
+        f"type-aware check, got {checked}"
+    )
+
+
+def test_update_answer_request_matches_the_shipped_contract():
+    # Finding 6 of the whole-range review: of the four request models added
+    # by tasks 2-4, only UpdatePrivacyAssessmentRequest had parity tests.
+    # UpdateAnswerRequest carries ONLY answer_text — `created_by` must never
+    # appear here, since authorship comes from the authenticated principal
+    # (see the model's own comment in schemas.py). A field-set equality
+    # assertion pins both directions at once.
+    assert set(UpdateAnswerRequest.model_fields) == _feature_interface_fields(
+        "UpdateAnswerRequest"
+    )
+
+
+def test_update_answer_request_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "UpdateAnswerRequest"
+    ).items():
+        pydantic_required = UpdateAnswerRequest.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        UpdateAnswerRequest, _feature_interface_raw_specs("UpdateAnswerRequest")
+    )
+
+
+def test_answer_update_matches_the_shipped_contract():
+    # The one the review calls out by name: a rename of
+    # AnswerUpdate.question_id in types.ts used to pass every test in this
+    # suite while breaking every bulk save.
+    assert set(AnswerUpdate.model_fields) == _feature_interface_fields("AnswerUpdate")
+
+
+def test_answer_update_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs("AnswerUpdate").items():
+        pydantic_required = AnswerUpdate.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        AnswerUpdate, _feature_interface_raw_specs("AnswerUpdate")
+    )
+
+
+def test_bulk_update_answers_request_matches_the_shipped_contract():
+    assert set(BulkUpdateAnswersRequest.model_fields) == _feature_interface_fields(
+        "BulkUpdateAnswersRequest"
+    )
+
+
+def test_bulk_update_answers_request_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "BulkUpdateAnswersRequest"
+    ).items():
+        pydantic_required = BulkUpdateAnswersRequest.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        BulkUpdateAnswersRequest,
+        _feature_interface_raw_specs("BulkUpdateAnswersRequest"),
+    )
+
+
+def test_bulk_update_answers_request_element_type_is_the_shipped_answer_update():
+    # `answers: AnswerUpdate[]` in TS. Field-set parity alone would pass with
+    # `List[dict]` or a list of the wrong model, so assert the element type
+    # itself — the same type-blindness finding 6 names, on the one request
+    # field where it carries a nested contract.
+    element = typing.get_args(BulkUpdateAnswersRequest.model_fields["answers"].annotation)
+    assert element and element[0] is AnswerUpdate
+    assert _feature_interface_raw_specs("BulkUpdateAnswersRequest")["answers"] == (
+        "AnswerUpdate[]"
+    )
+
+
+def test_the_request_model_feature_types_were_actually_read():
+    assert len(_feature_interface_fields("UpdateAnswerRequest")) == 1
+    assert len(_feature_interface_fields("AnswerUpdate")) == 2
+    assert len(_feature_interface_fields("BulkUpdateAnswersRequest")) == 1
 
 
 def test_template_key_derives_a_slug_from_a_normal_name():

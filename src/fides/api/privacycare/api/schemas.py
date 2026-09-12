@@ -4,9 +4,58 @@
 # clients/admin-ui/src/types/api/models/. The shipped admin-UI is compiled
 # against those types, so this file does not get to choose its own shape.
 import re
+from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+# Fix round 3 (whole-range review, MAJOR finding): the two enums that the
+# request contract below is typed against.
+#
+# `status` and `risk_level` used to be bare `Optional[str]` on
+# UpdatePrivacyAssessmentRequest. Both underlying columns are NATIVE
+# POSTGRES ENUMS (assessmentstatus / risklevel), and _update_assessment
+# writes them through raw sqlalchemy.text(), which bypasses SQLAlchemy's own
+# EnumColumn validation exactly the way that function's docstring already
+# documents for `onupdate`. So `{"status": "archived"}` reached Postgres and
+# raised DataError (InvalidTextRepresentation) — uncaught, since
+# update_assessment catches only LookupError and the app registers no
+# SQLAlchemyError handler — and surfaced to a DPO's client as an opaque 500.
+#
+# That was the odd one out on this surface's error-mapping axis: every other
+# client error here is a 404 or a 422, and
+# _reject_explicit_null_for_not_null_columns below exists for precisely this
+# class of problem ("rather than let that surface as a raw Postgres
+# IntegrityError bubbling out of the route as a 500"). It covered explicit
+# NULL and stopped there; the invalid-label case is the same class and was
+# left to bubble.
+#
+# The members below are copied from the SHIPPED TypeScript enums of the same
+# names in clients/admin-ui/src/features/privacy-assessments/types.ts, which
+# UpdatePrivacyAssessmentRequest's TS counterpart types its two fields
+# against. They are not restated from memory and must not drift:
+# test_assessment_status_enum_matches_the_shipped_contract /
+# test_risk_level_enum_matches_the_shipped_contract (test_api_schemas.py)
+# parse that file and assert member-for-member equality, so a UI-side
+# addition fails here rather than 500-ing in production. Both also match the
+# live Postgres enum labels exactly (verified: assessmentstatus =
+# in_progress, completed, outdated, generating; risklevel = high, medium,
+# low).
+#
+# `str, Enum` (not bare Enum) so these compare and serialise as their string
+# values everywhere the rest of this module already treats them as strings.
+class AssessmentStatus(str, Enum):
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    OUTDATED = "outdated"
+    GENERATING = "generating"
+
+
+class RiskLevel(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 
 class AssessmentResponse(BaseModel):
@@ -297,9 +346,24 @@ class UpdatePrivacyAssessmentRequest(BaseModel):
     # this key" (leave the column untouched) is distinguishable from "the
     # client sent this key with value null" (see the validator below for
     # what each of the three fields does with an explicit null).
+    #
+    # Fix round 3: `status`/`risk_level` are typed against the AssessmentStatus
+    # / RiskLevel enums above rather than bare `str` — see those enums' own
+    # comment for the 500-vs-422 reasoning. Pydantic now rejects an
+    # out-of-enum label at the schema boundary, before a single statement
+    # reaches Postgres, which is what FastAPI turns into the 422 every other
+    # malformed body on this surface already gets.
+    #
+    # `use_enum_values=True` keeps the validated values plain strings, so
+    # `request.model_dump(exclude_unset=True)` still hands _update_assessment
+    # exactly what it handed it before (bound string parameters for a raw
+    # text() UPDATE) — this fix tightens what gets IN, it does not change
+    # what goes to the database.
+    model_config = ConfigDict(use_enum_values=True)
+
     name: Optional[str] = None
-    status: Optional[str] = None
-    risk_level: Optional[str] = None
+    status: Optional[AssessmentStatus] = None
+    risk_level: Optional[RiskLevel] = None
 
     @model_validator(mode="after")
     def _reject_explicit_null_for_not_null_columns(

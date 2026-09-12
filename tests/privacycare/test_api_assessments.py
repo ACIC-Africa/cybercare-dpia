@@ -32,7 +32,9 @@ from fides.api.privacycare.api.assessments import (
 )
 from fides.api.privacycare.api.schemas import (
     AnswerUpdate,
+    AssessmentStatus,
     BulkUpdateAnswersRequest,
+    RiskLevel,
     UpdateAnswerRequest,
     UpdatePrivacyAssessmentRequest,
 )
@@ -1561,6 +1563,86 @@ def test_update_request_omitting_name_entirely_does_not_raise():
     # including name/status — only an EXPLICIT null on those two is rejected.
     request = UpdatePrivacyAssessmentRequest(risk_level="high")
     assert request.model_dump(exclude_unset=True) == {"risk_level": "high"}
+
+
+# --- Fix round 3 (whole-range review, MAJOR finding): out-of-enum
+# status/risk_level must be a 422 at the schema boundary, not a 500 out of
+# Postgres ---
+#
+# Both columns are native Postgres enums and _update_assessment writes them
+# through raw sqlalchemy.text(), which bypasses SQLAlchemy's own EnumColumn
+# validation — so a bare `Optional[str]` on the request model let
+# `{"status": "archived"}` reach the database and raise DataError
+# (InvalidTextRepresentation), uncaught, as an opaque 500. The fields are
+# now typed against schemas.AssessmentStatus / schemas.RiskLevel, whose
+# members are pinned member-for-member against the shipped TypeScript enums
+# by test_api_schemas.py.
+
+
+@pytest.mark.parametrize("bad_status", ["archived", "Completed", "in progress", ""])
+def test_update_request_rejects_an_out_of_enum_status(bad_status):
+    with pytest.raises(ValidationError):
+        UpdatePrivacyAssessmentRequest(status=bad_status)
+
+
+@pytest.mark.parametrize("bad_risk", ["catastrophic", "High", "severe", ""])
+def test_update_request_rejects_an_out_of_enum_risk_level(bad_risk):
+    with pytest.raises(ValidationError):
+        UpdatePrivacyAssessmentRequest(risk_level=bad_risk)
+
+
+@pytest.mark.parametrize("value", [s.value for s in AssessmentStatus])
+def test_update_request_accepts_every_shipped_status(value):
+    # The tightening must not reject anything the UI can legitimately send.
+    request = UpdatePrivacyAssessmentRequest(status=value)
+    assert request.model_dump(exclude_unset=True) == {"status": value}, (
+        "use_enum_values must keep the dump a plain string, so "
+        "_update_assessment still binds exactly what it bound before"
+    )
+
+
+@pytest.mark.parametrize("value", [r.value for r in RiskLevel])
+def test_update_request_accepts_every_shipped_risk_level(value):
+    request = UpdatePrivacyAssessmentRequest(risk_level=value)
+    assert request.model_dump(exclude_unset=True) == {"risk_level": value}
+
+
+def test_an_out_of_enum_status_is_rejected_before_any_sql_runs(db):
+    # THE point of the fix, proved on the emitted SQL rather than on our own
+    # source: the value is refused at model construction — which in FastAPI
+    # happens before the handler function is entered at all — so not one
+    # statement reaches Postgres. Before the fix, this same value produced a
+    # real UPDATE and a psycopg2 InvalidTextRepresentation behind it.
+    #
+    # Same `before_cursor_execute` idiom as test_answers.py's
+    # _captured_statements: it fires for every statement sent to this
+    # session's engine, so an empty list is a direct observation, not an
+    # inference.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "No SQL For A Bad Enum DPIA")
+    db.flush()
+
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        with pytest.raises(ValidationError):
+            # The route cannot even be called: FastAPI builds this model
+            # from the body first, and that is where the rejection lands.
+            update_assessment(
+                aid, UpdatePrivacyAssessmentRequest(status="archived"), db=db
+            )
+    finally:
+        sqlalchemy.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert statements == [], (
+        "an out-of-enum status must be refused at the schema boundary — no "
+        f"statement may reach Postgres, but these did: {statements!r}"
+    )
 
 
 # --- DELETE .../{assessment_id} (task 4: delete the assessment) ---
