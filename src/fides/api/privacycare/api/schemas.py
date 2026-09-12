@@ -247,6 +247,38 @@ class AssessmentGroupResponse(BaseModel):
     assessments: Optional[List[AssessmentResponse]] = None
 
 
+class UpdateAnswerRequest(BaseModel):
+    # Mirrors UpdateAnswerRequest in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. Carries
+    # ONLY answer_text — `created_by` deliberately has no field here. It
+    # comes from the authenticated principal in api/assessments.py's
+    # update_answer route, never from this body, so a client cannot forge
+    # authorship in the answer_version audit trail.
+    answer_text: str
+
+
+class UpdateAnswerResponse(BaseModel):
+    # Mirrors UpdateAnswerResponse in the same feature types.ts file. All
+    # three fields are required and non-nullable in that contract (no `?`,
+    # no `| null`) — no defaults here.
+    #
+    # `question` reuses AssessmentQuestionResponse (the 14-field shape
+    # already implemented above for the read surface) rather than defining
+    # a second question schema — see that class's own docstring for the
+    # id/question_id naming trap.
+    #
+    # `status` is the ASSESSMENT's status (AssessmentStatus: in_progress |
+    # completed | outdated | generating), NOT the answer's. Easy to
+    # conflate with AssessmentQuestionResponse.answer_status (AnswerStatus:
+    # complete | partial | needs_input) since both fields are named
+    # "status"-ish and both ride along in this same response — they are
+    # different enums entirely, sourced from different tables
+    # (privacy_assessment.status vs answer_version.answer_status).
+    question: AssessmentQuestionResponse
+    completeness: float
+    status: str
+
+
 # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
 # Its field set (items/total/page/size/pages) already matches the
 # GroupedAssessmentsResponse TS contract field-for-field — see

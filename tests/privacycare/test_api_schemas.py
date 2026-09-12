@@ -21,13 +21,11 @@ from fides.api.privacycare.api.schemas import (
     QuestionEvidence,
     QuestionGroup,
     TemplateResponse,
+    UpdateAnswerResponse,
     template_key,
 )
 
-TS_DIR = (
-    pathlib.Path(__file__).parents[2]
-    / "clients/admin-ui/src/types/api/models"
-)
+TS_DIR = pathlib.Path(__file__).parents[2] / "clients/admin-ui/src/types/api/models"
 
 # AssessmentSummaryResponse (and its two nested types) are NOT
 # OpenAPI-generated into TS_DIR above — they are hand-authored directly in
@@ -47,9 +45,7 @@ def _ts_field_specs(name: str) -> dict[str, bool]:
     body = re.search(r"=\s*\{(.*?)\};", text, re.S).group(1)
     return {
         field: bool(optional_marker)
-        for field, optional_marker in re.findall(
-            r"^\s*([a-z_]+)(\??):", body, re.M
-        )
+        for field, optional_marker in re.findall(r"^\s*([a-z_]+)(\??):", body, re.M)
     }
 
 
@@ -74,9 +70,7 @@ def _feature_interface_field_specs(name: str) -> dict[str, bool]:
     body = match.group(1)
     return {
         field: bool(optional_marker)
-        for field, optional_marker in re.findall(
-            r"^\s*([a-z_]+)(\??):", body, re.M
-        )
+        for field, optional_marker in re.findall(r"^\s*([a-z_]+)(\??):", body, re.M)
     }
 
 
@@ -184,9 +178,9 @@ def test_summary_response_matches_the_shipped_contract():
 
 
 def test_summary_blocked_group_matches_the_shipped_contract():
-    assert set(
-        AssessmentSummaryBlockedGroup.model_fields
-    ) == _feature_interface_fields("AssessmentSummaryBlockedGroup")
+    assert set(AssessmentSummaryBlockedGroup.model_fields) == _feature_interface_fields(
+        "AssessmentSummaryBlockedGroup"
+    )
 
 
 def test_summary_owner_matches_the_shipped_contract():
@@ -201,9 +195,7 @@ def test_summary_response_optionality_matches_the_shipped_contract():
     for field, is_optional in _feature_interface_field_specs(
         "AssessmentSummaryResponse"
     ).items():
-        pydantic_required = AssessmentSummaryResponse.model_fields[
-            field
-        ].is_required()
+        pydantic_required = AssessmentSummaryResponse.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
 
 
@@ -222,32 +214,26 @@ def test_evidence_item_matches_the_shipped_contract():
     # was wrong (evidence lives on answer_version.evidence) and inventing a
     # response shape instead of reading EvidenceItem here was caught twice
     # already in this plan. This is the guard against a third invented shape.
-    assert set(EvidenceItem.model_fields) == _feature_interface_fields(
-        "EvidenceItem"
-    )
+    assert set(EvidenceItem.model_fields) == _feature_interface_fields("EvidenceItem")
 
 
 def test_evidence_item_optionality_matches_the_shipped_contract():
-    for field, is_optional in _feature_interface_field_specs(
-        "EvidenceItem"
-    ).items():
+    for field, is_optional in _feature_interface_field_specs("EvidenceItem").items():
         pydantic_required = EvidenceItem.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
 
 
 def test_assessment_evidence_response_matches_the_shipped_contract():
-    assert set(
-        AssessmentEvidenceResponse.model_fields
-    ) == _feature_interface_fields("AssessmentEvidenceResponse")
+    assert set(AssessmentEvidenceResponse.model_fields) == _feature_interface_fields(
+        "AssessmentEvidenceResponse"
+    )
 
 
 def test_assessment_evidence_response_optionality_matches_the_shipped_contract():
     for field, is_optional in _feature_interface_field_specs(
         "AssessmentEvidenceResponse"
     ).items():
-        pydantic_required = AssessmentEvidenceResponse.model_fields[
-            field
-        ].is_required()
+        pydantic_required = AssessmentEvidenceResponse.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
 
 
@@ -294,9 +280,7 @@ def test_assessment_question_response_optionality_matches_the_shipped_contract()
     for field, is_optional in _feature_interface_field_specs(
         "AssessmentQuestion"
     ).items():
-        pydantic_required = AssessmentQuestionResponse.model_fields[
-            field
-        ].is_required()
+        pydantic_required = AssessmentQuestionResponse.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
     _assert_admits_none_where_ts_nullable(
         AssessmentQuestionResponse, _feature_interface_raw_specs("AssessmentQuestion")
@@ -304,15 +288,11 @@ def test_assessment_question_response_optionality_matches_the_shipped_contract()
 
 
 def test_question_group_matches_the_shipped_contract():
-    assert set(QuestionGroup.model_fields) == _feature_interface_fields(
-        "QuestionGroup"
-    )
+    assert set(QuestionGroup.model_fields) == _feature_interface_fields("QuestionGroup")
 
 
 def test_question_group_optionality_matches_the_shipped_contract():
-    for field, is_optional in _feature_interface_field_specs(
-        "QuestionGroup"
-    ).items():
+    for field, is_optional in _feature_interface_field_specs("QuestionGroup").items():
         pydantic_required = QuestionGroup.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
     _assert_admits_none_where_ts_nullable(
@@ -353,9 +333,7 @@ def test_assessment_group_response_optionality_matches_the_shipped_contract():
     for field, is_optional in _feature_interface_field_specs(
         "AssessmentGroupResponse"
     ).items():
-        pydantic_required = AssessmentGroupResponse.model_fields[
-            field
-        ].is_required()
+        pydantic_required = AssessmentGroupResponse.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
     _assert_admits_none_where_ts_nullable(
         AssessmentGroupResponse, _feature_interface_raw_specs("AssessmentGroupResponse")
@@ -439,6 +417,30 @@ def test_the_dpia_envelope_feature_types_were_actually_read():
     assert len(_feature_interface_fields("AssessmentGroupResponse")) == 4
     assert len(_feature_interface_fields("GroupedAssessmentsResponse")) == 5
     assert len(_feature_interface_fields("PrivacyAssessmentDetailResponse")) == 4
+    assert len(_feature_interface_fields("UpdateAnswerResponse")) == 3
+
+
+def test_update_answer_response_matches_the_shipped_contract():
+    # Task 2: UpdateAnswerResponse mirrors the same-named interface in
+    # types.ts — {question, completeness, status}. `question` reuses
+    # AssessmentQuestionResponse (asserted above to match AssessmentQuestion
+    # field-for-field) rather than a second question schema.
+    assert set(UpdateAnswerResponse.model_fields) == _feature_interface_fields(
+        "UpdateAnswerResponse"
+    )
+
+
+def test_update_answer_response_optionality_matches_the_shipped_contract():
+    # All three fields are required and non-nullable in the shipped
+    # contract (no `?`, no `| null`) — none carry a Pydantic default.
+    for field, is_optional in _feature_interface_field_specs(
+        "UpdateAnswerResponse"
+    ).items():
+        pydantic_required = UpdateAnswerResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        UpdateAnswerResponse, _feature_interface_raw_specs("UpdateAnswerResponse")
+    )
 
 
 def test_template_key_derives_a_slug_from_a_normal_name():

@@ -1,4 +1,10 @@
-# Read endpoints for the DPIA engine.
+# Read endpoints for the DPIA engine, plus (task 2) the one write endpoint:
+# PUT .../{assessment_id}/questions/{question_id}, which answers a single
+# question. The write itself is delegated entirely to
+# fides.api.privacycare.api.answers (task 1's versioned answer-write core,
+# raw SQL, same no-ORM-coupling convention as this file) — this module's
+# job for that route is HTTP shape only: auth, 404 mapping, and assembling
+# the response envelope from what the write left behind.
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security, status
 from fastapi_pagination import Page, Params, paginate
@@ -7,7 +13,13 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
+from fides.api.models.client import ClientDetail
 from fides.api.oauth.utils import verify_oauth_client
+from fides.api.privacycare.api.answers import (
+    QuestionNotInTemplateError,
+    recompute_completeness,
+    write_answer,
+)
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
     AssessmentEvidenceResponse,
@@ -20,6 +32,8 @@ from fides.api.privacycare.api.schemas import (
     PrivacyAssessmentDetailResponse,
     QuestionGroup,
     TemplateResponse,
+    UpdateAnswerRequest,
+    UpdateAnswerResponse,
     template_key,
 )
 from fides.common.scope_registry import SYSTEM_READ
@@ -102,6 +116,14 @@ _ASSESSMENT_DETAIL_SQL = sqlalchemy.text(
     """
 )
 
+# Used by update_answer (task 2) to read back the assessment's status after
+# a write — UpdateAnswerResponse.status is the ASSESSMENT's status, not the
+# answer's (see UpdateAnswerResponse's own docstring in schemas.py). No
+# tenant/organisation filter — same D14 basis as _ASSESSMENT_SQL above.
+_ASSESSMENT_STATUS_SQL = sqlalchemy.text(
+    "SELECT status FROM privacy_assessment WHERE id = :assessment_id"
+)
+
 # AssessmentMetadata's three fields all live on privacy_assessment_task,
 # reached via privacy_assessment.privacy_assessment_task_id (see the plan's
 # field-by-field source table). Metadata is None when that id is null —
@@ -148,9 +170,7 @@ def _list_assessments(db: Session):
 def _questions_for(db: Session, assessment_id: str) -> list[dict]:
     groups: list[dict] = []
     index: dict = {}
-    for row in db.execute(
-        _QUESTION_SQL, {"assessment_id": assessment_id}
-    ).mappings():
+    for row in db.execute(_QUESTION_SQL, {"assessment_id": assessment_id}).mappings():
         key = row["requirement_key"]
         if key not in index:
             index[key] = {
@@ -186,6 +206,25 @@ def _questions_for(db: Session, assessment_id: str) -> list[dict]:
             }
         )
     return groups
+
+
+def _question_by_id(db: Session, assessment_id: str, question_id: str) -> dict | None:
+    """Find one question (in its raw, _question_response-shaped dict form)
+    within an assessment, or None if it isn't there.
+
+    Deliberately reuses _questions_for rather than adding a second,
+    near-duplicate SQL query filtered by question_id: _questions_for's
+    query is already the single source of truth for this row shape (every
+    key _question_response reads), so a hand-rolled twin here could drift
+    from it silently the next time that query's column list changes. This
+    dataset (one template's questions) is small enough that scanning it in
+    Python costs nothing worth trading that safety for.
+    """
+    for group in _questions_for(db, assessment_id):
+        for q in group["questions"]:
+            if q["id"] == question_id:
+                return q
+    return None
 
 
 def _as_str(value):
@@ -274,9 +313,7 @@ def _evidence_item_from_payload(
 
 def _evidence_items_for(db: Session, assessment_id: str) -> list[dict]:
     items: list[dict] = []
-    for row in db.execute(
-        _EVIDENCE_SQL, {"assessment_id": assessment_id}
-    ).mappings():
+    for row in db.execute(_EVIDENCE_SQL, {"assessment_id": assessment_id}).mappings():
         item = _evidence_item_from_payload(
             row["evidence"],
             assessment_id=assessment_id,
@@ -457,7 +494,9 @@ def _metadata_for(db: Session, task_id: str | None) -> AssessmentMetadata | None
     )
 
 
-def _assessment_detail(db: Session, assessment_id: str) -> PrivacyAssessmentDetailResponse:
+def _assessment_detail(
+    db: Session, assessment_id: str
+) -> PrivacyAssessmentDetailResponse:
     row = (
         db.execute(_ASSESSMENT_DETAIL_SQL, {"assessment_id": assessment_id})
         .mappings()
@@ -499,7 +538,9 @@ def _list_templates(db: Session) -> list[TemplateResponse]:
     return [
         TemplateResponse(
             id=r["id"],
-            key=template_key(r["name"], r["id"]),  # id fallback: never emit an empty key
+            key=template_key(
+                r["name"], r["id"]
+            ),  # id fallback: never emit an empty key
             version=r["version"],
             name=r["name"],
             assessment_type=r["assessment_type"],
@@ -589,9 +630,7 @@ def _summary(db: Session) -> dict:
     blocked_groups.sort(
         key=lambda g: g["outdated_count"] + g["high_risk_count"], reverse=True
     )
-    owners_list = sorted(
-        owners.values(), key=lambda o: o["open_count"], reverse=True
-    )
+    owners_list = sorted(owners.values(), key=lambda o: o["open_count"], reverse=True)
 
     return {
         "total": total,
@@ -731,3 +770,103 @@ def get_evidence(
     assessment_id: str, *, db: Session = Depends(get_db)
 ) -> AssessmentEvidenceResponse:
     return AssessmentEvidenceResponse(**_evidence_for(db, assessment_id))
+
+
+def _update_answer(
+    db: Session,
+    assessment_id: str,
+    question_id: str,
+    answer_text: str,
+    created_by: str | None,
+) -> UpdateAnswerResponse:
+    """Write one answer and assemble the envelope update_answer (below)
+    hands back to the DPO's browser.
+
+    Delegates the actual writes entirely to task 1's core — write_answer
+    and recompute_completeness (fides.api.privacycare.api.answers) — this
+    function's only job is building UpdateAnswerResponse from what those
+    two left behind. write_answer already validated question_id belongs to
+    assessment_id's template (or raised) before this function ever calls
+    _question_by_id, so that lookup cannot legitimately come back None.
+
+    Propagates write_answer's LookupError/QuestionNotInTemplateError
+    unchanged rather than catching them here — update_answer (the actual
+    HTTP route) is what maps those to 404, the same split this file already
+    uses between _assessment_detail (raises LookupError) and get_assessment
+    (catches it).
+
+    Never commits — same "caller owns the transaction" convention as
+    write_answer/recompute_completeness themselves. That keeps this
+    function safely testable against a rolled-back transaction the same
+    way _assessment_detail/_evidence_for already are; update_answer commits
+    once, after this returns successfully.
+    """
+    write_answer(db, assessment_id, question_id, answer_text, created_by)
+    completeness = recompute_completeness(db, assessment_id)
+    q = _question_by_id(db, assessment_id, question_id)
+    assessment_status = db.execute(
+        _ASSESSMENT_STATUS_SQL, {"assessment_id": assessment_id}
+    ).scalar()
+    return UpdateAnswerResponse(
+        question=_question_response(q, assessment_id),
+        completeness=completeness,
+        status=assessment_status,
+    )
+
+
+@privacycare_router.put(
+    "/{assessment_id}/questions/{question_id}",
+    # Copied exactly from every read route above:
+    # dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])].
+    # test_api_registration.py's
+    # test_every_assessment_route_requires_verify_oauth_client_with_system_read
+    # asserts this literally, for every /plus/privacy-assessments route
+    # regardless of HTTP method — this module has no
+    # privacy-assessment-specific scope to reach for (Fides OSS's scope
+    # registry has none), so SYSTEM_READ is the blanket stand-in the read
+    # routes already established, not a scope this route independently
+    # chose.
+    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=UpdateAnswerResponse,
+)
+def update_answer(
+    assessment_id: str,
+    question_id: str,
+    request: UpdateAnswerRequest,
+    *,
+    db: Session = Depends(get_db),
+    # A second Security(...) call, same function and scopes as the
+    # dependencies=[...] entry above (FastAPI's dependency cache collapses
+    # matching calls within one request, so this does not re-verify the
+    # token twice) — captured as a parameter, unlike every read route
+    # above, so client.user_id is reachable below. That is the same
+    # accessor Ethyca's own write endpoints use for this exact purpose
+    # (e.g. privacy_request_endpoints.py's reviewed_by=client.user_id,
+    # imported_by=client.user_id): the linked FidesUser id when this token
+    # belongs to a human's personal client, None for a system-to-system API
+    # client with no linked user — which is exactly why write_answer's
+    # created_by is typed str | None.
+    client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
+) -> UpdateAnswerResponse:
+    """PUT one answer. created_by comes from the AUTHENTICATED PRINCIPAL
+    (client.user_id) above, never from `request` — UpdateAnswerRequest
+    carries only answer_text, precisely so a client cannot forge authorship
+    in the answer_version audit trail.
+
+    A thin HTTP shell around _update_answer: its only two jobs are (1)
+    mapping LookupError (unknown assessment) and QuestionNotInTemplateError
+    (unknown/foreign question) to 404 — both are the same client-facing
+    fact, "that thing is not there", and neither may escape as a 500 — and
+    (2) committing once _update_answer has succeeded.
+    """
+    try:
+        response = _update_answer(
+            db, assessment_id, question_id, request.answer_text, client.user_id
+        )
+    except (LookupError, QuestionNotInTemplateError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No question {question_id} on assessment {assessment_id}",
+        )
+    db.commit()
+    return response

@@ -1,9 +1,11 @@
 # Endpoint behaviour against real rows. Inserts are rolled back.
 import json
+import types
 import uuid
 
 import pytest
 import sqlalchemy
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.assessments import (
@@ -15,7 +17,10 @@ from fides.api.privacycare.api.assessments import (
     _list_templates,
     _questions_for,
     _summary,
+    _update_answer,
+    update_answer,
 )
+from fides.api.privacycare.api.schemas import UpdateAnswerRequest
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -341,13 +346,15 @@ def test_summary_owners_aggregate_open_assessments(db):
         db, tid, "Owned outdated", status="outdated", created_by="alice@example.com"
     )
     _seed_assessment(
-        db, tid, "Owned but completed", status="completed", created_by="alice@example.com"
+        db,
+        tid,
+        "Owned but completed",
+        status="completed",
+        created_by="alice@example.com",
     )
     db.flush()
     out = _summary(db)
-    alice = next(
-        (o for o in out["owners"] if o["owner"] == "alice@example.com"), None
-    )
+    alice = next((o for o in out["owners"] if o["owner"] == "alice@example.com"), None)
     assert alice is not None
     assert alice["open_count"] >= 2, "completed assessments must not count as open"
     assert alice["outdated_count"] >= 1
@@ -362,8 +369,14 @@ def _seed_question(db, template_id: str, key: str, group: str, order: int) -> st
             " question_key, question_text, question_order, required) "
             "VALUES (:id, :tid, :rk, :rt, :go, :qk, 'Is this processing necessary?', 1, true)"
         ),
-        {"id": qid, "tid": template_id, "rk": group, "rt": group.title(),
-         "go": order, "qk": key},
+        {
+            "id": qid,
+            "tid": template_id,
+            "rk": group,
+            "rt": group.title(),
+            "go": order,
+            "qk": key,
+        },
     )
     return qid
 
@@ -781,3 +794,186 @@ def test_detail_metadata_is_null_not_a_500_when_task_created_at_is_null(db):
     aid = _seed_assessment(db, tid, "Null Task Timestamp DPIA", task_id=task_id)
     db.flush()
     assert _assessment_detail(db, aid).metadata is None
+
+
+# --- PUT .../{assessment_id}/questions/{question_id} (task 2) ---
+#
+# _update_answer is the non-committing core (write + recompute + assemble
+# the response) — tested directly here the same way _assessment_detail/
+# _evidence_for are, against a transaction the `db` fixture rolls back.
+# update_answer is the actual HTTP route: a thin shell around
+# _update_answer that maps its two raised exceptions to 404 and commits on
+# success. Its 404 paths are exercised directly below too — safe against
+# the same rollback, since write_answer raises before either path ever
+# writes anything. Its commit path is exercised via monkeypatch (see
+# test_update_answer_route_commits_on_success) rather than a real commit,
+# so no test here ever persists rows past this file's `db` fixture.
+#
+# `client` is never resolved through FastAPI's dependency injection in any
+# of these tests (same as `db` above, which bypasses Depends(get_db)
+# entirely) — a plain object exposing `.user_id` is all update_answer reads
+# off it.
+def _fake_client(user_id):
+    return types.SimpleNamespace(user_id=user_id)
+
+
+def _seed_second_template(db) -> str:
+    # _seed_template hardcodes assessment_type="dpia", version="1.0" —
+    # calling it twice in one test collides with
+    # uq_assessment_template_type_version_revision (UNIQUE on
+    # assessment_type, version, fides_revision; same note as
+    # tests/privacycare/test_answers.py's own _seed_second_template, which
+    # this mirrors). A genuinely distinct second template needs a different
+    # assessment_type.
+    tid = f"tpl_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO assessment_template "
+            "(id, version, name, assessment_type, region, is_active) "
+            "VALUES (:id, '1.0', 'A Different Template', 'gdpr', 'EU', true)"
+        ),
+        {"id": tid},
+    )
+    return tid
+
+
+def test_update_answer_returns_the_question_with_the_new_answer_text(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Update Answer DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    response = _update_answer(
+        db, aid, qid, "We only collect what's necessary.", "alice@example.com"
+    )
+
+    assert response.question.question_id == qid
+    assert response.question.answer_text == "We only collect what's necessary."
+    assert response.question.answer_status == "complete"
+
+
+def test_update_answer_completeness_reflects_the_write(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Update Completeness DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    db.flush()
+
+    response = _update_answer(db, aid, q1, "Answered.", "alice@example.com")
+
+    assert response.completeness == pytest.approx(0.5), (
+        "1 of 2 questions now has a complete answer"
+    )
+    persisted = db.execute(
+        sqlalchemy.text("SELECT completeness FROM privacy_assessment WHERE id = :id"),
+        {"id": aid},
+    ).scalar()
+    assert persisted == pytest.approx(0.5), (
+        "completeness must be persisted, not just returned in the envelope"
+    )
+
+
+def test_update_answer_status_is_the_assessments_not_the_answers(db):
+    # The response's `status` must be privacy_assessment.status
+    # ("outdated" here), never answer_version.answer_status ("complete" —
+    # write_answer's fixed default for a human-typed save). The two ride
+    # along in the same envelope and are easy to conflate.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Status DPIA", status="outdated")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    response = _update_answer(db, aid, qid, "Answered.", "alice@example.com")
+
+    assert response.status == "outdated"
+    assert response.question.answer_status == "complete"
+
+
+def test_update_answer_created_by_comes_from_the_caller_not_the_body(db):
+    # UpdateAnswerRequest carries only answer_text — created_by is an
+    # argument _update_answer/write_answer take directly, never read off
+    # the request body, so a client cannot forge authorship.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Created By DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    _update_answer(db, aid, qid, "Answered.", "carol@example.com")
+
+    created_by = db.execute(
+        sqlalchemy.text(
+            "SELECT av.created_by FROM assessment_answer a "
+            "JOIN answer_version av ON av.id = a.current_version_id "
+            "WHERE a.assessment_id = :aid AND a.question_id = :qid"
+        ),
+        {"aid": aid, "qid": qid},
+    ).scalar()
+    assert created_by == "carol@example.com"
+
+
+def test_update_answer_route_maps_unknown_assessment_to_404(db):
+    with pytest.raises(HTTPException) as exc_info:
+        update_answer(
+            "no-such-assessment",
+            "no-such-question",
+            UpdateAnswerRequest(answer_text="x"),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_update_answer_route_maps_foreign_question_to_404(db):
+    tid = _seed_template(db)
+    other_tid = _seed_second_template(db)
+    aid = _seed_assessment(db, tid, "Own Template DPIA")
+    foreign_qid = _seed_question(db, other_tid, "q1", "necessity", 1)
+    db.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_answer(
+            aid,
+            foreign_qid,
+            UpdateAnswerRequest(answer_text="Should not be written."),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+    assert exc_info.value.status_code == 404
+
+    assert (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT COUNT(*) FROM assessment_answer "
+                "WHERE assessment_id = :aid AND question_id = :qid"
+            ),
+            {"aid": aid, "qid": foreign_qid},
+        ).scalar()
+        == 0
+    ), "a 404'd write must not leave a partial row behind"
+
+
+def test_update_answer_route_commits_on_success(db, monkeypatch):
+    # write_answer/recompute_completeness/_update_answer never commit (the
+    # "caller owns the transaction" convention documented in
+    # api/answers.py) — update_answer is the one place that must, or every
+    # write in this feature would silently vanish once the request's
+    # session closes. Monkeypatched rather than a real db.commit(): a real
+    # commit here would persist this test's seeded rows past the `db`
+    # fixture's rollback and into the shared database.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Commit DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+
+    committed = []
+    monkeypatch.setattr(db, "commit", lambda: committed.append(True))
+
+    update_answer(
+        aid,
+        qid,
+        UpdateAnswerRequest(answer_text="Answered."),
+        db=db,
+        client=_fake_client("alice@example.com"),
+    )
+
+    assert committed, "update_answer must commit once _update_answer succeeds"
