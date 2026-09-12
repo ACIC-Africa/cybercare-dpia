@@ -128,6 +128,105 @@ class AssessmentEvidenceResponse(BaseModel):
     items: Optional[List[EvidenceItem]] = None
 
 
+class AssessmentQuestionResponse(BaseModel):
+    # Mirrors AssessmentQuestion in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. Named
+    # *Response, not AssessmentQuestion, because AssessmentQuestion is
+    # already a SQLAlchemy model in fides.api.models.privacy_assessment.
+    #
+    # `id` is a DISPLAY LABEL (QuestionCard.tsx:43 renders
+    # "{question.id}. {question.question_text}"), sourced from
+    # assessment_question.question_key. `question_id` is the real
+    # identifier (QuestionCard.tsx:26 passes it as questionId), sourced
+    # from assessment_question.id. Do not swap them.
+    id: str
+    question_id: str
+    question_text: str
+    # `guidance: string | null;` carries no `?` in the TS contract: the key
+    # is always present, only its value may be null. Same precedent as
+    # EvidenceItem.citation_number above — no default.
+    guidance: Optional[str]
+    required: bool
+    fides_sources: List[str]
+    expected_coverage: str
+    answer_text: str
+    # `answer_status: AnswerStatus;` / `answer_source: AnswerSource;` are
+    # required and non-nullable in the TS contract (no `?`, no `| null`).
+    answer_status: str
+    answer_source: str
+    # `confidence: number | null;` — required, nullable; no default.
+    confidence: Optional[float]
+    evidence: List[dict]
+    # No database source (Plus computes these). Return empty forms rather
+    # than omitting the fields — a missing required field breaks the UI's
+    # deserialisation exactly as a wrong one would. Both are required,
+    # nullable-or-not per the TS contract (no `?` on either).
+    missing_data: List[str]
+    sme_prompt: Optional[str]
+
+
+class QuestionGroup(BaseModel):
+    # Mirrors QuestionGroup in the same feature types.ts file.
+    id: str
+    title: str
+    requirement_key: str
+    questions: List[AssessmentQuestionResponse]
+    answered_count: int
+    total_count: int
+    # No source in the OSS schema — always null for now. Required-but-
+    # nullable in the TS contract (no `?`): no default, same precedent as
+    # EvidenceItem.citation_number.
+    risk_level: Optional[str]
+    last_updated_at: Optional[str]
+    last_updated_by: Optional[str]
+
+
+class AssessmentMetadata(BaseModel):
+    # Mirrors AssessmentMetadata in the same feature types.ts file. That
+    # interface also carries a `[key: string]: unknown` index signature —
+    # not a field, and the shared feature-interface parser in
+    # test_api_schemas.py does not count it as one (its real field count
+    # is 3).
+    generation_timestamp: str
+    # `model_used: string | null;` — required, nullable; no default.
+    model_used: Optional[str]
+    use_llm: bool
+
+
+class PrivacyAssessmentDetailResponse(AssessmentResponse):
+    # Mirrors PrivacyAssessmentDetailResponse in the same feature
+    # types.ts file, which declares it as
+    # `extends PrivacyAssessmentResponse` — its own interface block lists
+    # only these four fields, and PrivacyAssessmentResponse's own fields
+    # are (for our OSS purposes) AssessmentResponse's fields. This model
+    # must carry those four PLUS every AssessmentResponse field via
+    # subclassing.
+    assessment_type: str
+    question_groups: List[QuestionGroup]
+    # The questionnaire is a commercial chat feature with no OSS table.
+    # Required, nullable in the TS contract (no `?`) — no default.
+    questionnaire: Optional[dict]
+    metadata: Optional[AssessmentMetadata]
+
+
+class AssessmentGroupResponse(BaseModel):
+    # Mirrors AssessmentGroupResponse in the same feature types.ts file.
+    # `data_use`/`data_use_name` are required-but-nullable (no `?`): no
+    # default. `assessments` genuinely carries a `?` in the TS contract,
+    # so it alone gets a default.
+    data_use: Optional[str]
+    data_use_name: Optional[str]
+    system_count: int
+    assessments: Optional[List[AssessmentResponse]] = None
+
+
+# GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
+# Its field set (items/total/page/size/pages) already matches the
+# GroupedAssessmentsResponse TS contract field-for-field — see
+# test_grouped_assessments_response_matches_the_shipped_contract, which
+# asserts that equivalence directly rather than defining a second model.
+
+
 def template_key(name: str, id: Optional[str] = None) -> str:
     # Derive the `key` the UI contract requires but the table does not store.
     # Lowercase, non-alphanumerics collapsed to underscores, trimmed.

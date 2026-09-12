@@ -4,13 +4,20 @@
 import pathlib
 import re
 
+from fastapi_pagination import Page
+
 from fides.api.privacycare.api.schemas import (
     AssessmentEvidenceResponse,
+    AssessmentGroupResponse,
+    AssessmentMetadata,
+    AssessmentQuestionResponse,
     AssessmentResponse,
     AssessmentSummaryBlockedGroup,
     AssessmentSummaryOwner,
     AssessmentSummaryResponse,
     EvidenceItem,
+    PrivacyAssessmentDetailResponse,
+    QuestionGroup,
     TemplateResponse,
     template_key,
 )
@@ -54,8 +61,13 @@ def _feature_interface_field_specs(name: str) -> dict[str, bool]:
     # `export type Name = {...};` file. There is no nested `{` inside these
     # particular interface bodies, so a non-greedy match to the next `}` on
     # its own line is unambiguous.
+    #
+    # `[^{]*` (rather than a literal " ") between the name and the opening
+    # brace so this also matches `export interface Name extends Other {`
+    # (PrivacyAssessmentDetailResponse) and not just the plain
+    # `export interface Name {` form.
     text = FEATURE_TS_PATH.read_text()
-    match = re.search(rf"export interface {name} \{{(.*?)\n\}}", text, re.S)
+    match = re.search(rf"export interface {name}\b[^{{]*\{{(.*?)\n\}}", text, re.S)
     assert match, f"{name} not found in {FEATURE_TS_PATH}"
     body = match.group(1)
     return {
@@ -186,6 +198,125 @@ def test_the_evidence_feature_types_were_actually_read():
     # and pass vacuously.
     assert len(_feature_interface_fields("EvidenceItem")) == 9
     assert len(_feature_interface_fields("AssessmentEvidenceResponse")) == 5
+
+
+def test_assessment_question_response_matches_the_shipped_contract():
+    # The TS interface is named AssessmentQuestion; our Pydantic model is
+    # named AssessmentQuestionResponse to avoid colliding with the
+    # SQLAlchemy model of the same (unsuffixed) name.
+    assert set(AssessmentQuestionResponse.model_fields) == _feature_interface_fields(
+        "AssessmentQuestion"
+    )
+
+
+def test_assessment_question_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "AssessmentQuestion"
+    ).items():
+        pydantic_required = AssessmentQuestionResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_question_group_matches_the_shipped_contract():
+    assert set(QuestionGroup.model_fields) == _feature_interface_fields(
+        "QuestionGroup"
+    )
+
+
+def test_question_group_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "QuestionGroup"
+    ).items():
+        pydantic_required = QuestionGroup.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_assessment_metadata_matches_the_shipped_contract():
+    # AssessmentMetadata also carries a `[key: string]: unknown` index
+    # signature in TS. It must not be counted as a field: the parser's
+    # field regex requires the line to start with `[a-z_]+`, which a `[`
+    # never matches, so the index signature is already excluded and the
+    # real field count is 3 (see test_the_feature_types_file_was_actually_read
+    # -equivalent guard below).
+    assert set(AssessmentMetadata.model_fields) == _feature_interface_fields(
+        "AssessmentMetadata"
+    )
+
+
+def test_assessment_metadata_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "AssessmentMetadata"
+    ).items():
+        pydantic_required = AssessmentMetadata.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_assessment_group_response_matches_the_shipped_contract():
+    assert set(AssessmentGroupResponse.model_fields) == _feature_interface_fields(
+        "AssessmentGroupResponse"
+    )
+
+
+def test_assessment_group_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "AssessmentGroupResponse"
+    ).items():
+        pydantic_required = AssessmentGroupResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_grouped_assessments_response_matches_the_shipped_contract():
+    # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse]
+    # — assert the field-set equivalence directly rather than defining a
+    # second model.
+    assert set(Page.model_fields) == _feature_interface_fields(
+        "GroupedAssessmentsResponse"
+    )
+
+
+def test_privacy_assessment_detail_response_matches_the_shipped_contract():
+    # PrivacyAssessmentDetailResponse `extends PrivacyAssessmentResponse` in
+    # TS, so its own interface block lists only the four ADDED fields. Our
+    # Pydantic model must carry those four PLUS every AssessmentResponse
+    # field (PrivacyAssessmentResponse only narrows two already-typed
+    # fields; it adds none). This is the inheritance check the brief calls
+    # out as most likely to be got wrong.
+    added_fields = _feature_interface_fields("PrivacyAssessmentDetailResponse")
+    assert added_fields == {
+        "assessment_type",
+        "question_groups",
+        "questionnaire",
+        "metadata",
+    }
+    assert set(PrivacyAssessmentDetailResponse.model_fields) == (
+        added_fields | set(AssessmentResponse.model_fields)
+    )
+
+
+def test_privacy_assessment_detail_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "PrivacyAssessmentDetailResponse"
+    ).items():
+        pydantic_required = PrivacyAssessmentDetailResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_dpia_envelope_feature_types_were_actually_read():
+    # Same guard as test_the_feature_types_file_was_actually_read: a bad
+    # path or regex would make the parity tests above compare empty sets
+    # and pass vacuously.
+    assert len(_feature_interface_fields("AssessmentQuestion")) == 14
+    assert len(_feature_interface_fields("QuestionGroup")) == 9
+    assert len(_feature_interface_fields("AssessmentMetadata")) == 3
+    assert len(_feature_interface_fields("AssessmentGroupResponse")) == 4
+    assert len(_feature_interface_fields("GroupedAssessmentsResponse")) == 5
+    assert len(_feature_interface_fields("PrivacyAssessmentDetailResponse")) == 4
 
 
 def test_template_key_derives_a_slug_from_a_normal_name():
