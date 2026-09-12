@@ -201,6 +201,24 @@ class PrivacyAssessmentDetailResponse(AssessmentResponse):
     # are (for our OSS purposes) AssessmentResponse's fields. This model
     # must carry those four PLUS every AssessmentResponse field via
     # subclassing.
+    #
+    # Fix round 1: PrivacyAssessmentDetailResponse extends
+    # PrivacyAssessmentResponse in TS, NOT the generated AssessmentResponse
+    # directly. PrivacyAssessmentResponse narrows two fields off the
+    # generated type (`extends Omit<GeneratedAssessmentResponse, "status"
+    # | "risk_level">`) and redeclares both as required:
+    #   status: AssessmentStatus;              (already str, required,
+    #                                            non-nullable here — no
+    #                                            change needed)
+    #   risk_level: RiskLevel | null;           (required, nullable)
+    # The generated AssessmentResponse types risk_level as
+    # `risk_level?: string | null` — genuinely optional. Subclassing
+    # AssessmentResponse silently inherited THAT optional version instead
+    # of the feature-narrowed required one. Override both narrowed fields
+    # here so the inheritance matches what this class actually extends,
+    # not what it happens to be implemented in terms of.
+    status: str
+    risk_level: Optional[str]
     assessment_type: str
     question_groups: List[QuestionGroup]
     # The questionnaire is a commercial chat feature with no OSS table.

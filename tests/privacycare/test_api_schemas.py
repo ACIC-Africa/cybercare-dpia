@@ -3,6 +3,7 @@
 # a Fides upgrade that changes the contract fails here rather than in a browser.
 import pathlib
 import re
+import typing
 
 from fastapi_pagination import Page
 
@@ -80,6 +81,63 @@ def _feature_interface_field_specs(name: str) -> dict[str, bool]:
 
 def _feature_interface_fields(name: str) -> set[str]:
     return set(_feature_interface_field_specs(name).keys())
+
+
+def _feature_interface_raw_specs(name: str) -> dict[str, str]:
+    # Same interface-body match as _feature_interface_field_specs, but
+    # returns the raw TS type text per field (e.g. "string | null") rather
+    # than just the optional marker. A trailing `?` alone does not tell you
+    # whether a REQUIRED field's value may be null — that is a separate
+    # axis, and conflating the two is exactly how the risk_level narrowing
+    # bug (fix round 1) went undetected: the optionality test only ever
+    # asked whether a default existed.
+    text = FEATURE_TS_PATH.read_text()
+    match = re.search(rf"export interface {name}\b[^{{]*\{{(.*?)\n\}}", text, re.S)
+    assert match, f"{name} not found in {FEATURE_TS_PATH}"
+    body = match.group(1)
+    return {
+        field: type_text.strip()
+        for field, type_text in re.findall(
+            r"^\s*([a-z_]+)\??:\s*(.+?);\s*$", body, re.M
+        )
+    }
+
+
+def _ts_type_is_nullable(type_text: str) -> bool:
+    return "null" in [part.strip() for part in type_text.split("|")]
+
+
+def _assert_admits_none_where_ts_nullable(model, raw_specs, fields=None):
+    # For every TS field typed `X | null`, assert the Pydantic annotation
+    # actually admits None. Optionality (is_required()) alone would let a
+    # required-but-nullable field stay wrongly typed as non-nullable and go
+    # unnoticed. `fields`, if given, restricts the check to that subset
+    # (used when raw_specs comes from a different interface than the one
+    # being asserted against, e.g. checking narrowed fields on a subclass).
+    for field, type_text in raw_specs.items():
+        if fields is not None and field not in fields:
+            continue
+        if not _ts_type_is_nullable(type_text):
+            continue
+        annotation = model.model_fields[field].annotation
+        assert type(None) in typing.get_args(annotation), (
+            f"{field}: TS type {type_text!r} is nullable but Pydantic "
+            f"annotation {annotation!r} does not admit None"
+        )
+
+
+def _narrowed_fields(name: str) -> set[str]:
+    # PrivacyAssessmentResponse narrows fields off the generated
+    # AssessmentResponse via `extends Omit<GeneratedAssessmentResponse,
+    # "status" | "risk_level">`. Parse the quoted field names out of that
+    # clause directly rather than hardcoding them, so a future narrowing
+    # addition is caught automatically instead of drifting silently (fix
+    # round 1 finding: risk_level's narrowed, required-nullable contract
+    # was missed because nothing traced this extends clause through).
+    text = FEATURE_TS_PATH.read_text()
+    match = re.search(rf"export interface {name}\b(.*?)\{{", text, re.S)
+    assert match, f"{name} extends-clause not found in {FEATURE_TS_PATH}"
+    return set(re.findall(r'"([a-z_]+)"', match.group(1)))
 
 
 def test_assessment_response_matches_the_shipped_contract():
@@ -217,6 +275,9 @@ def test_assessment_question_response_optionality_matches_the_shipped_contract()
             field
         ].is_required()
         assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        AssessmentQuestionResponse, _feature_interface_raw_specs("AssessmentQuestion")
+    )
 
 
 def test_question_group_matches_the_shipped_contract():
@@ -231,6 +292,9 @@ def test_question_group_optionality_matches_the_shipped_contract():
     ).items():
         pydantic_required = QuestionGroup.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        QuestionGroup, _feature_interface_raw_specs("QuestionGroup")
+    )
 
 
 def test_assessment_metadata_matches_the_shipped_contract():
@@ -251,6 +315,9 @@ def test_assessment_metadata_optionality_matches_the_shipped_contract():
     ).items():
         pydantic_required = AssessmentMetadata.model_fields[field].is_required()
         assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        AssessmentMetadata, _feature_interface_raw_specs("AssessmentMetadata")
+    )
 
 
 def test_assessment_group_response_matches_the_shipped_contract():
@@ -267,6 +334,9 @@ def test_assessment_group_response_optionality_matches_the_shipped_contract():
             field
         ].is_required()
         assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        AssessmentGroupResponse, _feature_interface_raw_specs("AssessmentGroupResponse")
+    )
 
 
 def test_grouped_assessments_response_matches_the_shipped_contract():
@@ -305,6 +375,35 @@ def test_privacy_assessment_detail_response_optionality_matches_the_shipped_cont
             field
         ].is_required()
         assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        PrivacyAssessmentDetailResponse,
+        _feature_interface_raw_specs("PrivacyAssessmentDetailResponse"),
+    )
+
+
+def test_privacy_assessment_detail_response_narrowed_fields_match_the_feature_contract():
+    # Fix round 1: PrivacyAssessmentDetailResponse actually extends
+    # PrivacyAssessmentResponse in TS, not the generated AssessmentResponse
+    # directly, and PrivacyAssessmentResponse narrows status/risk_level to
+    # required, redeclared types via `extends Omit<GeneratedAssessmentResponse,
+    # "status" | "risk_level">`. Parse that narrowing clause to find the
+    # affected fields rather than hardcoding "status"/"risk_level" here, so
+    # a future narrowing addition is caught automatically instead of
+    # drifting silently the way risk_level's requiredness did.
+    narrowed = _narrowed_fields("PrivacyAssessmentResponse")
+    assert narrowed  # guard against a silently-empty parse
+    narrowed_specs = _feature_interface_field_specs("PrivacyAssessmentResponse")
+    for field in narrowed:
+        is_optional = narrowed_specs[field]
+        pydantic_required = PrivacyAssessmentDetailResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        PrivacyAssessmentDetailResponse,
+        _feature_interface_raw_specs("PrivacyAssessmentResponse"),
+        fields=narrowed,
+    )
 
 
 def test_the_dpia_envelope_feature_types_were_actually_read():
