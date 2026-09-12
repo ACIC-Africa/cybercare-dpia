@@ -124,10 +124,54 @@ def _resolved_sources(question: dict, context: dict) -> list[tuple[str, str]]:
     return pairs
 
 
+# The subject each fides_sources root speaks about, in the words a DPO uses.
+#
+# A source key is `root.field`, and the ROOT is the subject the fact belongs
+# to. Labelling with the field alone made `system.name` and
+# `privacy_declaration.name` both render as "Name", so a prompt read
+# "- Name: Acme CRM / - Name: Marketing outreach" with nothing saying which
+# was the system and which the processing activity. That collision is on the
+# OPENING question of dpia_1_1, cpra_1_1 and cnil_1_1 — 7 of the 89 `partial`
+# questions — and its failure shape is the worst available: the model
+# attributes a fact to the wrong subject while the evidence items, which do
+# keep source_key, still cite correctly. A wrong statement wearing a correct
+# citation.
+#
+# Mapped rather than derived so the name is the one a DPO would use
+# ("Processing activity", not "Privacy declaration"), and so a root added to
+# assessment_question later cannot silently reintroduce the collision: an
+# unmapped root falls back to the root itself, which still distinguishes it.
+# Covers all nine roots live in assessment_question.fides_sources, including
+# the five in UNSUPPORTED_SOURCE_ROOTS that resolve_source never answers
+# today — labelling them costs nothing and means supporting one later is not
+# also a labelling change.
+_SOURCE_ROOT_LABELS = {
+    "system": "System",
+    "privacy_declaration": "Processing activity",
+    "data_use": "Data use",
+    "data_category": "Data category",
+    "privacy_notice": "Privacy notice",
+    "privacy_experience": "Privacy experience",
+    "policy": "Policy",
+    "connection": "Integration",
+    "fides": "Fides configuration",
+}
+
+
 def _label(source_key: str) -> str:
-    """'privacy_declaration.data_use' -> 'Data use'."""
-    field = source_key.split(".", 1)[-1]
-    return field.replace("_", " ").capitalize()
+    """'system.name' -> 'System name'; 'privacy_declaration.name' -> 'Processing activity name'.
+
+    Two different source keys must never produce the same label: this text is
+    both the model's only way to tell one subject from another in the
+    `partial` prompt AND the answer text a regulator reads on the `full`
+    path. test_no_shipped_question_has_two_sources_with_the_same_label holds
+    that guarantee across every question in the database.
+    """
+    root, _, field = source_key.partition(".")
+    prefix = _SOURCE_ROOT_LABELS.get(root, root.replace("_", " ").capitalize())
+    if not field:
+        return prefix
+    return f"{prefix} {field.replace('_', ' ')}"
 
 
 def draft_from_context(

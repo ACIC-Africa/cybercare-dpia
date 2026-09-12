@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare import llm as llm_module
 from fides.api.privacycare.api.assessments import _assessment_detail, _evidence_for
 from fides.api.privacycare.generator import (
+    _SOURCE_ROOT_LABELS,
+    _label,
     GENERATION_CALLER,
     GENERATOR_AUTHOR,
     NEEDS_INPUT_SENTINEL,
@@ -113,6 +115,58 @@ def test_full_coverage_skips_sources_that_do_not_resolve():
 
     assert len(draft.evidence["items"]) == 1
     assert "retention_period" not in draft.answer_text
+
+
+def test_a_label_names_the_subject_the_fact_belongs_to():
+    # `system.name` and `privacy_declaration.name` are BOTH "Name" if the
+    # dotted root is thrown away. The model then reads two facts under one
+    # label and can attribute either to the wrong subject, while the evidence
+    # items -- which keep source_key -- still cite correctly. A wrong
+    # statement wearing a correct citation is the worst failure shape this
+    # pipeline has.
+    assert _label("system.name") == "System name"
+    assert _label("privacy_declaration.name") == "Processing activity name"
+    assert _label("data_use.name") == "Data use name"
+    assert _label("data_category.name") == "Data category name"
+    assert _label("privacy_declaration.data_use") == "Processing activity data use"
+
+
+def test_an_unmapped_root_still_keeps_its_root_in_the_label():
+    # A root added to assessment_question.fides_sources that nobody added to
+    # _SOURCE_ROOT_LABELS must NOT silently collapse back to the field name
+    # and reintroduce the collision. It falls back to the root itself.
+    assert _label("vendor.name") == "Vendor name"
+    assert _label("vendor.name") != _label("system.name")
+
+
+def test_every_root_label_is_distinct():
+    # The no-collision guarantee rests on this: two roots sharing a prefix
+    # would make `a.name` and `b.name` the same label again.
+    labels = list(_SOURCE_ROOT_LABELS.values())
+    assert len(labels) == len(set(labels))
+
+
+def test_no_shipped_question_has_two_sources_with_the_same_label(db):
+    # The standing guarantee, asserted against the real data rather than a
+    # hand-picked example: for EVERY question in the database, no two of its
+    # fides_sources render under the same label. Before the root->prefix
+    # mapping this failed on 7 questions, among them the opening question of
+    # dpia_1_1, cpra_1_1 and cnil_1_1.
+    rows = db.execute(
+        sqlalchemy.text(
+            "SELECT question_key, fides_sources FROM assessment_question "
+            "WHERE fides_sources IS NOT NULL"
+        )
+    ).mappings().all()
+    assert rows, "no shipped questions found -- the guarantee would be vacuous"
+
+    collisions = {}
+    for row in rows:
+        sources = list(row["fides_sources"] or [])
+        labels = [_label(source) for source in sources]
+        if len(set(labels)) != len(set(sources)):
+            collisions[row["question_key"]] = sources
+    assert collisions == {}
 
 
 def test_partial_coverage_drafts_nothing_without_the_llm():
