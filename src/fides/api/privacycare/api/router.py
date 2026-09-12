@@ -37,38 +37,23 @@ def register() -> None:
     if getattr(app_setup, _REGISTERED_FLAG, False):
         return
 
-    # THE ORDER OF THE LAST TWO IMPORTS IS LOAD-BEARING. Do not sort them.
-    #
-    # api/tasks.py binds POST "", GET "/tasks" and GET "/tasks/{task_id}";
-    # api/assessments.py binds GET "/{assessment_id}". Starlette matches
-    # routes in registration order and stops at the first match, so if
-    # "/{assessment_id}" bound first, a request for "/tasks" would match IT
-    # (assessment_id="tasks") and the progress bar would 404 forever against
-    # a route that demonstrably exists. api/tasks must therefore import
-    # first. test_the_tasks_route_is_matched_before_the_assessment_id_route
-    # fails if these two lines are swapped.
-    #
-    # This works only because the two route modules do not import each
-    # other: the helper they share, _created_by_from_client, lives in
-    # api/identity.py, which neither depends on. An import of one route
-    # module from the other would bind ALL of that module's routes at import
-    # time and silently defeat the ordering below, whatever order these
-    # lines are in. That is exactly what happened once already, and why
-    # identity.py exists.
-    #
-    # `tasks as api_tasks` is aliased because this package also has a
-    # top-level `tasks` module (the Celery task, imported first below);
-    # re-binding that name here would shadow it. That import is what
-    # registers privacycare.generate_assessments with celery_app — the API
+    # Registers privacycare.generate_assessments with celery_app: the API
     # process needs it registered to queue a message, while the worker
     # process gets it from fides.api.privacycare.worker.
+    importlib.import_module("fides.api.privacycare.tasks")
+
+    # THE ORDER OF THE NEXT TWO IMPORTS IS LOAD-BEARING. Do not sort them.
+    #
     # Both route modules decorate the SHARED privacycare_router at import
     # time, so the order they are imported in IS the order their routes are
     # registered in — and Starlette matches in registration order, stopping
-    # at the first match. api/assessments.py binds GET "/{assessment_id}";
-    # api/tasks.py binds GET "/tasks". If assessments bound first, a request
-    # for "/tasks" would match IT (assessment_id="tasks") and the progress
-    # bar would 404 forever against a route that demonstrably exists.
+    # at the first match. api/tasks.py binds POST "", GET "/tasks" and GET
+    # "/tasks/{task_id}"; api/assessments.py binds GET "/{assessment_id}".
+    # If assessments bound first, a request for "/tasks" would match IT
+    # (assessment_id="tasks") and the progress bar would 404 forever against
+    # a route that demonstrably exists.
+    # test_the_tasks_route_is_matched_before_the_assessment_id_route fails
+    # if these two lines are swapped.
     #
     # importlib, not `from ... import ...`, precisely BECAUSE the order
     # matters: ruff's I001 alphabetises an import block and would silently
@@ -77,8 +62,6 @@ def register() -> None:
     # for their route-binding side effect (they carried unused-import
     # suppressions before), so nothing is lost by making the side effect,
     # and its order, explicit.
-    # test_the_tasks_route_is_matched_before_the_assessment_id_route
-    # fails if these two lines are swapped.
     #
     # This works only because the two route modules do not import each
     # other: the helper they share, _created_by_from_client, lives in
@@ -86,11 +69,6 @@ def register() -> None:
     # module from the other would bind ALL of that module's routes at import
     # time and defeat the ordering however these lines are written. That is
     # exactly what happened once already, and why identity.py exists.
-    # Registers privacycare.generate_assessments with celery_app: the API
-    # process needs it registered to queue a message, while the worker
-    # process gets it from fides.api.privacycare.worker.
-    importlib.import_module("fides.api.privacycare.tasks")
-
     importlib.import_module("fides.api.privacycare.api.tasks")
     importlib.import_module("fides.api.privacycare.api.assessments")
 

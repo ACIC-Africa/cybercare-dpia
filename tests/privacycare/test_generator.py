@@ -9,10 +9,10 @@ from fides.api.privacycare.api.answers import recompute_completeness
 from fides.api.privacycare.api.assessments import _assessment_detail, _evidence_for
 from fides.api.privacycare.generator import (
     _SOURCE_ROOT_LABELS,
-    _label,
     GENERATION_CALLER,
     GENERATOR_AUTHOR,
     NEEDS_INPUT_SENTINEL,
+    _label,
     answer_questions,
     draft_from_context,
     draft_with_llm,
