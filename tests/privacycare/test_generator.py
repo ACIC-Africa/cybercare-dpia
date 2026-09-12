@@ -10,9 +10,9 @@ from fides.api.privacycare.generator import (
     GENERATION_CALLER,
     GENERATOR_AUTHOR,
     NEEDS_INPUT_SENTINEL,
+    answer_questions,
     draft_from_context,
     draft_with_llm,
-    answer_questions,
 )
 from tests.privacycare.test_api_assessments import (
     _seed_assessment,
@@ -351,6 +351,50 @@ def test_partial_coverage_asks_the_model_and_records_a_partial_answer(monkeypatc
     assert draft.answer_source == "ai_analysis"
     assert draft.answer_text.startswith("The activity is described")
     assert captured["caller"] == GENERATION_CALLER
+
+
+def test_an_llm_draft_cites_its_facts_as_ai_analysis_evidence(monkeypatch):
+    # The facts are still the record's; what the model contributed is the
+    # prose. Typing the evidence "ai_analysis" rather than "system" is what
+    # tells a reviewer -- and a regulator -- that this answer was drafted
+    # rather than read off the record.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: "An answer."
+    )
+
+    question = _question(
+        "partial", ["system.name", "privacy_declaration.name"]
+    )
+
+    draft = draft_with_llm(question, _CONTEXT, model=None)
+
+    items = draft.evidence["items"]
+    assert [i["source_key"] for i in items] == [
+        "system.name",
+        "privacy_declaration.name",
+    ]
+    assert {i["type"] for i in items} == {"ai_analysis"}, (
+        "a drafted answer's citations must not claim to be read straight "
+        f"off the system record: {items!r}"
+    )
+    assert [i["value"] for i in items] == ["CRM", "Email campaigns"]
+
+
+def test_an_llm_draft_honours_citation_start(monkeypatch):
+    # Citations render as [1], [2] ... across a whole exported DPIA. If the
+    # LLM path restarted numbering, two answers would both claim [1] and the
+    # report's references would be ambiguous.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: "An answer."
+    )
+
+    question = _question(
+        "partial", ["system.name", "privacy_declaration.name"]
+    )
+
+    draft = draft_with_llm(question, _CONTEXT, model=None, citation_start=7)
+
+    assert [i["citation_number"] for i in draft.evidence["items"]] == [7, 8]
 
 
 def test_the_prompt_carries_the_resolved_facts_and_the_question(monkeypatch):
