@@ -12,6 +12,19 @@ from dataclasses import dataclass
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+# fides_sources addresses nine roots; build_context supplies four (system,
+# privacy_declaration, data_use, data_category). The five below are
+# deliberately unsupported in phase 1 — they name Fides subsystems
+# PrivacyCare does not operate (consent notices and experiences, DSR
+# policies, integrations, Fides' own config), so there is no data to resolve
+# them against. resolve_source returns None for them, which routes the
+# question to a human exactly as a `none`-coverage question is routed.
+# Listed here so the gap is a recorded decision and not an oversight, and so
+# that adding one later is an obvious edit.
+UNSUPPORTED_SOURCE_ROOTS = frozenset(
+    {"privacy_notice", "privacy_experience", "policy", "connection", "fides"}
+)
+
 
 @dataclass(frozen=True)
 class GenerationTarget:
@@ -114,22 +127,35 @@ _DATA_USE_DETAIL_SQL = sqlalchemy.text(
     "SELECT name, description FROM ctl_data_uses WHERE fides_key = :fides_key"
 )
 
+_DATA_CATEGORY_DETAIL_SQL = sqlalchemy.text(
+    "SELECT fides_key, name, description FROM ctl_data_categories "
+    "WHERE fides_key = ANY(:fides_keys)"
+)
+
 
 def build_context(db: Session, target: GenerationTarget) -> dict:
     """The facts available about one target, keyed the way fides_sources
     addresses them.
 
-    The three top-level keys are not arbitrary: assessment_question.
-    fides_sources holds dotted paths whose first segment is exactly
-    "system", "privacy_declaration" or "data_use" (sampled live:
-    ['system.name', 'system.description', 'privacy_declaration.name'],
+    The top-level keys are not arbitrary: assessment_question.fides_sources
+    holds dotted paths whose first segment names one of nine roots (sampled
+    live: ['system.name', 'system.description', 'privacy_declaration.name'],
     ['privacy_declaration.data_use', 'data_use.name',
-    'data_use.description']). This dict IS that addressing space.
+    'data_use.description'], ['data_category.name']). This function supplies
+    four of the nine — system, privacy_declaration, data_use, data_category
+    — because those are the ones PrivacyCare has data for. The other five
+    are named in UNSUPPORTED_SOURCE_ROOTS and never appear here: see that
+    constant's docstring for why, and unresolvable_roots() for how a caller
+    finds out which roots a given question's sources actually missed.
 
     A data_use with no ctl_data_uses row yields None name/description rather
     than raising — a declaration may legitimately name a custom data use,
     and one unregistered taxonomy key must not stop the whole system's
-    generation.
+    generation. data_category does the same per-category: a category key
+    with no ctl_data_categories row falls back to the key itself for
+    "name" (the key is still a true statement about the processing, unlike
+    an invented label) and to None for "description" (there is nothing
+    true to say).
 
     The returned dict is stored verbatim in privacy_assessment.
     context_snapshot, so it must contain only JSON-serialisable values. That
@@ -146,6 +172,27 @@ def build_context(db: Session, target: GenerationTarget) -> dict:
         _DATA_USE_DETAIL_SQL, {"fides_key": target.data_use}
     ).mappings().first()
 
+    category_keys = list(target.data_categories or [])
+    category_rows_by_key: dict = {}
+    if category_keys:
+        category_rows = db.execute(
+            _DATA_CATEGORY_DETAIL_SQL, {"fides_keys": category_keys}
+        ).mappings().all()
+        category_rows_by_key = {row["fides_key"]: row for row in category_rows}
+    # Declaration order, not query order — a declaration has many
+    # categories, fides_sources addresses the path singular, and the
+    # taxonomy join must not silently reorder what the customer declared.
+    category_names = [
+        (category_rows_by_key[key]["name"] or key)
+        if key in category_rows_by_key
+        else key
+        for key in category_keys
+    ]
+    category_descriptions = [
+        category_rows_by_key[key]["description"] if key in category_rows_by_key else None
+        for key in category_keys
+    ]
+
     return {
         "system": {
             "fides_key": target.system_fides_key,
@@ -159,6 +206,10 @@ def build_context(db: Session, target: GenerationTarget) -> dict:
             "fides_key": target.data_use,
             "name": data_use["name"] if data_use else None,
             "description": data_use["description"] if data_use else None,
+        },
+        "data_category": {
+            "name": category_names,
+            "description": category_descriptions,
         },
     }
 
@@ -205,3 +256,30 @@ def resolve_source(context: dict, dotted_path: str) -> str | None:
         return "yes" if value else "no"
     rendered = str(value).strip()
     return rendered or None
+
+
+def unresolvable_roots(context: dict, source_paths: list[str]) -> set[str]:
+    """Which top-level roots, among source_paths, resolve_source could not
+    answer for this context.
+
+    A root lands in the result either because it is in
+    UNSUPPORTED_SOURCE_ROOTS (a recorded phase-1 gap — no data exists for it
+    regardless of context) or because at least one of its paths resolved to
+    None in this specific context (a supported root that happens to have
+    nothing to say here, e.g. a declaration with no data_categories).
+
+    This makes the gap countable rather than silent: a caller can log, per
+    assessment, which roots contributed nothing — instead of discovering
+    from a customer that half a template came back blank. It deliberately
+    reports at root granularity, matching how fides_sources addresses the
+    schema, not at the level of individual paths.
+    """
+    unresolved: set[str] = set()
+    for path in source_paths:
+        root = path.split(".", 1)[0]
+        if root in UNSUPPORTED_SOURCE_ROOTS:
+            unresolved.add(root)
+            continue
+        if resolve_source(context, path) is None:
+            unresolved.add(root)
+    return unresolved

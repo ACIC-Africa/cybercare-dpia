@@ -9,10 +9,12 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.context import (
+    UNSUPPORTED_SOURCE_ROOTS,
     GenerationTarget,
     build_context,
     resolve_source,
     select_targets,
+    unresolvable_roots,
 )
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -26,7 +28,9 @@ def db():
         session.rollback()
 
 
-def _seed_system(db, fides_key: str, *, name=None, requires_dpa=False) -> str:
+def _seed_system(
+    db, fides_key: str, *, name=None, requires_dpa=False, uses_profiling=False
+) -> str:
     system_id = f"sys_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
@@ -37,7 +41,7 @@ def _seed_system(db, fides_key: str, *, name=None, requires_dpa=False) -> str:
             " requires_data_protection_assessments, uses_cookies, "
             " cookie_refresh, uses_non_cookie_access, hidden) "
             "VALUES (:id, :fides_key, :name, :description, '{}', "
-            " true, false, false, false, :requires_dpa, false, "
+            " true, false, :uses_profiling, false, :requires_dpa, false, "
             " false, false, false)"
         ),
         {
@@ -46,13 +50,20 @@ def _seed_system(db, fides_key: str, *, name=None, requires_dpa=False) -> str:
             "name": name,
             "description": f"{fides_key} description",
             "requires_dpa": requires_dpa,
+            "uses_profiling": uses_profiling,
         },
     )
     return system_id
 
 
 def _seed_declaration(
-    db, system_id: str, data_use: str, *, name=None, categories=None
+    db,
+    system_id: str,
+    data_use: str,
+    *,
+    name=None,
+    categories=None,
+    processes_special_category_data=False,
 ) -> str:
     decl_id = f"decl_{uuid.uuid4().hex[:8]}"
     db.execute(
@@ -63,7 +74,8 @@ def _seed_declaration(
             " flexible_legal_basis_for_processing, legal_basis_for_processing, "
             " retention_period) "
             "VALUES (:id, :name, :data_use, :categories, :system_id, '{}', "
-            " false, false, true, 'Consent', '7 years')"
+            " :processes_special_category_data, false, true, 'Consent', "
+            " '7 years')"
         ),
         {
             "id": decl_id,
@@ -71,6 +83,7 @@ def _seed_declaration(
             "data_use": data_use,
             "categories": categories or ["user.contact.email"],
             "system_id": system_id,
+            "processes_special_category_data": processes_special_category_data,
         },
     )
     return decl_id
@@ -146,6 +159,28 @@ def test_select_targets_high_risk_only_uses_the_requires_dpa_flag(db):
     )
 
 
+def test_select_targets_high_risk_only_ignores_other_gdpr_triggers(db):
+    # Guards OQ-PRIVACY-10 with teeth: uses_profiling and
+    # processes_special_category_data are real GDPR Article 35 triggers, but
+    # deciding they also constitute a Kenyan DPA 2019 trigger is a legal
+    # call reserved for the customer's privacy SME, not engineering. A
+    # system that trips both of those, yet has
+    # requires_data_protection_assessments=False, must still be excluded —
+    # if the predicate is ever widened to OR them in, this must start
+    # failing.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key, requires_dpa=False, uses_profiling=True)
+    _seed_declaration(
+        db,
+        sid,
+        "marketing.advertising",
+        processes_special_category_data=True,
+    )
+    db.flush()
+
+    assert select_targets(db, [key], high_risk_only=True) == []
+
+
 def test_select_targets_returns_nothing_when_no_system_matches(db):
     assert select_targets(db, ["no-such-system"], high_risk_only=False) == []
 
@@ -195,6 +230,37 @@ def test_build_context_tolerates_an_unregistered_data_use(db):
     assert context["data_use"]["description"] is None
 
 
+def test_build_context_joins_data_categories_in_declaration_order_with_fallback(db):
+    # ctl_data_categories ships pre-seeded with the real Fides default
+    # taxonomy (like ctl_data_uses), so "user.contact.email" resolves to its
+    # real name/description. The second key is deliberately made-up so the
+    # no-taxonomy-row fallback (name -> the key itself, description -> None)
+    # is exercised in the same call, in the declaration's own order.
+    unregistered_key = f"custom.category.{uuid.uuid4().hex[:6]}"
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key, name="CRM")
+    _seed_declaration(
+        db, sid, "marketing.advertising",
+        categories=["user.contact.email", unregistered_key],
+    )
+    db.flush()
+
+    target = next(t for t in select_targets(db, [key], high_risk_only=False))
+    context = build_context(db, target)
+
+    assert context["data_category"]["name"] == [
+        "User Contact Email",
+        unregistered_key,
+    ]
+    assert context["data_category"]["description"] == [
+        "User's contact email address.",
+        None,
+    ]
+    assert resolve_source(context, "data_category.name") == (
+        f"User Contact Email, {unregistered_key}"
+    )
+
+
 @pytest.mark.parametrize(
     "path,expected",
     [
@@ -228,3 +294,57 @@ def test_resolve_source_returns_none_for_an_empty_list():
     # empty list rendered into a DPIA answer would assert a fact.
     context = {"privacy_declaration": {"data_categories": []}}
     assert resolve_source(context, "privacy_declaration.data_categories") is None
+
+
+def test_resolve_source_returns_none_for_a_list_of_only_nones():
+    # A list can be non-empty and still carry no fact — every element
+    # absent. That must collapse to None too, not to an empty string
+    # rendered from joining nothing.
+    context = {"privacy_declaration": {"data_categories": [None, None]}}
+    assert resolve_source(context, "privacy_declaration.data_categories") is None
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_resolve_source_returns_none_for_a_blank_string(blank):
+    # An empty or whitespace-only string is present but says nothing — it
+    # must read as absent, the same as None or [], not as "" in a DPIA
+    # answer.
+    context = {"system": {"name": blank}}
+    assert resolve_source(context, "system.name") is None
+
+
+def test_unresolvable_roots_flags_unsupported_roots_regardless_of_context():
+    # privacy_notice and connection have no data in ANY context — they are
+    # phase-1-unsupported Fides subsystems, not merely absent-here facts.
+    context = {"system": {"name": "CRM"}}
+    paths = ["system.name", "privacy_notice.name", "connection.name"]
+
+    assert unresolvable_roots(context, paths) == {"privacy_notice", "connection"}
+
+
+def test_unresolvable_roots_flags_a_supported_root_with_nothing_to_say():
+    # privacy_declaration IS supported — build_context always populates it —
+    # but this declaration's own data_categories is empty, so the source
+    # still resolves to None for this specific assessment.
+    context = {"privacy_declaration": {"data_categories": []}}
+
+    assert unresolvable_roots(
+        context, ["privacy_declaration.data_categories"]
+    ) == {"privacy_declaration"}
+
+
+def test_unresolvable_roots_is_empty_when_every_source_resolves():
+    context = {"system": {"name": "CRM"}}
+    assert unresolvable_roots(context, ["system.name"]) == set()
+
+
+def test_unsupported_source_roots_names_exactly_the_five_phase_1_gaps():
+    # Locks the constant's membership: adding or removing an entry here is a
+    # deliberate, reviewed decision, not an incidental edit.
+    assert UNSUPPORTED_SOURCE_ROOTS == {
+        "privacy_notice",
+        "privacy_experience",
+        "policy",
+        "connection",
+        "fides",
+    }
