@@ -567,6 +567,14 @@ def test_a_generated_answer_and_a_human_edit_share_one_version_chain(db):
     assert versions[0]["answer_source"] == "ai_analysis"
     assert versions[1]["answer_source"] == "user_input"
     assert versions[0]["answer_text"] == "Machine draft."
+    # State the one-handle claim rather than inferring it. [1, 2] above is
+    # already impossible under a two-handle regression (version_number is
+    # scoped per answer_id, so two handles would give [1, 1]) — but the
+    # claim this test is named for deserves to be asserted, not deduced.
+    assert versions[0]["answer_id"] == versions[1]["answer_id"], (
+        "a human edit of a machine draft must extend the SAME answer, not "
+        "open a second handle for the same (assessment, question)"
+    )
 
 
 def test_write_answer_rejects_a_status_outside_the_enum(db):
