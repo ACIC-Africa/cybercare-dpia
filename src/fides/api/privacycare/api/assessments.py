@@ -843,6 +843,21 @@ def _update_answer(
     write_answer(db, assessment_id, question_id, answer_text, created_by)
     completeness = recompute_completeness(db, assessment_id)
     q = _question_by_id(db, assessment_id, question_id)
+    if q is None:
+        # Fix round 3 (whole-range review, finding 4): an ENFORCED invariant,
+        # not an asserted one. The argument below — write_answer already
+        # validated this question against the assessment's template, so the
+        # lookup cannot legitimately come back None — is sound today. If it
+        # ever stops being sound, the un-guarded failure mode was a TypeError
+        # on q["evidence"] surfacing as a 500 on a SUCCESSFUL write that had
+        # already appended an answer_version: the DPO's answer saved, the
+        # DPO's browser shown a crash. That is the worst response shape this
+        # surface can produce. LookupError is the one the route already maps
+        # to the 404 that says, truthfully, "that question is not there".
+        raise LookupError(
+            f"question {question_id} vanished from assessment {assessment_id} "
+            f"between the write and the read-back"
+        )
     assessment_status = db.execute(
         _ASSESSMENT_STATUS_SQL, {"assessment_id": assessment_id}
     ).scalar()
@@ -1073,6 +1088,31 @@ def bulk_update_answers(
 # every key it can ever interpolate as a bare SQL identifier comes from
 # UpdatePrivacyAssessmentRequest.model_fields, a closed, code-defined set —
 # never a request-supplied string.
+# Existence check AND parent row lock in one statement — the same FOR UPDATE
+# discipline every other write path on this surface uses (see
+# _lock_assessment_and_get_template_id in api/answers.py, and
+# _LOCK_ASSESSMENT_SQL's comment there for the three races it closes).
+#
+# Used by both task-4 core functions, for different halves of what it
+# returns:
+#
+# - _update_assessment's empty-body branch wants the LOCK (fix round 3,
+#   whole-range review, finding 8: that branch used to do two unlocked reads
+#   — this existence check, then _ASSESSMENT_DETAIL_SQL for the response — so
+#   under READ COMMITTED a concurrent answer write could commit between them
+#   and the returned AssessmentResponse could mix pre-write and post-write
+#   state, e.g. a stale completeness beside a fresh updated_at. It was the
+#   one place this surface's own locking discipline was not applied).
+#
+# - _delete_assessment wants the NAME as well, for its warning, and the lock
+#   is what makes the version count it takes next TRUTHFUL rather than
+#   approximate: without it a concurrent write_answer could append a version
+#   between the COUNT and the DELETE, and the log line would under-report
+#   what was destroyed by exactly the rows nobody can now go and look at.
+_LOCK_ASSESSMENT_ROW_SQL = sqlalchemy.text(
+    "SELECT name FROM privacy_assessment WHERE id = :assessment_id FOR UPDATE"
+)
+
 _UPDATABLE_ASSESSMENT_FIELDS = {"name", "status", "risk_level"}
 
 
@@ -1091,9 +1131,11 @@ def _update_assessment(
 
     An empty `updates` (a body with all three fields omitted) is a
     deliberate no-op WRITE, not a no-op existence check: the row is still
-    looked up and its current, unchanged state is returned — same
-    "still 404s an unknown id, still returns real state for a known one"
-    precedent as _bulk_update_answers's empty-batch handling.
+    looked up — under the same FOR UPDATE row lock every other path here
+    holds across its reads (fix round 3, finding 8) — and its current,
+    unchanged state is returned. Same "still 404s an unknown id, still
+    returns real state for a known one" precedent as
+    _bulk_update_answers's empty-batch handling.
 
     updated_at is bumped explicitly (`, updated_at = now()`) because this is
     raw SQL via sqlalchemy.text(), not an ORM UPDATE — PrivacyAssessment's
@@ -1136,8 +1178,15 @@ def _update_assessment(
         if result.rowcount == 0:
             raise LookupError(f"No assessment with id {assessment_id}")
     else:
+        # Fix round 3 (finding 8): _LOCK_ASSESSMENT_ROW_SQL, not the
+        # lock-free _ASSESSMENT_STATUS_SQL this used to use. The UPDATE in
+        # the branch above takes the row lock implicitly, as its first
+        # statement, and holds it across the detail read below; this branch
+        # writes nothing, so nothing was holding that lock for it and its
+        # two reads could straddle a concurrent commit. Same statement,
+        # same LookupError, one row lock more.
         exists = db.execute(
-            _ASSESSMENT_STATUS_SQL, {"assessment_id": assessment_id}
+            _LOCK_ASSESSMENT_ROW_SQL, {"assessment_id": assessment_id}
         ).first()
         if exists is None:
             raise LookupError(f"No assessment with id {assessment_id}")
@@ -1231,21 +1280,6 @@ def update_assessment(
     return response
 
 
-# Fix round 3 (whole-range review, MAJOR finding 3): the two reads
-# _delete_assessment takes BEFORE the DELETE, so the destruction can be
-# recorded at all.
-#
-# The name read doubles as the existence check AND takes the parent row lock
-# — the same FOR UPDATE discipline every other write path on this surface
-# uses (see _lock_assessment_and_get_template_id in api/answers.py). The lock
-# is what makes the version count below TRUTHFUL rather than approximate:
-# without it a concurrent write_answer could append a version between the
-# COUNT and the DELETE, and the log line would under-report what was
-# destroyed by exactly the rows nobody can now go and look at.
-_ASSESSMENT_NAME_FOR_UPDATE_SQL = sqlalchemy.text(
-    "SELECT name FROM privacy_assessment WHERE id = :assessment_id FOR UPDATE"
-)
-
 # Counted BEFORE the delete — afterwards there is nothing left to count.
 _CASCADED_VERSION_COUNT_SQL = sqlalchemy.text(
     "SELECT COUNT(*) FROM answer_version av "
@@ -1310,7 +1344,7 @@ def _delete_assessment(db: Session, assessment_id: str, deleted_by: str) -> None
     system will record that it is gone, or who made it go.
     """
     row = db.execute(
-        _ASSESSMENT_NAME_FOR_UPDATE_SQL, {"assessment_id": assessment_id}
+        _LOCK_ASSESSMENT_ROW_SQL, {"assessment_id": assessment_id}
     ).first()
     if row is None:
         raise LookupError(f"No assessment with id {assessment_id}")

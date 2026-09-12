@@ -1468,6 +1468,84 @@ def test_update_assessment_explicit_null_risk_level_clears_it(db):
     assert persisted is None, "must be persisted, not just returned in the envelope"
 
 
+def test_empty_body_update_locks_the_assessment_row(db):
+    # Fix round 3 (whole-range review, finding 8): the empty-body branch used
+    # to take two UNLOCKED reads — the existence check, then the detail read
+    # for the response — so under READ COMMITTED a concurrent answer write
+    # could commit between them and the returned AssessmentResponse could mix
+    # pre-write and post-write state. Every other path on this surface holds
+    # the row lock across its reads.
+    #
+    # Asserted on the emitted SQL via before_cursor_execute, the same idiom
+    # test_answers.py uses to prove write_answer's lock — a direct check on
+    # what was sent to Postgres, not on our own source.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Empty Body Lock DPIA")
+    db.flush()
+
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        response = _update_assessment(db, aid, {})
+    finally:
+        sqlalchemy.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert response.id == aid
+    assert any("FOR UPDATE" in statement for statement in statements), (
+        "the empty-body branch must hold the parent row lock across its two "
+        f"reads, like every other write path here — emitted: {statements!r}"
+    )
+
+
+def test_update_answer_404s_rather_than_500s_if_the_question_read_back_is_gone(
+    db, monkeypatch
+):
+    # Fix round 3 (whole-range review, finding 4): _question_by_id "cannot
+    # legitimately come back None" — write_answer validated the question
+    # against the template before this point. The guard exists for if that
+    # ever stops being true: the un-guarded failure was a TypeError on
+    # q["evidence"], surfacing as a 500 AFTER a successful append. The answer
+    # is saved and the caller sees a crash — the worst response shape on this
+    # surface. Forcing the None here is the only way to exercise it.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Vanished Question DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+    monkeypatch.setattr(assessments_module, "_question_by_id", lambda *a, **k: None)
+
+    with pytest.raises(LookupError):
+        _update_answer(db, aid, qid, "An answer.", "alice@example.com")
+
+
+def test_update_answer_route_maps_a_vanished_question_read_back_to_404(
+    db, monkeypatch
+):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Vanished Question Route DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+    monkeypatch.setattr(assessments_module, "_question_by_id", lambda *a, **k: None)
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_answer(
+            aid,
+            qid,
+            UpdateAnswerRequest(answer_text="An answer."),
+            db=db,
+            client=_fake_client("alice@example.com"),
+        )
+    assert exc_info.value.status_code == 404, (
+        "a failed read-back must land on the 404 this route already maps, "
+        "never escape as a 500"
+    )
+
+
 def test_update_assessment_unknown_id_raises_lookuperror(db):
     with pytest.raises(LookupError):
         _update_assessment(db, "no-such-assessment", {"name": "Doesn't matter"})
