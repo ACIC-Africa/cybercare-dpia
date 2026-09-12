@@ -25,6 +25,16 @@ UNSUPPORTED_SOURCE_ROOTS = frozenset(
     {"privacy_notice", "privacy_experience", "policy", "connection", "fides"}
 )
 
+# The roots build_context actually populates. Its counterpart,
+# UNSUPPORTED_SOURCE_ROOTS, records the ones phase 1 deliberately cannot
+# resolve; together they must account for every root the shipped templates
+# cite. Named so that pairing can be checked against the live templates rather
+# than against itself — the earlier check restated the unsupported set back to
+# itself, so a tenth root added upstream would have fallen through both.
+SUPPLIED_SOURCE_ROOTS = frozenset(
+    {"system", "privacy_declaration", "data_use", "data_category"}
+)
+
 
 @dataclass(frozen=True)
 class GenerationTarget:

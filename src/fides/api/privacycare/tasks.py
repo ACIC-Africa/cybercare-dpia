@@ -39,6 +39,19 @@ GENERATION_QUEUE = PRIVACY_ASSESSMENTS_QUEUE_NAME
 # queued message carries. A rename would orphan every in-flight message.
 GENERATION_TASK_NAME = "privacycare.generate_assessments"
 
+# The only task statuses this module writes. Named rather than scattered as
+# literals so there is ONE thing to pin: privacy_assessment_task.status is a
+# plain varchar with no database enum, so Postgres accepts any string we hand
+# it, and Ethyca's own ORM then raises LookupError reading a row we wrote.
+# tests/privacycare/test_vocabularies.py checks this set against BOTH
+# authorities — Ethyca's ExecutionLogStatus (what their code can read back)
+# and the shipped TaskStatus in types.ts (what the UI can render).
+TASK_STATUSES_WRITTEN = frozenset({"pending", "in_processing", "complete", "error"})
+
+# The action_type every task this module creates carries. Ethyca's
+# AssessmentTaskType is the authority; RE_EVALUATE is not built.
+TASK_ACTION_TYPE = "generate"
+
 _LOAD_TASK_SQL = sqlalchemy.text(
     "SELECT assessment_types, system_fides_keys, use_llm, llm_model, "
     "       high_risk_only, created_by "

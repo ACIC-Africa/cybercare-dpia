@@ -37,6 +37,13 @@ from fides.api.privacycare.llm import DEFAULT_MODEL, GatewayUnavailable, complet
 # then tell at a glance which answers still need a human's eyes.
 GENERATOR_AUTHOR = "privacycare-generator"
 
+# Every expected_coverage value the policy below branches on. Named so it can
+# be pinned against the shipped questions themselves: the column is a plain
+# varchar with no check constraint, so a fourth level added upstream would
+# fall through every branch and silently generate nothing for those questions,
+# with no error and no log. See tests/privacycare/test_vocabularies.py.
+HANDLED_COVERAGE_LEVELS = frozenset({"full", "partial", "none"})
+
 # The model is given one way to say "I cannot answer this from the record".
 # Without it the only options are a guess or an empty string, and a guessed
 # answer in a DPIA is worse than an unanswered question: the unanswered one
