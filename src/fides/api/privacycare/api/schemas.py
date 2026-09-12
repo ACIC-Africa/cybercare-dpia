@@ -215,10 +215,14 @@ class AssessmentQuestionResponse(BaseModel):
     # malformed payload is skipped (with the same logged warning) in both
     # places instead of only one.
     evidence: List[EvidenceItem]
-    # No database source (Plus computes these). Return empty forms rather
-    # than omitting the fields — a missing required field breaks the UI's
-    # deserialisation exactly as a wrong one would. Both are required,
-    # nullable-or-not per the TS contract (no `?` on either).
+    # missing_data IS populated now: generation writes the source keys the
+    # record could not supply as a sibling key of the evidence JSONB, and
+    # _missing_data_from_payload reads them back (the final-review fix wave
+    # — before that it was hardcoded []). sme_prompt still has no source.
+    # Both are returned as empty forms rather than omitted when absent: a
+    # missing required field breaks the UI's deserialisation exactly as a
+    # wrong one would. Both are required, nullable-or-not per the TS
+    # contract (no `?` on either).
     missing_data: List[str]
     sme_prompt: Optional[str]
 

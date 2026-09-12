@@ -559,6 +559,80 @@ def test_an_llm_draft_cites_its_facts_as_ai_analysis_evidence(monkeypatch):
     assert [i["value"] for i in items] == ["CRM", "Email campaigns"]
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "NEEDS_INPUT",
+        "  NEEDS_INPUT\n",
+        "NEEDS_INPUT.",
+        "**NEEDS_INPUT**",
+        '"NEEDS_INPUT"',
+        "`NEEDS_INPUT`",
+        "- NEEDS_INPUT",
+        "NEEDS_INPUT — the record does not state a retention period",
+    ],
+)
+def test_a_decorated_decline_is_still_a_decline(monkeypatch, reply):
+    # Models decorate. Stripping only the RIGHT side left the same defect in
+    # mirror position: a bolded, quoted, backticked or bulleted sentinel was
+    # filed as a cited partial answer whose entire text is the refusal.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: reply
+    )
+
+    assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "The record names no retention period, so this NEEDS_INPUT from the DPO.",
+        "NEEDS_INPUTS are tracked separately in the register.",
+    ],
+)
+def test_an_answer_that_merely_mentions_the_sentinel_is_still_an_answer(
+    monkeypatch, reply
+):
+    # Over-broadening would throw away work the model did correctly: an
+    # answer that genuinely reports a gap is a real answer and gets filed.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: reply
+    )
+
+    draft = draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None)
+
+    assert draft is not None
+    assert draft.answer_text == reply
+
+
+def test_missing_data_omits_roots_phase_1_structurally_cannot_resolve(monkeypatch):
+    # missing_data is rendered by AnswerStatusTags.tsx as data the answer
+    # "can be automatically derived if you populate" it. That is true of a
+    # declaration field the customer left blank; it is false of
+    # privacy_notice, which names a Fides subsystem PrivacyCare phase 1 does
+    # not operate. Listing it would send a DPO off to populate records that
+    # would change nothing.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: "An answer."
+    )
+
+    question = _question(
+        "partial",
+        [
+            "system.name",
+            "privacy_declaration.retention_period",  # absent, but fillable
+            "privacy_notice.name",                   # structurally unsupported
+        ],
+    )
+
+    draft = draft_with_llm(question, _CONTEXT, model=None)
+
+    assert draft.missing_data == ["privacy_declaration.retention_period"], (
+        "only what the CUSTOMER can fix belongs in missing_data; what only "
+        f"we can fix is our backlog, not their to-do list: {draft.missing_data!r}"
+    )
+
+
 def test_an_llm_draft_honours_citation_start(monkeypatch):
     # Citations render as [1], [2] ... across a whole exported DPIA. If the
     # LLM path restarted numbering, two answers would both claim [1] and the

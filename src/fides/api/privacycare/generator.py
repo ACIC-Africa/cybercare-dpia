@@ -27,7 +27,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.answers import write_answer
-from fides.api.privacycare.context import resolve_source
+from fides.api.privacycare.context import UNSUPPORTED_SOURCE_ROOTS, resolve_source
 from fides.api.privacycare.llm import DEFAULT_MODEL, GatewayUnavailable, complete
 
 # Every generated answer_version's created_by. answer_version.created_by is
@@ -138,12 +138,24 @@ def _unresolved_sources(
     DPIA has to carry: a question the record answers half of must not be
     indistinguishable, in the artifact or in the completeness percentage,
     from one it answers in full.
+
+    Sources on an UNSUPPORTED_SOURCE_ROOTS root are excluded. missing_data
+    is rendered by AnswerStatusTags.tsx as data the answer "can be
+    automatically derived if you populate" — which is true of a declaration
+    field the customer left blank, and false of privacy_notice / policy /
+    connection / privacy_experience / fides, which name Fides subsystems
+    PrivacyCare phase 1 does not operate at all. Listing those would send a
+    DPO off to populate records that would change nothing (25 of the 89
+    `partial` questions cite at least one). What the customer CAN fix stays;
+    what only we can fix is our backlog, not their to-do list, and
+    unresolvable_roots() is where that gap is counted.
     """
     answered = {key for key, _ in resolved}
     return [
         source_key
         for source_key in question["fides_sources"] or []
         if source_key not in answered
+        and source_key.split(".", 1)[0] not in UNSUPPORTED_SOURCE_ROOTS
     ]
 
 
@@ -277,6 +289,10 @@ def _generation_prompt(question: dict, resolved: list[tuple[str, str]]) -> str:
 # sentinel is compared so "NEEDS_INPUT." is the decline it plainly is.
 _TRAILING_PUNCTUATION = " \t\r\n.!?:;,-–—…\"\'`)]}*"
 
+# Both-ends decoration a model may wrap the sentinel in. Superset of
+# _TRAILING_PUNCTUATION so a single strip() handles either side.
+_SENTINEL_DECORATION = _TRAILING_PUNCTUATION + "*`'\"-–—[](){}<>#: \t"
+
 
 def _is_decline(reply: str) -> bool:
     """Did the model say it cannot answer this from the record?
@@ -290,8 +306,8 @@ def _is_decline(reply: str) -> bool:
     carrying real ai_analysis evidence citing genuine fides_sources. In an
     exported DPIA that reads as a cited, drafted answer.
 
-    Two shapes count as a decline: the sentinel alone once trailing
-    punctuation is removed, and a reply that BEGINS with the sentinel
+    Two shapes count as a decline: the sentinel alone once decoration is
+    removed from EITHER end, and a reply that BEGINS with the sentinel
     (whatever follows is the model explaining itself, which the prompt asked
     it not to do but which does not make the decline less of one).
 
@@ -306,8 +322,16 @@ def _is_decline(reply: str) -> bool:
     stripped = reply.strip()
     if not stripped:
         return True
-    # Shape 1: the sentinel alone, once trailing punctuation is removed.
-    if stripped.rstrip(_TRAILING_PUNCTUATION) == NEEDS_INPUT_SENTINEL:
+    # Decoration is stripped from BOTH ends. Stripping only the right left
+    # the same defect in mirror position: "**NEEDS_INPUT**", a quoted
+    # "NEEDS_INPUT", a backticked one, and "- NEEDS_INPUT" in a bulleted
+    # reply all fell through and were filed as cited answers whose entire
+    # text is the refusal. Models decorate; the sentinel has to survive it.
+    stripped = stripped.strip(_SENTINEL_DECORATION)
+    if not stripped:
+        return True
+    # Shape 1: the sentinel alone, once decoration is removed.
+    if stripped == NEEDS_INPUT_SENTINEL:
         return True
     # Shape 2: the sentinel, then the model explaining itself. Only counts
     # when the sentinel ends where a word ends — see the docstring.
