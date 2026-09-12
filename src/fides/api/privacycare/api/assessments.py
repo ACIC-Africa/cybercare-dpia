@@ -10,6 +10,7 @@ from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.router import privacycare_router
 from fides.api.privacycare.api.schemas import (
     AssessmentEvidenceResponse,
+    AssessmentGroupResponse,
     AssessmentResponse,
     AssessmentSummaryResponse,
     TemplateResponse,
@@ -336,16 +337,43 @@ def _assessment_to_response(row) -> AssessmentResponse:
     )
 
 
+def _grouped_assessments(db: Session) -> list[AssessmentGroupResponse]:
+    # Groups the client's assessments by data_use, as the list page renders them.
+    # Order is deterministic: named data uses alphabetically, the null group last.
+    groups: dict = {}
+    for row in _list_assessments(db):
+        key = row["data_use"]
+        if key not in groups:
+            groups[key] = {
+                "data_use": key,
+                "data_use_name": row["data_use_name"],
+                "systems": set(),
+                "assessments": [],
+            }
+        groups[key]["assessments"].append(_assessment_to_response(row))
+        if row["system_fides_key"]:
+            groups[key]["systems"].add(row["system_fides_key"])
+    ordered = sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or ""))
+    return [
+        AssessmentGroupResponse(
+            data_use=g["data_use"],
+            data_use_name=g["data_use_name"],
+            system_count=len(g["systems"]),
+            assessments=g["assessments"],
+        )
+        for _, g in ordered
+    ]
+
+
 @privacycare_router.get(
     "",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
-    response_model=Page[AssessmentResponse],
+    response_model=Page[AssessmentGroupResponse],
 )
 def list_assessments(
     *, db: Session = Depends(get_db), params: Params = Depends()
-) -> Page[AssessmentResponse]:
-    rows = [_assessment_to_response(r) for r in _list_assessments(db)]
-    return paginate(rows, params)
+) -> Page[AssessmentGroupResponse]:
+    return paginate(_grouped_assessments(db), params)
 
 
 @privacycare_router.get(

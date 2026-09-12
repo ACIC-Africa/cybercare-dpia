@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare.api.assessments import (
     _assessment_to_response,
     _evidence_for,
+    _grouped_assessments,
     _list_assessments,
     _list_templates,
     _questions_for,
@@ -68,18 +69,22 @@ def _seed_assessment(
     created_by: str | None = None,
     data_use: str | None = None,
     data_use_name: str | None = None,
+    system: str | None = "sys_test",
 ) -> str:
-    # status/risk_level/created_by/data_use/data_use_name are all optional
-    # kwargs (defaulting to the original single-status behaviour) so the
-    # summary tests below can drive every AssessmentSummarySegment and the
-    # blocked_groups/owners aggregation without a second seed helper.
+    # status/risk_level/created_by/data_use/data_use_name/system are all
+    # optional kwargs (defaulting to the original single-status behaviour,
+    # system="sys_test") so the summary tests below can drive every
+    # AssessmentSummarySegment and the blocked_groups/owners aggregation
+    # without a second seed helper, and existing positional/keyword callers
+    # keep working unchanged. `system` is additive: a later task extends
+    # this same helper again.
     aid = f"asmt_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO privacy_assessment "
             "(id, template_id, name, status, system_fides_key, risk_level, "
             " created_by, data_use, data_use_name) "
-            "VALUES (:id, :tid, :name, :status, 'sys_test', :risk_level, "
+            "VALUES (:id, :tid, :name, :status, :system, :risk_level, "
             " :created_by, :data_use, :data_use_name)"
         ),
         {
@@ -87,6 +92,7 @@ def _seed_assessment(
             "tid": template_id,
             "name": name,
             "status": status,
+            "system": system,
             "risk_level": risk_level,
             "created_by": created_by,
             "data_use": data_use,
@@ -94,6 +100,37 @@ def _seed_assessment(
         },
     )
     return aid
+
+
+def test_assessments_group_by_data_use(db):
+    tid = _seed_template(db)
+    a1 = _seed_assessment(db, tid, "Onboarding A", data_use="essential.service")
+    a2 = _seed_assessment(db, tid, "Onboarding B", data_use="essential.service")
+    a3 = _seed_assessment(db, tid, "Marketing", data_use="marketing.advertising")
+    db.flush()
+    groups = {g.data_use: g for g in _grouped_assessments(db)}
+    assert "essential.service" in groups and "marketing.advertising" in groups
+    ids = {a.id for a in groups["essential.service"].assessments}
+    assert {a1, a2} <= ids
+    assert a3 not in ids
+
+
+def test_system_count_counts_distinct_systems_not_assessments(db):
+    tid = _seed_template(db)
+    _seed_assessment(db, tid, "S1", data_use="shared.use", system="sys_one")
+    _seed_assessment(db, tid, "S2", data_use="shared.use", system="sys_one")
+    _seed_assessment(db, tid, "S3", data_use="shared.use", system="sys_two")
+    db.flush()
+    group = next(g for g in _grouped_assessments(db) if g.data_use == "shared.use")
+    assert group.system_count == 2, "three assessments across two systems"
+
+
+def test_null_data_use_forms_its_own_group(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Ungrouped", data_use=None)
+    db.flush()
+    group = next(g for g in _grouped_assessments(db) if g.data_use is None)
+    assert aid in {a.id for a in group.assessments}
 
 
 def test_list_returns_seeded_assessments(db):
