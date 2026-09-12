@@ -273,6 +273,50 @@ def _generation_prompt(question: dict, resolved: list[tuple[str, str]]) -> str:
     )
 
 
+# Trailing characters a model adds to a one-word reply. Stripped before the
+# sentinel is compared so "NEEDS_INPUT." is the decline it plainly is.
+_TRAILING_PUNCTUATION = " \t\r\n.!?:;,-–—…\"\'`)]}*"
+
+
+def _is_decline(reply: str) -> bool:
+    """Did the model say it cannot answer this from the record?
+
+    The sentinel is the ONLY thing standing between the gateway and a filed
+    DPIA answer: there is no post-hoc grounding check and no confidence
+    gate. Exact equality after strip() was therefore too narrow — a reply of
+    "NEEDS_INPUT." or "NEEDS_INPUT — the record does not state a retention
+    period" fell through to the write and was stored as an
+    answer_status="partial" answer whose entire text is the refusal,
+    carrying real ai_analysis evidence citing genuine fides_sources. In an
+    exported DPIA that reads as a cited, drafted answer.
+
+    Two shapes count as a decline: the sentinel alone once trailing
+    punctuation is removed, and a reply that BEGINS with the sentinel
+    (whatever follows is the model explaining itself, which the prompt asked
+    it not to do but which does not make the decline less of one).
+
+    Deliberately NOT "contains the sentinel": an answer that genuinely
+    reports a gap — "the record names no retention period, so this needs
+    input from the DPO" — is a real answer and must be filed as one.
+    Over-broadening here would throw away work the model did correctly. The
+    boundary is checked rather than assumed: the character after the
+    sentinel must not be alphanumeric, so a hypothetical NEEDS_INPUTS is not
+    read as a decline with a stray S.
+    """
+    stripped = reply.strip()
+    if not stripped:
+        return True
+    # Shape 1: the sentinel alone, once trailing punctuation is removed.
+    if stripped.rstrip(_TRAILING_PUNCTUATION) == NEEDS_INPUT_SENTINEL:
+        return True
+    # Shape 2: the sentinel, then the model explaining itself. Only counts
+    # when the sentinel ends where a word ends — see the docstring.
+    if not stripped.startswith(NEEDS_INPUT_SENTINEL):
+        return False
+    rest = stripped[len(NEEDS_INPUT_SENTINEL) :]
+    return not (rest[0].isalnum() or rest[0] == "_")
+
+
 def draft_with_llm(
     question: dict,
     context: dict,
@@ -326,7 +370,7 @@ def draft_with_llm(
         return None
 
     answer_text = (reply or "").strip()
-    if not answer_text or answer_text == NEEDS_INPUT_SENTINEL:
+    if _is_decline(answer_text):
         return None
 
     items = [

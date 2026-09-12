@@ -624,6 +624,77 @@ def test_a_declining_reply_is_recognised_despite_surrounding_whitespace(monkeypa
     assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
 
 
+def test_a_decline_with_a_full_stop_is_still_a_decline(monkeypatch):
+    # "NEEDS_INPUT." used to be filed as a cited `partial` answer whose
+    # entire text is the sentinel. The sentinel is the only thing standing
+    # between the gateway and a filed DPIA answer — there is no grounding
+    # check and no confidence gate behind it.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: f"{NEEDS_INPUT_SENTINEL}.",
+    )
+    assert (
+        draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None)
+        is None
+    )
+
+
+def test_a_decline_followed_by_an_apology_is_still_a_decline(monkeypatch):
+    # The prompt asks for "exactly NEEDS_INPUT and nothing else", which is
+    # the right instruction and not a guarantee. A model that declines and
+    # then explains itself has still declined.
+    for reply in (
+        f"{NEEDS_INPUT_SENTINEL} — the record does not state a retention period.",
+        f"{NEEDS_INPUT_SENTINEL}. I am sorry, the record does not say.",
+        f"{NEEDS_INPUT_SENTINEL}\n\nThe record holds no retention period.",
+    ):
+        monkeypatch.setattr(
+            "fides.api.privacycare.generator.complete", lambda *a, **k: reply
+        )
+        assert (
+            draft_with_llm(
+                _question("partial", ["system.name"]), _CONTEXT, model=None
+            )
+            is None
+        ), reply
+
+
+def test_a_real_answer_that_mentions_the_sentinel_is_still_an_answer(monkeypatch):
+    # The other direction, and it matters just as much: over-broadening to
+    # "contains the sentinel" would throw away an answer the model got
+    # right. An answer that reports a gap in the record is a real answer.
+    reply = (
+        "The record names email and behavioural data for advertising. It "
+        f"states no retention period, so that field {NEEDS_INPUT_SENTINEL} "
+        "from the assessor."
+    )
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete", lambda *a, **k: reply
+    )
+
+    draft = draft_with_llm(
+        _question("partial", ["system.name"]), _CONTEXT, model=None
+    )
+
+    assert draft is not None
+    assert draft.answer_text == reply
+
+
+def test_a_word_that_merely_starts_with_the_sentinel_is_not_a_decline(monkeypatch):
+    # The boundary is checked, not assumed: the character after the sentinel
+    # must not be alphanumeric.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: f"{NEEDS_INPUT_SENTINEL}S are recorded for this activity.",
+    )
+
+    draft = draft_with_llm(
+        _question("partial", ["system.name"]), _CONTEXT, model=None
+    )
+
+    assert draft is not None
+
+
 def test_an_empty_reply_writes_nothing(monkeypatch):
     monkeypatch.setattr(
         "fides.api.privacycare.generator.complete", lambda *a, **k: "   "
