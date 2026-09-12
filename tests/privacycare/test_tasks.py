@@ -112,6 +112,16 @@ def _seed_task(
     return task_id
 
 
+def _timestamps(db, task_id):
+    return db.execute(
+        sqlalchemy.text(
+            "SELECT created_at, updated_at FROM privacy_assessment_task "
+            "WHERE id = :id"
+        ),
+        {"id": task_id},
+    ).mappings().first()
+
+
 def _task_row(db, task_id):
     return db.execute(
         sqlalchemy.text(
@@ -433,6 +443,69 @@ def test_a_context_build_failure_does_not_discard_the_others(db, monkeypatch):
     assert row["completed_count"] == 1
     assert bad_key in row["message"], "the message must name which target failed"
     assert _assessments_for_task(db, task_id)[0]["system_fides_key"] == good_key
+
+
+def test_a_status_change_moves_updated_at_off_created_at(db):
+    # privacy_assessment_task is only ever written through raw
+    # sqlalchemy.text(), which bypasses Base.updated_at's ORM-level
+    # onupdate=func.now(); the column's only database-level default is now()
+    # at INSERT, and there is no trigger. So updated_at used to equal
+    # created_at for every task in every state — and it is the ONLY record
+    # of when a generation run ended, rendered by
+    # AssessmentTaskStatusIndicator.tsx as the run's finish time.
+    from fides.api.privacycare.tasks import _set_status
+
+    task_id = _seed_task(db, assessment_types=["kenya_dpia"])
+    db.flush()
+    before = _timestamps(db, task_id)
+    assert before["updated_at"] == before["created_at"], (
+        "precondition: a freshly inserted task has not been updated yet"
+    )
+
+    _set_status(db, task_id, "in_processing", 4, 0, None)
+    db.flush()
+
+    after = _timestamps(db, task_id)
+    assert after["updated_at"] > after["created_at"]
+    assert after["created_at"] == before["created_at"], (
+        "created_at must not move"
+    )
+
+
+def test_every_later_status_write_moves_updated_at_again(db):
+    # The finish write is the one the UI reads as "this run ended". It must
+    # be later than the in_processing write, not merely later than INSERT.
+    from fides.api.privacycare.tasks import _set_status
+
+    task_id = _seed_task(db, assessment_types=["kenya_dpia"])
+    db.flush()
+
+    _set_status(db, task_id, "in_processing", 4, 0, None)
+    db.flush()
+    mid = _timestamps(db, task_id)["updated_at"]
+
+    _set_status(db, task_id, "complete", 4, 4, "Generated 4 of 4 assessments.")
+    db.flush()
+
+    assert _timestamps(db, task_id)["updated_at"] > mid
+
+
+def test_a_real_run_leaves_a_finish_time_later_than_its_queue_time(db):
+    # End to end through run_generation rather than through _set_status
+    # directly: the task the UI polls must carry a genuine finish time.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_declaration(db, _seed_system(db, key), "marketing.advertising")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    stamps = _timestamps(db, task_id)
+    assert _task_row(db, task_id)["status"] == "complete"
+    assert stamps["updated_at"] > stamps["created_at"]
 
 
 def test_a_wrapper_level_failure_preserves_the_real_progress_count(db):

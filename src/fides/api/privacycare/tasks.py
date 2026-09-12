@@ -75,10 +75,33 @@ _FINISH_ASSESSMENT_SQL = sqlalchemy.text(
     "WHERE id = :assessment_id"
 )
 
+# updated_at is bumped EXPLICITLY, for the same reason _update_assessment in
+# api/assessments.py bumps it explicitly: Base.updated_at's
+# onupdate=func.now() is an ORM-level construct, and a raw
+# db.execute(text(...)) bypasses it entirely. The column's only
+# database-level default is now() at INSERT and there is no trigger
+# (verified against information_schema.columns), so without this clause
+# privacy_assessment_task.updated_at never advances — every task in every
+# state reports having been last updated the instant it was queued.
+#
+# That is not cosmetic. AssessmentTaskResponse.updated_at is what
+# AssessmentTaskStatusIndicator.tsx renders as a run's finish time, and no
+# other column holds it: a forty-minute run, and a run that errored, would
+# both tell the DPO they finished the moment Generate was pressed. For an
+# artifact whose purpose is answering "when was this done, and by whom",
+# the *when* half of the task record was unrecoverable.
+#
+# clock_timestamp(), not now(): now() is the TRANSACTION's start time, so a
+# status write would report when its transaction began rather than when the
+# status actually changed — and, since the row is inserted with now() too,
+# a write sharing that transaction would not move updated_at off created_at
+# at all. clock_timestamp() records the moment of the write, which is the
+# fact being stored.
 _SET_TASK_STATUS_SQL = sqlalchemy.text(
     "UPDATE privacy_assessment_task "
     "SET status = :status, total_count = :total_count, "
-    "    completed_count = :completed_count, message = :message "
+    "    completed_count = :completed_count, message = :message, "
+    "    updated_at = clock_timestamp() "
     "WHERE id = :task_id"
 )
 
