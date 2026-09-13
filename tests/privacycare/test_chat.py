@@ -518,3 +518,37 @@ def test_a_negative_cursor_names_no_question_rather_than_the_last_one(db):
         "a negative cursor resolved to a real question id, so an answer would "
         "be filed against a question the officer was never asked"
     )
+
+
+def test_answering_in_the_chat_moves_the_stored_completeness(db):
+    # privacy_assessment.completeness is a STORED column; write_answer does not
+    # touch it. Generation refreshes it in tasks.py and the answer-write routes
+    # refresh it in api/assessments.py — this path did not. So an officer
+    # answering in the chat moved answered_count while completeness stood
+    # still: the assessment card kept showing the old percentage, and the
+    # exported PDF would print a climbing answered count beside a frozen
+    # completeness. Contradictory numbers in a document filed with a regulator.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Chat Completeness DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 2)
+    db.flush()
+
+    def _stored():
+        return db.execute(
+            sqlalchemy.text(
+                "SELECT completeness FROM privacy_assessment WHERE id = :i"
+            ),
+            {"i": aid},
+        ).scalar()
+
+    assert _stored() == 0
+
+    session = open_or_resume(db, aid)
+    record_answer_and_advance(db, session, "Consent, captured at signup.",
+                              "carol@example.com")
+
+    assert _stored() == 50.0, (
+        "answering in the chat did not refresh the stored completeness; the "
+        f"card and the PDF would keep showing the old figure: {_stored()}"
+    )

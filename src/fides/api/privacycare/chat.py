@@ -23,7 +23,7 @@ import sqlalchemy
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.api.answers import write_answer
+from fides.api.privacycare.api.answers import recompute_completeness, write_answer
 
 # The three values fides.api.models.questionnaire.QuestionnaireStatus
 # defines, and the three labels the live `questionnairestatus` pg_enum
@@ -659,4 +659,22 @@ def record_answer_and_advance(
     session = begin_turn(db, session)
     index = session.current_question_index
     record_answer(db, session, answer_text, created_by, question_index=index)
+
+    # Recompute here, not in the route. privacy_assessment.completeness is a
+    # STORED column: write_answer does not touch it, so every path that files
+    # an answer has to refresh it or the figure goes stale. Generation does it
+    # in tasks.py and the answer-write routes do it in api/assessments.py;
+    # this path did not, so an officer answering in the chat moved
+    # answered_count while completeness stood still. The assessment card kept
+    # showing the old percentage, and the exported PDF would print a climbing
+    # answered count beside a frozen completeness — contradictory numbers in a
+    # document filed with a regulator.
+    #
+    # It belongs in this function rather than the route for the same reason
+    # the answer and the advance do: the three writes are one turn, and a
+    # caller that sequenced them itself could forget one. recompute_completeness
+    # re-acquires the same assessment lock this transaction already holds,
+    # which is a no-op.
+    recompute_completeness(db, session.assessment_id)
+
     return advance(db, session, from_index=index)
