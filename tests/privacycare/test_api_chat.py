@@ -6,6 +6,7 @@
 # gateway call. The `_stub_llm` fixture below applies a default stub to every
 # test in this module (autouse), and individual tests override judge_reply's
 # stub where the test is specifically about a non-responsive reply.
+import json
 from typing import List
 
 import pytest
@@ -462,3 +463,358 @@ def test_the_feature_types_file_was_actually_read_for_chat_types():
     assert len(_feature_interface_fields("QuestionnaireChatMessage")) == 6
     assert len(_feature_interface_fields("StartChatResponse")) == 4
     assert len(_feature_interface_fields("ChatReplyResponse")) == 4
+
+
+# --- The whole-range review's CRITICAL: two in-flight replies ---
+
+
+def _seeded_chat(db, monkeypatch, question_count: int):
+    """Template + assessment + `question_count` questions + a started chat.
+    Returns (assessment_id, questionnaire_id).
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Interleaved Chat DPIA")
+    for i in range(question_count):
+        _seed_question(db, tid, f"q{i}", "necessity", i + 1)
+    db.flush()
+    _no_commit(db, monkeypatch)
+    questionnaire_id = start_questionnaire_chat(
+        StartChatRequest(assessment_id=aid), db=db
+    ).questionnaire_id
+    return aid, questionnaire_id
+
+
+def _filed(db, assessment_id: str) -> dict:
+    """{question_key: [answer_text, ...]} — every version, oldest first."""
+    rows = db.execute(
+        sqlalchemy.text(
+            "SELECT q.question_key, av.answer_text, av.version_number "
+            "FROM assessment_answer a "
+            "JOIN answer_version av ON av.answer_id = a.id "
+            "JOIN assessment_question q ON q.id = a.question_id "
+            "WHERE a.assessment_id = :aid "
+            "ORDER BY q.question_key, av.version_number"
+        ),
+        {"aid": assessment_id},
+    ).mappings().all()
+    filed: dict = {}
+    for row in rows:
+        filed.setdefault(row["question_key"], []).append(row["answer_text"])
+    return filed
+
+
+def test_two_interleaved_replies_ask_every_question_exactly_once(db, monkeypatch):
+    """The defect the whole-range review found, as a permanent test.
+
+    _session_by_id takes no lock, so two replies in flight for the same
+    questionnaire genuinely both read the same index — that read is what is
+    stale here, reproduced by handing every reply in this test the SAME
+    handle read once at index 0. Before the fix: reply A filed q0 and
+    advanced the row to 1; reply B filed against its stale 0 (q0 again) and
+    then advanced from the STORED 1 to 2. q1 was never asked, never
+    answered, and the session went on to report itself complete — a DPIA
+    filed under DPA 2019 s31 with a question silently blank.
+
+    Threads are not used deliberately: a genuine two-connection test has to
+    COMMIT for the second transaction to see the first, and nothing in this
+    suite is allowed to leave a row behind. What is actually under test is
+    not Postgres' lock but the composition — that the index an answer is
+    filed against and the index advanced from come from one authoritative
+    read taken after the lock — and a stale handle proves that directly.
+    """
+    assessment_id, questionnaire_id = _seeded_chat(db, monkeypatch, 3)
+    stale = _session_by_id(db, questionnaire_id)
+    assert stale.current_question_index == 0, "the read every reply below shares"
+
+    judged: list = []
+    asked: list = []
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat.judge_reply",
+        lambda question, reply, **kw: judged.append(question["question_key"]) or True,
+    )
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat.phrase_question",
+        lambda question, context, **kw: asked.append(question["question_key"])
+        or f"[phrased] {question['question_key']}",
+    )
+    # Every reply is handed the same index-0 handle — the shape an unlocked
+    # read produces when two replies are in flight at once.
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat._session_by_id",
+        lambda _db, _questionnaire_id: stale,
+    )
+
+    responses = [
+        reply_to_questionnaire_chat(
+            ChatReplyRequest(questionnaire_id=questionnaire_id, message_text=text),
+            db=db,
+            client=_fake_client("carol@example.com"),
+        )
+        for text in ("Reply A.", "Reply B.", "Reply C.")
+    ]
+
+    assert judged == ["q0", "q1", "q2"], (
+        "each reply must be judged against the question the session is "
+        f"actually on, in order: {judged}"
+    )
+    assert _filed(db, assessment_id) == {
+        "q0": ["Reply A."],
+        "q1": ["Reply B."],
+        "q2": ["Reply C."],
+    }, "every question answered exactly once, none skipped, none filed twice"
+    assert asked == ["q1", "q2"], (
+        f"every remaining question asked exactly once: {asked}"
+    )
+    assert [r.answered_questions for r in responses] == [1, 2, 3]
+    assert responses[-1].status == QuestionnaireSessionStatus.COMPLETED
+    assert _questionnaire_row(db, questionnaire_id)["current_question_index"] == 3
+
+
+def test_a_stale_reply_files_against_the_question_the_row_is_actually_on(
+    db, monkeypatch
+):
+    # The other half of the same defect: not just "no question skipped" but
+    # "no answer filed against the wrong question". The turn's lock is taken
+    # before the question is chosen, so a stale handle cannot cause the
+    # officer's words to be judged against q0 and filed against q1.
+    assessment_id, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
+    stale = _session_by_id(db, questionnaire_id)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE questionnaire SET current_question_index = 1 WHERE id = :i"
+        ),
+        {"i": questionnaire_id},
+    )
+    judged: list = []
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat.judge_reply",
+        lambda question, reply, **kw: judged.append(question["question_key"]) or True,
+    )
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat._session_by_id",
+        lambda _db, _questionnaire_id: stale,
+    )
+
+    reply_to_questionnaire_chat(
+        ChatReplyRequest(
+            questionnaire_id=questionnaire_id, message_text="The officer's words."
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert judged == ["q1"], "judged against the question the row is on"
+    assert _filed(db, assessment_id) == {"q1": ["The officer's words."]}
+
+
+# --- The whole-range review's MAJOR: a question id that will not resolve ---
+
+
+def _break_question_ids(db, questionnaire_id: str, question_ids: list) -> None:
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE questionnaire SET provider_context = CAST(:pc AS JSONB) "
+            "WHERE id = :i"
+        ),
+        {"pc": json.dumps({"question_ids": question_ids}), "i": questionnaire_id},
+    )
+
+
+def test_a_reply_skips_an_unresolvable_question_and_asks_the_next_one(db, monkeypatch):
+    # Before: current_question returned None for an unresolvable entry, the
+    # route read that as "session already complete", and that branch never
+    # advances. Every reply forever answered "the questionnaire is now
+    # complete" while the row sat at in_progress on the same index, with no
+    # answer ever fileable.
+    assessment_id, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
+    session = _session_by_id(db, questionnaire_id)
+    _break_question_ids(
+        db, questionnaire_id, ["q_deleted_since", session.question_ids[1]]
+    )
+
+    response = reply_to_questionnaire_chat(
+        ChatReplyRequest(
+            questionnaire_id=questionnaire_id, message_text="The officer's words."
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert _filed(db, assessment_id) == {"q1": ["The officer's words."]}, (
+        "the bad entry is skipped and the reply files against the next real "
+        "question, rather than stalling with nothing fileable"
+    )
+    assert response.status == QuestionnaireSessionStatus.COMPLETED
+    assert _questionnaire_row(db, questionnaire_id)["status"] == "completed"
+
+
+def test_a_question_on_another_template_does_not_500_the_reply(db, monkeypatch):
+    # write_answer raises QuestionNotInTemplateError — a ValueError, which
+    # the route catches nowhere — so a frozen question_ids entry that has
+    # drifted off the assessment's template used to be an uncaught 500 on
+    # every reply, at the same index, forever.
+    assessment_id, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
+    session = _session_by_id(db, questionnaire_id)
+    other_tid = _seed_template(db)
+    foreign = _seed_question(db, other_tid, "q_foreign", "necessity", 1)
+    db.flush()
+    _break_question_ids(db, questionnaire_id, [foreign, session.question_ids[1]])
+
+    response = reply_to_questionnaire_chat(
+        ChatReplyRequest(
+            questionnaire_id=questionnaire_id, message_text="The officer's words."
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert isinstance(response, ChatReplyResponse), "no 500, no ValueError"
+    assert _filed(db, assessment_id) == {"q1": ["The officer's words."]}
+
+
+def test_a_session_with_no_question_ids_at_all_does_not_stall_in_progress(
+    db, monkeypatch
+):
+    # provider_context is free-form JSONB on an Ethyca-authored table, so a
+    # questionnaire row carrying no question_ids key is reachable without
+    # this app ever writing one. The officer being told "complete" while the
+    # row says in_progress forever is the dead end; the row is reconciled.
+    _, questionnaire_id = _seeded_chat(db, monkeypatch, 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE questionnaire SET provider_context = CAST('{}' AS JSONB) "
+            "WHERE id = :i"
+        ),
+        {"i": questionnaire_id},
+    )
+
+    response = reply_to_questionnaire_chat(
+        ChatReplyRequest(questionnaire_id=questionnaire_id, message_text="Hello?"),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert response.status == QuestionnaireSessionStatus.COMPLETED
+    assert response.answered_questions == 0
+    assert response.total_questions == 0
+    assert _questionnaire_row(db, questionnaire_id)["status"] == "completed", (
+        "the bot said complete; the row must not still say in_progress"
+    )
+
+
+# --- The whole-range review's MAJOR: answered_questions is a count ---
+
+
+def test_answered_questions_counts_answers_not_the_cursor(db, monkeypatch):
+    # A session whose cursor has run ahead of the answers actually filed —
+    # the shape a skipped question leaves behind. answered_questions must
+    # follow answer_version, the same definition answered_count and
+    # completeness use, not the pointer.
+    _, questionnaire_id = _seeded_chat(db, monkeypatch, 3)
+    session = _session_by_id(db, questionnaire_id)
+    _break_question_ids(
+        db,
+        questionnaire_id,
+        ["q_deleted_since", session.question_ids[1], session.question_ids[2]],
+    )
+
+    response = reply_to_questionnaire_chat(
+        ChatReplyRequest(questionnaire_id=questionnaire_id, message_text="An answer."),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert _questionnaire_row(db, questionnaire_id)["current_question_index"] == 2
+    assert response.answered_questions == 1, (
+        "the cursor is at 2 because index 0 was skipped; only ONE answer has "
+        "been filed and that is what the officer is shown"
+    )
+    assert response.total_questions == 3
+
+
+def test_a_reply_after_a_nothing_pending_start_does_not_report_one_of_zero(
+    db, monkeypatch
+):
+    # No concurrency needed to see the old bug: start's nothing-pending
+    # branch advanced an empty question list, and the next reply reported
+    # "1 answered of 0".
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Nothing Pending Reply DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, "Answered before chat started.", "alice@example.com")
+    db.flush()
+    _no_commit(db, monkeypatch)
+    questionnaire_id = start_questionnaire_chat(
+        StartChatRequest(assessment_id=aid), db=db
+    ).questionnaire_id
+
+    response = reply_to_questionnaire_chat(
+        ChatReplyRequest(questionnaire_id=questionnaire_id, message_text="Anything?"),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert (response.answered_questions, response.total_questions) == (0, 0)
+
+
+# --- The whole-range review's MINOR: start is a read when it resumes ---
+
+
+def test_starting_twice_returns_the_transcript_without_re_asking(db, monkeypatch):
+    # A page refresh or a second tab used to grow the transcript — the audit
+    # artifact — by one bot turn per visit, and pay for a gateway completion
+    # each time.
+    calls: list = []
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat.phrase_question",
+        lambda question, context, **kw: calls.append(question["question_key"])
+        or f"[phrased] {question['question_key']}",
+    )
+    _, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
+    assert calls == ["q0"]
+
+    again = start_questionnaire_chat(
+        StartChatRequest(assessment_id=_session_by_id(db, questionnaire_id).assessment_id),
+        db=db,
+    )
+
+    assert again.questionnaire_id == questionnaire_id
+    assert calls == ["q0"], "resuming must not spend a second gateway call"
+    assert [m.text for m in again.messages] == ["[phrased] q0"], (
+        "resuming returns the transcript it found, not a second copy of the "
+        "question the officer is already looking at"
+    )
+    assert (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT COUNT(*) FROM chat_message WHERE questionnaire_id = :i"
+            ),
+            {"i": questionnaire_id},
+        ).scalar()
+        == 1
+    )
+
+
+def test_resuming_onto_a_question_nobody_has_asked_yet_does_ask_it(db, monkeypatch):
+    # The test is "has this index already been asked", not "is the transcript
+    # non-empty": a session resumed onto a question the officer has never
+    # seen must still be asked it.
+    calls: list = []
+    _, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
+    aid = _session_by_id(db, questionnaire_id).assessment_id
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE questionnaire SET current_question_index = 1 WHERE id = :i"
+        ),
+        {"i": questionnaire_id},
+    )
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat.phrase_question",
+        lambda question, context, **kw: calls.append(question["question_key"])
+        or f"[phrased] {question['question_key']}",
+    )
+
+    again = start_questionnaire_chat(StartChatRequest(assessment_id=aid), db=db)
+
+    assert calls == ["q1"]
+    assert [m.text for m in again.messages] == ["[phrased] q0", "[phrased] q1"]

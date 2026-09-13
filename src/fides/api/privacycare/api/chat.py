@@ -20,10 +20,10 @@ convention.
 A RULING from the task-2 review, not a stylistic choice: if the model
 wrongly judges a deflection as answered, a non-answer is filed silently —
 the worse of the two error directions a DPIA can make. The guard lives in
-the conversation, not the prompt: whenever record_answer actually files
-something, the very next bot message echoes the text just recorded, in
-quotes, so the officer sees what went in at the moment it happens rather
-than discovering it on review later. Because chat.record_answer's answer
+the conversation, not the prompt: whenever record_answer_and_advance
+actually files something, the very next bot message echoes the text just
+recorded, in quotes, so the officer sees what went in at the moment it
+happens rather than discovering it on review later. Because the answer
 chain is append-only (write_answer's own contract), a wrong echo is not a
 disaster either — the officer's correction becomes version 2 with both
 preserved.
@@ -50,10 +50,14 @@ from fides.api.privacycare.api.schemas import (
 from fides.api.privacycare.chat import (
     ChatSession,
     advance,
+    answered_count,
+    begin_turn,
     current_question,
     open_or_resume,
-    record_answer,
+    question_already_asked,
+    record_answer_and_advance,
     record_message,
+    skip_unresolvable_questions,
     transcript,
 )
 from fides.api.privacycare.chat_llm import judge_reply, phrase_question
@@ -174,24 +178,38 @@ def _start_chat(db: Session, request: StartChatRequest) -> StartChatResponse:
     permitted to invent content chat_llm.py wasn't asked to produce). An
     empty transcript on a session the caller can see is complete is
     neither.
+
+    RESUMING IS A READ. A second `start` on an already-open session — a page
+    refresh, a second tab, a client retry — returns the transcript it finds
+    and asks nothing: no phrase_question call billed, and no duplicate copy
+    of the question the officer is already looking at appended to the
+    transcript that IS the audit artifact for a document filed with a
+    regulator. The test is whether a bot turn already exists for the
+    session's CURRENT question index (question_already_asked), not whether
+    the transcript is non-empty — a session resumed onto a question nobody
+    has asked yet, because the entries before it were skipped as
+    unresolvable, still gets asked.
     """
     session = open_or_resume(db, request.assessment_id, request.include_question_ids)
+    session = skip_unresolvable_questions(db, session)
     question = current_question(db, session)
 
     if question is None:
-        session = advance(db, session)
-        return StartChatResponse(
-            questionnaire_id=session.id,
-            assessment_id=session.assessment_id,
-            messages=[],
-            total_questions=len(session.question_ids),
+        # Genuinely past the end: skip_unresolvable_questions above has
+        # already moved the cursor off any entry that merely failed to
+        # resolve, so the two are no longer confusable here.
+        if session.status != "completed":
+            session = advance(db, session, from_index=session.current_question_index)
+    elif not question_already_asked(db, session.id, session.current_question_index):
+        context = _context_for(db, session.assessment_id)
+        text = phrase_question(question, context)
+        record_message(
+            db,
+            session.id,
+            text,
+            is_bot=True,
+            question_index=session.current_question_index,
         )
-
-    context = _context_for(db, session.assessment_id)
-    text = phrase_question(question, context)
-    record_message(
-        db, session.id, text, is_bot=True, question_index=session.current_question_index
-    )
 
     messages = [_chat_message_from_row(row) for row in transcript(db, session.id)]
     return StartChatResponse(
@@ -205,7 +223,7 @@ def _start_chat(db: Session, request: StartChatRequest) -> StartChatResponse:
 def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReplyResponse:
     """Persist the officer's message, judge it, and respond.
 
-    Answered: record_answer files it verbatim, advance() moves the
+    Answered: record_answer_and_advance files it verbatim and moves the
     session on, and the FIRST bot message echoes the recorded text back —
     the task-2 review's ruling, not optional (see this module's own
     docstring). The second bot message is whatever comes next: the
@@ -223,8 +241,20 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
     actually gets a value (clock_timestamp(), stamped by the INSERT
     itself), and re-deriving that here would either invent a timestamp or
     leave it null for no reason.
+
+    THE LOCK IS TAKEN HERE, at the start of the turn — begin_turn, before
+    current_question, not deep inside record_answer where the increment
+    happens. _session_by_id's read is unlocked, so two in-flight replies
+    both saw the same index; the first filed and advanced, and the second
+    filed against its stale index and then advanced from the stored one,
+    skipping the question in between and reporting the session complete
+    with it blank. Everything this function does after begin_turn — which
+    question is phrased, which question the judgement is about, which
+    question the answer is filed against, and which index is advanced from
+    — derives from that one read. See chat.begin_turn.
     """
-    session = _session_by_id(db, request.questionnaire_id)
+    session = begin_turn(db, _session_by_id(db, request.questionnaire_id))
+    session = skip_unresolvable_questions(db, session)
     question = current_question(db, session)
 
     record_message(
@@ -242,17 +272,34 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
     bot_turns: list[tuple[str, int | None]] = []
 
     if question is None:
-        # The session was already complete before this message arrived (a
-        # stray extra reply after the last question was answered). Nothing
-        # to judge it against; just say so.
+        # The session really is past its last question (a stray extra reply
+        # after the last one was answered). This branch used to also catch
+        # "the current entry did not resolve", which never advances — so the
+        # officer was told the questionnaire was complete on every reply
+        # forever while the row sat at in_progress on the same index.
+        # skip_unresolvable_questions above now moves the cursor off those,
+        # so reaching here means past-the-end and nothing else.
+        #
+        # Past the end and still in_progress is reconcilable and is
+        # reconciled: a session whose question_ids were empty from the
+        # start (provider_context is free-form JSONB on an Ethyca-authored
+        # table and this app is not the only thing that may write it), or
+        # whose every entry was skipped above, would otherwise be told it
+        # was complete by the bot on every reply while the row said
+        # in_progress forever. The row is made to agree with what the
+        # officer is being told.
+        if session.status != "completed":
+            session = advance(db, session, from_index=session.current_question_index)
         bot_turns.append((_SESSION_COMPLETE_MESSAGE, None))
     elif judge_reply(question, request.message_text):
         answered_index = session.current_question_index
-        record_answer(db, session, request.message_text, created_by)
-        session = advance(db, session)
+        session = record_answer_and_advance(
+            db, session, request.message_text, created_by
+        )
         bot_turns.append(
             (f'Recorded as your answer: "{request.message_text}"', answered_index)
         )
+        session = skip_unresolvable_questions(db, session)
         next_question = current_question(db, session)
         if next_question is not None:
             context = _context_for(db, session.assessment_id)
@@ -279,7 +326,11 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
     return ChatReplyResponse(
         bot_messages=bot_messages,
         status=session.status,
-        answered_questions=session.current_question_index,
+        # A COUNT of this session's questions that actually hold a complete
+        # answer, not the cursor — see chat._ANSWERED_IN_SESSION_SQL. The
+        # cursor is what a DPO used to be shown as "how much of my DPIA is
+        # done", and it overstated whenever an entry was skipped.
+        answered_questions=answered_count(db, session),
         total_questions=len(session.question_ids),
     )
 
