@@ -121,6 +121,16 @@ def register() -> None:
     importlib.import_module("fides.api.privacycare.api.assessments")
     importlib.import_module("fides.api.privacycare.api.processes")
 
+    # api/reports.py (task 3, config-and-pdf plan) binds GET
+    # "/{assessment_id}/pdf" on this SAME privacycare_router — but as a
+    # TWO-segment path. Starlette matches a route by its whole path
+    # template, so a two-segment request path can never match "/tasks",
+    # "/config" or "/{assessment_id}" (all one segment) and vice versa:
+    # this import carries none of the ordering hazard the comment above
+    # documents for tasks/config/assessments, and is placed after them only
+    # so a reader sees the whole "/{assessment_id}*" family together.
+    importlib.import_module("fides.api.privacycare.api.reports")
+
     # chat.py decorates its OWN router (privacycare_chat_router, a distinct
     # prefix), so it carries none of the tasks-vs-assessments matching-order
     # hazard above — nothing here is registered against privacycare_router.

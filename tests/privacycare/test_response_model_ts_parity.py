@@ -164,6 +164,25 @@ ALLOWLIST: dict[str, dict] = {
             "carries its own parity tests in test_api_schemas.py."
         ),
     },
+    "bytes": {
+        "ts_name": None,
+        "reason": (
+            "Task 3 (config-and-pdf plan): GET .../{assessment_id}/pdf "
+            "(api/reports.py) returns a raw PDF binary body via "
+            "fastapi.Response(media_type='application/pdf'), not JSON. It "
+            "declares response_model=bytes only so "
+            "test_every_route_has_a_response_model_declared_or_inferred "
+            "(test_api_registration.py) still passes — same precedent as "
+            "DeletePrivacyAssessmentResponse above. Returning a Response "
+            "instance directly bypasses response_model serialization "
+            "entirely, so `bytes` is never actually validated against and "
+            "has no TypeScript counterpart to be in parity with. (In "
+            "practice `bytes` is not even a BaseModel subclass, so "
+            "_discover_models never adds it to the walk at all — this "
+            "entry exists for the same documentation reason as the others, "
+            "not because a test would otherwise fail without it.)"
+        ),
+    },
 }
 
 

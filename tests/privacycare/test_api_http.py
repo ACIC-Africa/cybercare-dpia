@@ -36,6 +36,8 @@ GET_ROUTE_SUFFIXES = [
     # split every PUT/DELETE route on this surface already sits outside it.
     "/config",
     "/config/defaults",
+    # The PDF export route (task 3, config-and-pdf plan).
+    f"/{_ASSESSMENT_ID}/pdf",
 ]
 
 

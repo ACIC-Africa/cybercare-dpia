@@ -27,6 +27,10 @@ EXPECTED_READ_SUFFIXES = {
     # that path" precedent as "/{assessment_id}" above (GET+PUT+DELETE).
     "/config",
     "/config/defaults",
+    # The PDF export route (task 3, config-and-pdf plan). Two path segments
+    # — see api/router.py's comment on api/reports.py's import for why it
+    # cannot collide with "/{assessment_id}" above.
+    "/{assessment_id}/pdf",
 }
 
 PRIVACYCARE_PATH_PREFIX = PRIVACYCARE_PREFIX
