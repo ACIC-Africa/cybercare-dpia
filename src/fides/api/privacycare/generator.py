@@ -301,8 +301,15 @@ _TRAILING_PUNCTUATION = " \t\r\n.!?:;,-–—…\"\'`)]}*"
 _SENTINEL_DECORATION = _TRAILING_PUNCTUATION + "*`'\"-–—[](){}<>#: \t"
 
 
-def _is_decline(reply: str) -> bool:
-    """Did the model say it cannot answer this from the record?
+def _is_decline(reply: str, sentinel: str = NEEDS_INPUT_SENTINEL) -> bool:
+    """Did the model reply with its one sanctioned sentinel, decoration and all?
+
+    `sentinel` defaults to NEEDS_INPUT_SENTINEL (this module's own use, in
+    draft_with_llm below) but is a parameter, not a hardcoded name, so the
+    same decoration-stripping can be shared rather than re-derived: this is
+    the shape chat_llm.judge_reply reuses verbatim for NOT_ANSWERED, because
+    a model that wraps ITS sentinel in "**...**" or a trailing full stop
+    will do the same to any other one-word sentinel it is asked to return.
 
     The sentinel is the ONLY thing standing between the gateway and a filed
     DPIA answer: there is no post-hoc grounding check and no confidence
@@ -338,13 +345,13 @@ def _is_decline(reply: str) -> bool:
     if not stripped:
         return True
     # Shape 1: the sentinel alone, once decoration is removed.
-    if stripped == NEEDS_INPUT_SENTINEL:
+    if stripped == sentinel:
         return True
     # Shape 2: the sentinel, then the model explaining itself. Only counts
     # when the sentinel ends where a word ends — see the docstring.
-    if not stripped.startswith(NEEDS_INPUT_SENTINEL):
+    if not stripped.startswith(sentinel):
         return False
-    rest = stripped[len(NEEDS_INPUT_SENTINEL) :]
+    rest = stripped[len(sentinel) :]
     return not (rest[0].isalnum() or rest[0] == "_")
 
 
