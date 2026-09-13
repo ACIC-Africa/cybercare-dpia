@@ -320,7 +320,14 @@ def test_content_disposition_filename_survives_the_admin_uis_exact_regex(db):
     # The sanitiser's concrete output for this exact awkward name — pinned
     # so a future change to the sanitiser is a deliberate decision, not an
     # accident nobody notices.
-    assert filename == "Data Protection Impact Assessment Fuel Card CRM review.pdf"
+    # The assessment id is appended deliberately: a title in a non-Latin
+    # script sanitises to the generic fallback, and without the id a DPO
+    # exporting several such assessments would get several identically named
+    # files, each overwriting the last. See _report_filename.
+    assert filename.startswith(
+        "Data Protection Impact Assessment Fuel Card CRM review-"
+    )
+    assert filename.endswith(".pdf")
 
 
 def test_sanitize_filename_never_reintroduces_the_excluded_characters():
@@ -339,3 +346,26 @@ def test_sanitize_filename_never_reintroduces_the_excluded_characters():
         assert ";" not in result
         assert "\n" not in result
         assert result != ""
+
+
+def test_a_non_latin_title_still_yields_a_distinguishable_filename(db, monkeypatch):
+    # The sanitiser keeps only Latin letters and a few marks, so a title in
+    # another script collapses to the generic fallback. This product ships
+    # into Kenya: a DPO exporting several assessments named in Swahili or
+    # Arabic would get several files all called assessment-report.pdf, each
+    # silently overwriting the last in their downloads folder.
+    from fides.api.privacycare.api.reports import _report_filename
+
+    class _R:
+        title = "تقييم الأثر"
+
+    first = _report_filename(_R(), "pa_aaaaaaaaaaaa")
+    second = _report_filename(_R(), "pa_bbbbbbbbbbbb")
+
+    assert first != second, (
+        f"two differently-identified assessments produced the same filename: {first}"
+    )
+    assert "pa_aaaaaaaaaaaa" in first
+    assert _ADMIN_UI_FILENAME_REGEX.search(f'attachment; filename="{first}.pdf"'), (
+        "the disambiguated filename no longer survives the UI's own regex"
+    )

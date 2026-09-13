@@ -60,6 +60,22 @@ def _sanitize_filename(text: str) -> str:
     return cleaned or "assessment-report"
 
 
+def _report_filename(report, assessment_id: str) -> str:
+    """The download filename, always carrying something that identifies WHICH
+    assessment this is.
+
+    The sanitiser above keeps only Latin letters, digits and a few
+    punctuation marks, so a title written in a non-Latin script collapses to
+    the generic fallback. That is not hypothetical for this product: it ships
+    into Kenya, and a DPO exporting several assessments named in Swahili or
+    Arabic would get several files all called assessment-report.pdf, each
+    silently overwriting the last in the browser's download folder.
+    Appending the assessment id costs nothing and makes every export
+    distinguishable and traceable back to its row.
+    """
+    return f"{_sanitize_filename(report.title)}-{_sanitize_filename(assessment_id)}"
+
+
 @privacycare_router.get(
     "/{assessment_id}/pdf",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
@@ -117,7 +133,7 @@ def get_assessment_pdf(
             detail=str(exc),
         )
 
-    filename = f"{_sanitize_filename(report.title)}.pdf"
+    filename = f"{_report_filename(report, assessment_id)}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
