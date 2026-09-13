@@ -7,8 +7,9 @@
 #   1. THE LAZY IMPORT — test_reportlab_is_never_imported_at_module_scope
 #      (static) and test_a_broken_reportlab_import_surfaces_as_... (dynamic).
 #   2. THE FONT — test_missing_font_raises_pdfrendererror_instead_of_...,
-#      test_locate_font_file_finds_dejavu_sans_on_this_host, and the glyph
-#      round-trip test.
+#      the three package-data tests (the font must come out of the
+#      installed distribution, not off this host — see their own
+#      docstrings), and the glyph round-trip test.
 #   3. THE FILENAME —
 #      test_content_disposition_filename_survives_the_admin_uis_exact_regex.
 #
@@ -16,10 +17,18 @@
 # pypdf and checks it is actually there — never `len(pdf_bytes) > 0`, never
 # a mocked call.
 import ast
+import builtins
+import glob
 import inspect
 import io
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tomllib
+from importlib import resources
+from pathlib import Path
 
 import pytest
 import sqlalchemy
@@ -31,7 +40,6 @@ from fides.api.privacycare.api import reports as reports_module
 from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.api.reports import _sanitize_filename, get_assessment_pdf
 from fides.api.privacycare.pdf import PDFRenderError, render_pdf
-from fides.api.privacycare.pdf import _locate_font_file as locate_font_file
 from fides.api.privacycare.report import Report, build_report
 from tests.privacycare.test_api_assessments import (
     _seed_assessment,
@@ -125,28 +133,160 @@ def test_a_broken_reportlab_import_surfaces_as_pdfrendererror(monkeypatch):
 # ── 2. The font ──────────────────────────────────────────────────────────
 
 
-def test_locate_font_file_finds_dejavu_sans_on_this_host():
-    path = locate_font_file("DejaVuSans.ttf")
-    assert path is not None, "DejaVu Sans should be installed on this host"
-    assert path.endswith("DejaVuSans.ttf")
-    import os
+# Directories a host keeps fonts in. The font this document is set in must
+# come from NONE of them: the image PrivacyCare ships as
+# (python-slim-bookworm plus curl/git/freetds) has no fontconfig and no
+# DejaVu face, so a font found here is a font the deployment will not have.
+_SYSTEM_FONT_DIRS = (
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/usr/share/fonts/truetype",
+    os.path.expanduser("~/.fonts"),
+    os.path.expanduser("~/.local/share/fonts"),
+)
 
-    assert os.path.isfile(path)
+
+def test_the_font_is_package_data_and_not_a_host_install():
+    """The test that would have caught the 503.
+
+    The previous version of this file asserted that DejaVu Sans was
+    installed ON THIS HOST — which is true of a developer laptop and false
+    of every deployment, so it passed while the shipped product returned
+    503 for every export. What has to be true instead is that the font
+    resolves out of the INSTALLED PACKAGE: same file, wherever
+    ethyca-fides is installed, with nothing on the host consulted.
+    """
+    import fides.api.privacycare.pdf as pdf_module
+
+    package_dir = Path(pdf_module.__file__).resolve().parent
+
+    for filename in (pdf_module._REGULAR_FONT_FILE, pdf_module._BOLD_FONT_FILE):
+        resource = pdf_module._vendored_font(filename)
+        assert resource is not None, f"{filename} is not shipped as package data"
+        assert resource.is_file()
+        assert resource.read_bytes()[:4] in (b"\x00\x01\x00\x00", b"true"), (
+            f"{filename} does not look like a real TrueType file"
+        )
+
+        resolved = str(resources.files(pdf_module._FONT_PACKAGE).joinpath(filename))
+        assert str(package_dir) in resolved, (
+            f"{filename} resolved to {resolved}, which is outside the "
+            f"privacycare package at {package_dir}"
+        )
+        for system_dir in _SYSTEM_FONT_DIRS:
+            assert not resolved.startswith(system_dir), (
+                f"{filename} resolved to a HOST font at {resolved} — the "
+                "deployment image has no such file"
+            )
+
+
+def test_font_resolution_consults_no_fc_list_and_no_system_font_directory():
+    """Behavioural half of the test above: with every route off this
+    process blocked, the font must still register.
+
+    Blocks the ways the old implementation reached the host — a
+    subprocess (`fc-list`), a PATH lookup, a filesystem walk/glob — and
+    additionally fails the test if ANY system font directory is opened.
+    Mutation-checked: restoring the fc-list lookup makes this raise.
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    import fides.api.privacycare.pdf as pdf_module
+
+    real_open = builtins.open
+
+    def _no_host_fonts(file, *args, **kwargs):
+        path = str(file)
+        for system_dir in _SYSTEM_FONT_DIRS:
+            assert not path.startswith(system_dir), (
+                f"the renderer opened a HOST font file: {path}"
+            )
+        return real_open(file, *args, **kwargs)
+
+    def _blocked(*args, **kwargs):
+        raise AssertionError(
+            f"font resolution shelled out to / searched the host: args={args!r}"
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(builtins, "open", _no_host_fonts)
+        mp.setattr(subprocess, "run", _blocked)
+        mp.setattr(subprocess, "Popen", _blocked)
+        mp.setattr(subprocess, "check_output", _blocked)
+        mp.setattr(os, "popen", _blocked)
+        mp.setattr(os, "walk", _blocked)
+        mp.setattr(shutil, "which", _blocked)
+        mp.setattr(glob, "glob", _blocked)
+        mp.setattr(glob, "iglob", _blocked)
+
+        regular, bold = pdf_module._register_unicode_font(pdfmetrics, TTFont)
+
+    assert regular == pdf_module._FONT_NAME
+    assert bold == pdf_module._FONT_NAME_BOLD
+
+
+def test_pdf_py_imports_nothing_that_can_reach_the_host_for_a_font():
+    """Static guard on the same property, so the seam cannot reopen
+    quietly: pdf.py must not import subprocess/shutil/glob at all, and
+    must contain no system font path.
+    """
+    import fides.api.privacycare.pdf as pdf_module
+
+    source = inspect.getsource(pdf_module)
+    tree = ast.parse(source)
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append((node.module or "").split(".")[0])
+
+    for forbidden in ("subprocess", "shutil", "glob"):
+        assert forbidden not in imported, (
+            f"pdf.py imports {forbidden} — the font must come from package "
+            "data, never from a host lookup"
+        )
+
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    for system_dir in ("/usr/share/fonts", "fc-list"):
+        assert system_dir not in code, f"pdf.py's code references {system_dir!r}"
+
+
+def test_the_font_files_are_declared_as_packaging_artifacts():
+    """The font is only useful if it survives the build. Both the wheel
+    and the sdist must name it explicitly — relying on "hatchling includes
+    everything under packages" is what a future exclusion rule would
+    silently break, and the failure mode is a 503 on every export, in
+    production only.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    config = tomllib.loads((repo_root / "pyproject.toml").read_text())
+    targets = config["tool"]["hatch"]["build"]["targets"]
+
+    for target in ("wheel", "sdist"):
+        artifacts = targets[target]["artifacts"]
+        assert any(
+            "privacycare/fonts" in entry and entry.endswith(".ttf")
+            for entry in artifacts
+        ), f"the {target} build does not declare the PrivacyCare font files"
 
 
 def test_missing_font_raises_pdfrendererror_instead_of_a_silent_fallback(
     monkeypatch,
 ):
     """The bar the brief sets: "fail loudly ... do not fall back to a
-    built-in font, because that failure is invisible." Forcing
-    _locate_font_file to find nothing must raise PDFRenderError, never
-    quietly proceed with a ReportLab built-in font.
+    built-in font, because that failure is invisible." A distribution
+    built without its font data must raise PDFRenderError, never quietly
+    proceed with a ReportLab built-in font.
     """
     import fides.api.privacycare.pdf as pdf_module
 
-    monkeypatch.setattr(pdf_module, "_locate_font_file", lambda suffix: None)
+    monkeypatch.setattr(pdf_module, "_vendored_font", lambda filename: None)
 
-    with pytest.raises(PDFRenderError, match="Unicode"):
+    with pytest.raises(PDFRenderError, match="missing from the installed package"):
         pdf_module.render_pdf(_empty_report())
 
 
@@ -269,9 +409,7 @@ def test_unknown_assessment_maps_to_404(db):
     assert "no-such-assessment" in exc_info.value.detail
 
 
-def test_pdf_render_error_maps_to_a_503_whose_detail_names_the_cause(
-    db, monkeypatch
-):
+def test_pdf_render_error_maps_to_a_503_whose_detail_names_the_cause(db, monkeypatch):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Broken Renderer DPIA")
     db.flush()

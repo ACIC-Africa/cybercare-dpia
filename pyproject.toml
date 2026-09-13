@@ -192,15 +192,31 @@ packages = ["src/fides"]
 # Ensure that the "ui-build" folder is included in wheel and sdist; it is
 # populated by our clients/admin-ui build process to allow the Admin UI app to
 # be distributed as part of the ethyca-fides Python package.
-artifacts = ["src/fides/ui-build"]
+#
+# The PrivacyCare fonts are package DATA the DPIA PDF cannot render without:
+# fides/api/privacycare/pdf.py reads DejaVuSans*.ttf out of the installed
+# package and refuses to fall back to a built-in font. Listed explicitly as
+# an artifact (rather than relied on as "hatchling includes everything under
+# packages") so a build cannot silently drop the binary files and turn every
+# PDF export into a 503. See src/fides/api/privacycare/fonts/LICENSE.txt.
+artifacts = [
+    "src/fides/ui-build",
+    "src/fides/api/privacycare/fonts/*.ttf",
+    "src/fides/api/privacycare/fonts/LICENSE.txt",
+]
 # Bundle policy-engine Go source so downstream consumers can build libpbac
 # from the same fides commit they installed.
 [tool.hatch.build.targets.wheel.force-include]
 "policy-engine" = "fides/policy-engine"
 
 [tool.hatch.build.targets.sdist]
-# Ensure that the "ui-build" folder is included in wheel and sdist (see above)
-artifacts = ["src/fides/ui-build"]
+# Ensure that the "ui-build" folder and the PrivacyCare fonts are included in
+# wheel and sdist (see above)
+artifacts = [
+    "src/fides/ui-build",
+    "src/fides/api/privacycare/fonts/*.ttf",
+    "src/fides/api/privacycare/fonts/LICENSE.txt",
+]
 
 # Constrain setuptools for build isolation so legacy deps get pkg_resources (e.g. in docs image).
 [tool.uv]

@@ -24,12 +24,24 @@
 #    verbatim, for a regulator; "CO<sub>2</sub>", "m<super>2</super>", a
 #    currency symbol, or a Kenyan name with a diacritic corrupting into a
 #    black box would be invisible until someone opened the PDF by eye. A
-#    TrueType font with real Unicode coverage (DejaVu Sans, located via
-#    fc-list rather than a hardcoded path — see _locate_font_file) is
-#    registered and used for ALL body text; if none is found, this module
-#    fails loudly (PDFRenderError) rather than falling back to a built-in
-#    font, because that fallback is exactly the invisible failure being
-#    guarded against.
+#    TrueType font with real Unicode coverage (DejaVu Sans) is registered
+#    and used for ALL body text; if it cannot be loaded, this module fails
+#    loudly (PDFRenderError) rather than falling back to a built-in font,
+#    because that fallback is exactly the invisible failure being guarded
+#    against.
+#
+#    THE FONT IS VENDORED, not located on the host. An earlier revision
+#    shelled out to `fc-list` and searched the host's installed fonts. That
+#    made the document depend on a system package and a system tool — the
+#    exact dependency class D-PDF-1 rejected WeasyPrint to avoid — and the
+#    image this product ships as (python-slim-bookworm plus curl, git and
+#    freetds; Dockerfile) carries neither fontconfig nor any DejaVu face.
+#    Every export in every real deployment therefore 503'd, while the tests
+#    passed because the developer host happened to have DejaVu installed: a
+#    test that passes because of the HOST is worth nothing. The .ttf now
+#    ships inside this package (fonts/, with its licence) and is read
+#    through importlib.resources relative to this module — no `fc-list`, no
+#    filesystem search, nothing outside the installed distribution.
 #
 # 3. THE FILENAME. api/reports.py sanitises the officer-supplied assessment
 #    name before it reaches Content-Disposition; this module has no part in
@@ -39,11 +51,15 @@
 #    distrusted in the HEADER.
 from __future__ import annotations
 
-import os
-import subprocess
+import io
+from importlib import resources
+from typing import TYPE_CHECKING
 from xml.sax.saxutils import escape as xml_escape
 
 from fides.api.privacycare.report import Report, ReportQuestion, ReportSection
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from importlib.resources.abc import Traversable
 
 
 class PDFRenderError(Exception):
@@ -64,40 +80,31 @@ _FONT_NAME = "PrivacyCareBody"
 _FONT_NAME_BOLD = "PrivacyCareBody-Bold"
 
 
-def _locate_font_file(filename_suffix: str) -> str | None:
-    """Find a font file on this host by filename suffix, via `fc-list`.
+# The font files vendored into this package (fonts/, alongside their
+# licence), and the package path they are read from. A PACKAGE path, not a
+# filesystem path: importlib.resources resolves it relative to this
+# installed module, so it is found wherever the distribution is installed
+# and cannot be satisfied — or defeated — by anything on the host.
+_FONT_PACKAGE = "fides.api.privacycare.fonts"
+_REGULAR_FONT_FILE = "DejaVuSans.ttf"
+_BOLD_FONT_FILE = "DejaVuSans-Bold.ttf"
 
-    Deliberately not a hardcoded path (the brief: "locate it rather than
-    assuming a path"). `fc-list` prints "<path>: <family>:style=<style>" per
-    installed font, one per face — this host has 8 DejaVu faces registered
-    that way. Matching on the TTF's own filename (e.g. "DejaVuSans.ttf",
-    "DejaVuSans-Bold.ttf") rather than the family name fc-list reports is
-    robust to a host where DejaVu is installed but not fontconfig's default
-    match for "sans-serif", and to fc-list's family/style text differing
-    slightly across fontconfig versions.
 
-    Returns None (never raises) on any failure to run fc-list or find a
-    match — the caller (_register_unicode_font) is what decides that's fatal
-    and raises PDFRenderError with a message actionable by whoever deploys
-    this.
+def _vendored_font(filename: str) -> "Traversable | None":
+    """The vendored font file `filename` as an importlib.resources
+    Traversable, or None if this distribution does not carry it.
+
+    None means the package was built without its font data (see
+    pyproject.toml's wheel/sdist `artifacts` entries, which exist to stop
+    exactly that) — a packaging failure, not a host configuration the
+    deployer can fix. Never raises; _register_unicode_font is what decides
+    that a missing regular face is fatal.
     """
     try:
-        result = subprocess.run(
-            ["fc-list"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        resource = resources.files(_FONT_PACKAGE).joinpath(filename)
+        return resource if resource.is_file() else None
+    except (ModuleNotFoundError, OSError):
         return None
-    if result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        path = line.split(":", 1)[0].strip()
-        if path.endswith(filename_suffix) and os.path.isfile(path):
-            return path
-    return None
 
 
 def _register_unicode_font(pdfmetrics, ttfont_cls) -> tuple[str, str]:
@@ -106,35 +113,45 @@ def _register_unicode_font(pdfmetrics, ttfont_cls) -> tuple[str, str]:
     FAMILY so that `<b>`/`<strong>` markup inside a Paragraph resolves to
     the real bold face rather than a synthetically slanted regular one.
 
-    Raises PDFRenderError — never falls back to a ReportLab built-in font —
-    if the regular face cannot be found. See the module docstring, point 2,
-    for why a silent fallback here is exactly the failure mode this
-    function exists to prevent.
-    """
-    regular_path = _locate_font_file("DejaVuSans.ttf")
-    if regular_path is None:
-        raise PDFRenderError(
-            "No Unicode-capable TrueType font found on this host (looked "
-            "for DejaVuSans.ttf via `fc-list`). Refusing to fall back to a "
-            "ReportLab built-in Type 1 font: those silently render "
-            "subscript/superscript, non-Latin and currency glyphs as solid "
-            "black boxes instead of raising, which is unacceptable for a "
-            "document filed with a regulator. Install a DejaVu Sans "
-            "TrueType font (e.g. the fonts-dejavu-core / ttf-dejavu "
-            "package) on this host and retry."
-        )
-    bold_path = _locate_font_file("DejaVuSans-Bold.ttf")
+    Reads the font out of this package's own data (see _vendored_font);
+    it consults nothing on the host. Raises PDFRenderError — never falls
+    back to a ReportLab built-in font — if the regular face cannot be
+    loaded. See the module docstring, point 2, for why a silent fallback
+    here is exactly the failure mode this function exists to prevent.
 
-    pdfmetrics.registerFont(ttfont_cls(_FONT_NAME, regular_path))
-    if bold_path is not None:
-        pdfmetrics.registerFont(ttfont_cls(_FONT_NAME_BOLD, bold_path))
+    The .ttf bytes are handed to TTFont as a file object rather than a
+    path: a Traversable is not guaranteed to have a filesystem path at all
+    (a zip-imported distribution has none), and reading it is the one
+    access that works for every installation shape.
+    """
+    regular = _vendored_font(_REGULAR_FONT_FILE)
+    if regular is None:
+        raise PDFRenderError(
+            f"The Unicode font this document is set in ({_REGULAR_FONT_FILE}) "
+            f"is missing from the installed package ({_FONT_PACKAGE}). "
+            "Refusing to fall back to a ReportLab built-in Type 1 font: "
+            "those silently render subscript/superscript, non-Latin and "
+            "currency glyphs as solid black boxes instead of raising, which "
+            "is unacceptable for a document filed with a regulator. The font "
+            "ships as package data, so this is a broken/incomplete install "
+            "of ethyca-fides rather than anything missing on this host — "
+            "reinstall the package."
+        )
+    bold = _vendored_font(_BOLD_FONT_FILE)
+
+    pdfmetrics.registerFont(ttfont_cls(_FONT_NAME, io.BytesIO(regular.read_bytes())))
+    if bold is not None:
+        pdfmetrics.registerFont(
+            ttfont_cls(_FONT_NAME_BOLD, io.BytesIO(bold.read_bytes()))
+        )
         bold_name = _FONT_NAME_BOLD
     else:
         # Bold face missing but regular found: still real Unicode coverage,
         # just no bold weight. Register the family pointing bold at the
         # regular face rather than failing — headings render un-bold
         # instead of as black boxes, which is a cosmetic loss, not a
-        # correctness one.
+        # correctness one. (Both faces are vendored, so this branch is
+        # reachable only from a partial install.)
         bold_name = _FONT_NAME
 
     pdfmetrics.registerFontFamily(
@@ -178,8 +195,6 @@ def render_pdf(report: Report) -> bytes:
     exception type to map to a 503.
     """
     try:
-        import io
-
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -297,7 +312,10 @@ def render_pdf(report: Report) -> bytes:
         story: list = [Paragraph(_escaped(report.title), title_style)]
 
         meta_rows = [
-            [Paragraph(_escaped(label), meta_style), Paragraph(_escaped(value), meta_style)]
+            [
+                Paragraph(_escaped(label), meta_style),
+                Paragraph(_escaped(value), meta_style),
+            ]
             for label, value in report.metadata
         ]
         meta_table = Table(meta_rows, colWidths=[40 * mm, 130 * mm])
