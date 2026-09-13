@@ -546,6 +546,60 @@ def test_sanitize_filename_never_reintroduces_the_excluded_characters():
         assert result != ""
 
 
+def test_a_long_assessment_name_cannot_produce_an_unsaveable_filename(db):
+    """An assessment name is officer-supplied free text with no length
+    limit. A 300-character name produced a 354-character filename — past
+    the 255-BYTE cap on ext4, NTFS and APFS, where the browser truncates
+    or fails the save outright. The UI's regex extracts it happily, so
+    nothing upstream catches this.
+    """
+    from fides.api.privacycare.api.reports import _report_filename
+
+    class _R:
+        title = "Data Protection Impact Assessment: " + ("Fuel Card Review " * 20)
+
+    filename = f"{_report_filename(_R(), 'pa_e5704ed3d717')}.pdf"
+
+    assert len(filename.encode("utf-8")) <= 255, len(filename)
+    # The id survives whole, at the end, where it keeps exports apart.
+    assert filename.endswith("-pa_e5704ed3d717.pdf")
+    assert _ADMIN_UI_FILENAME_REGEX.search(f'attachment; filename="{filename}"')
+
+
+def test_two_long_names_that_differ_only_past_the_cut_still_differ(db):
+    """Truncation must not become the new collision: the id is what makes
+    two exports distinguishable, and it is appended after the cut.
+    """
+    from fides.api.privacycare.api.reports import _report_filename
+
+    class _First:
+        title = "A" * 300 + " first"
+
+    class _Second:
+        title = "A" * 300 + " second"
+
+    first = _report_filename(_First(), "pa_aaaaaaaaaaaa")
+    second = _report_filename(_Second(), "pa_bbbbbbbbbbbb")
+
+    assert first != second
+    assert len(f"{first}.pdf".encode("utf-8")) <= 255
+    assert first.endswith("-pa_aaaaaaaaaaaa")
+
+
+def test_the_route_itself_caps_the_filename_it_sends(db):
+    # Through the real route and the real header, not just the helper.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Fuel Card Review " * 20)
+    db.flush()
+
+    response = get_assessment_pdf(aid, db=db)
+    disposition = response.headers["content-disposition"]
+    filename = _ADMIN_UI_FILENAME_REGEX.search(disposition).group(1)
+
+    assert len(filename.encode("utf-8")) <= 255, disposition
+    assert filename.endswith(f"-{aid}.pdf")
+
+
 def test_a_non_latin_title_still_yields_a_distinguishable_filename(db, monkeypatch):
     # The sanitiser keeps only Latin letters and a few marks, so a title in
     # another script collapses to the generic fallback. This product ships

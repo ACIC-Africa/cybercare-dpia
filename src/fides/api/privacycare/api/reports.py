@@ -44,6 +44,18 @@ from fides.common.scope_registry import SYSTEM_READ
 # guess at what it accepts.
 _FILENAME_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9 ._-]+")
 
+# ext4, NTFS and APFS all cap a single filename at 255 BYTES. _sanitize_filename
+# keeps only ASCII characters, so for this filename bytes and characters are the
+# same count and a plain slice is safe (there is no multi-byte sequence for it to
+# cut in half). An assessment name is officer-supplied free text with no length
+# limit of its own: a 300-character name produced a 354-character filename, which
+# the admin UI's regex extracts intact and the browser then truncates or fails to
+# save. The title is cut well short of the limit so that the assessment id — the
+# part that makes one export distinguishable from another — always survives whole
+# at the END of the name, where a reader can find it.
+_FILENAME_MAX_CHARS = 255 - len(".pdf")
+_TITLE_MAX_CHARS = 120
+
 
 def _sanitize_filename(text: str) -> str:
     """A safe, non-empty base filename (without extension) derived from
@@ -72,8 +84,20 @@ def _report_filename(report, assessment_id: str) -> str:
     silently overwriting the last in the browser's download folder.
     Appending the assessment id costs nothing and makes every export
     distinguishable and traceable back to its row.
+
+    Length-capped: see _TITLE_MAX_CHARS. The id is measured first and the
+    title gets whatever room is left (up to its own cap), so the id is
+    never the part that gets cut — two 300-character names that differ
+    only in their last character still produce two different files.
     """
-    return f"{_sanitize_filename(report.title)}-{_sanitize_filename(assessment_id)}"
+    identifier = _sanitize_filename(assessment_id)
+    room_for_title = min(_TITLE_MAX_CHARS, _FILENAME_MAX_CHARS - len(identifier) - 1)
+    if room_for_title <= 0:
+        # Pathological (an id longer than the whole limit): keep the id,
+        # which identifies the row, over the title, which decorates it.
+        return identifier[:_FILENAME_MAX_CHARS]
+    title = _sanitize_filename(report.title)[:room_for_title].strip(" .")
+    return f"{title}-{identifier}" if title else identifier
 
 
 @privacycare_router.get(
