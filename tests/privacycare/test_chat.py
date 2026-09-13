@@ -160,3 +160,41 @@ def test_messages_come_back_in_order_with_their_sender(db):
 def test_a_session_for_an_unknown_assessment_raises(db):
     with pytest.raises(LookupError):
         open_or_resume(db, "pa_does_not_exist")
+
+
+def test_advance_uses_the_stored_index_not_the_one_it_was_handed(db):
+    # advance() used to increment the index carried on the ChatSession passed
+    # in — a value read before the lock. Two concurrent replies converged on
+    # the same next index by luck, and the docstring claimed a protection the
+    # code did not provide. Handing it a session whose index is deliberately
+    # stale proves it now reads the authoritative value under the lock.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Stale Index DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 2)
+    _seed_question(db, tid, "q3", "necessity", 3)
+    db.flush()
+    session = open_or_resume(db, aid)
+
+    # Someone else moved the session on to question 2 (index 1).
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE questionnaire SET current_question_index = 1 WHERE id = :i"
+        ),
+        {"i": session.id},
+    )
+
+    # `session` still says index 0. Advancing must go to 2, not back to 1.
+    advanced = advance(db, session)
+
+    assert advanced.current_question_index == 2, (
+        "advance incremented the stale in-memory index instead of the stored "
+        f"one: {advanced.current_question_index}"
+    )
+    stored = db.execute(
+        sqlalchemy.text(
+            "SELECT current_question_index FROM questionnaire WHERE id = :i"
+        ),
+        {"i": session.id},
+    ).scalar()
+    assert stored == 2

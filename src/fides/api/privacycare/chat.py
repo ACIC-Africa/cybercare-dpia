@@ -134,6 +134,18 @@ _TRANSCRIPT_SQL = sqlalchemy.text(
     "ORDER BY timestamp, id"
 )
 
+# Re-read under the lock. advance() used to increment the index carried on
+# the ChatSession it was handed — a value read BEFORE the lock was taken, so
+# the lock serialised the write without protecting the read it was derived
+# from. Two concurrent replies converged on the same next index by luck rather
+# than by design (both stale reads produced N+1, so nothing was skipped), and
+# the docstring claimed a protection the code did not actually provide. Taking
+# the current value under the lock makes the stated guarantee true and removes
+# a trap for anyone who later changes how far advance moves.
+_CURRENT_INDEX_FOR_UPDATE_SQL = sqlalchemy.text(
+    "SELECT current_question_index FROM questionnaire WHERE id = :id"
+)
+
 _UPDATE_PROGRESS_SQL = sqlalchemy.text(
     "UPDATE questionnaire SET current_question_index = :idx WHERE id = :id"
 )
@@ -350,7 +362,15 @@ def advance(db: Session, session: ChatSession) -> ChatSession:
     """
     _lock_assessment_and_get_name(db, session.assessment_id)
 
-    next_index = session.current_question_index + 1
+    # The authoritative index, read AFTER the lock — not the possibly-stale
+    # one on the session object handed in. See _CURRENT_INDEX_FOR_UPDATE_SQL.
+    current_index = db.execute(
+        _CURRENT_INDEX_FOR_UPDATE_SQL, {"id": session.id}
+    ).scalar()
+    if current_index is None:
+        raise LookupError(f"No questionnaire with id {session.id}")
+
+    next_index = current_index + 1
     if next_index >= len(session.question_ids):
         db.execute(_COMPLETE_QUESTIONNAIRE_SQL, {"id": session.id, "idx": next_index})
         status = "completed"
