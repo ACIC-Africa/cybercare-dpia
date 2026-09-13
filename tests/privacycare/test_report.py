@@ -6,6 +6,7 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.api.assessments import _assessment_detail
+from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.report import Report, ReportCitation, build_report
 from tests.privacycare.test_api_assessments import (
     _seed_answer_with_evidence,
@@ -173,3 +174,31 @@ def test_build_report_returns_a_report_instance(db):
     aid = _seed_assessment(db, tid, "Type Check DPIA")
     db.flush()
     assert isinstance(build_report(db, aid), Report)
+
+
+def test_the_officers_words_pass_through_untouched(db):
+    # The report model must not escape, sanitise or truncate. Escaping belongs
+    # to the renderer, and doing it in both places double-escapes: an officer
+    # who writes `R&D` sees `R&amp;D` in the document they signed and the
+    # regulator reads.
+    #
+    # Asserted rather than inspected, because the very next task adds escaping
+    # on the rendering side. That is exactly when someone "helpfully" adds it
+    # here too.
+    awkward = (
+        'Shared with R&D <partners> — see "Annexe 1".\n'
+        "Retention: 7 years; reviewed annually."
+    )
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Verbatim Text DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, awkward, "carol@example.com")
+    db.flush()
+
+    report = build_report(db, aid)
+
+    answers = [q.answer_text for s in report.sections for q in s.questions]
+    assert awkward in answers, (
+        "the officer's text was altered on the way into the report model: "
+        f"{answers!r}"
+    )
