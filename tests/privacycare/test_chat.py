@@ -119,11 +119,24 @@ def test_advancing_past_the_last_question_completes_the_session(db):
 
     assert session.status == "completed"
     assert current_question(db, session) is None
-    completed_at = db.execute(
-        sqlalchemy.text("SELECT completed_at FROM questionnaire WHERE id = :i"),
+    # clock_timestamp(), not now(). now() is transaction START, so inside one
+    # transaction it can stamp a completion time EARLIER than the work that
+    # produced it — the exact bug found and fixed in tasks.py on this branch.
+    # Comparing against a clock reading taken before the call distinguishes
+    # them: now() would be at or before it, clock_timestamp() after.
+    completed_at, before, after = db.execute(
+        sqlalchemy.text(
+            "SELECT q.completed_at, now(), clock_timestamp() "
+            "FROM questionnaire q WHERE q.id = :i"
+        ),
         {"i": session.id},
-    ).scalar()
+    ).first()
     assert completed_at is not None
+    assert completed_at > before, (
+        "completed_at looks like now() (transaction start), which can predate "
+        f"the work it records: {completed_at} vs now()={before}"
+    )
+    assert completed_at <= after
 
 
 def test_messages_come_back_in_order_with_their_sender(db):

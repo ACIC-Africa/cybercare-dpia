@@ -51,16 +51,29 @@ def db():
         session.rollback()
 
 
-def _seed_template(db, *, assessment_type: str = "dpia") -> str:
-    # assessment_type and region are NOT NULL on the live table (not
-    # mentioned in the task brief's column list) — supply both or the
-    # insert violates a not-null constraint.
+def _seed_template(db, *, assessment_type: str | None = None) -> str:
+    # assessment_type and region are NOT NULL on the live table — supply both
+    # or the insert violates a not-null constraint.
     #
-    # assessment_type defaults to "dpia" so every existing caller in this
-    # file is unaffected. test_tasks.py (plan 05) needs a fresh, unique
-    # assessment_type per test — `uq_assessment_template_active_type` allows
-    # only one active template per type — so it passes one explicitly rather
-    # than this helper being copied into a second file.
+    # assessment_type DEFAULTS TO A UNIQUE VALUE, not to "dpia". Two unique
+    # constraints make a fixed type a collision waiting to happen:
+    #
+    #   uq_assessment_template_type_version_revision  (type, version, revision)
+    #   uq_assessment_template_active_type            (type) WHERE is_active
+    #
+    # The second is the sharper one: only ONE ACTIVE template may exist per
+    # type, ever. With a hardcoded "dpia" this helper collided with itself
+    # whenever a test needed two templates — which is why test_answers.py grew
+    # a local _seed_second_template — and, more awkwardly, with any leftover
+    # row in the shared development database. A single committed probe row
+    # from a code review broke six unrelated tests exactly that way, and the
+    # error named a unique constraint rather than the actual cause.
+    #
+    # A unique default makes every call independent of every other call and of
+    # whatever the database already holds. Callers that genuinely need a
+    # specific type still pass one (test_tasks.py's _full_coverage_template).
+    if assessment_type is None:
+        assessment_type = f"dpia_{uuid.uuid4().hex[:8]}"
     tid = f"tpl_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
@@ -76,15 +89,20 @@ def _seed_template(db, *, assessment_type: str = "dpia") -> str:
 def _seed_template_named(db, name: str) -> str:
     # Same NOT NULL constraints as _seed_template, but lets the caller pick
     # a name — used to exercise the template_key() id fallback with a name
-    # that collapses to an empty slug.
+    # that collapses to an empty slug. Its assessment_type is unique per call
+    # for the same reason _seed_template's is; see that helper's comment.
     tid = f"tpl_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO assessment_template "
             "(id, version, name, assessment_type, region, is_active) "
-            "VALUES (:id, '1.0', :name, 'dpia', 'KE', true)"
+            "VALUES (:id, '1.0', :name, :assessment_type, 'KE', true)"
         ),
-        {"id": tid, "name": name},
+        {
+            "id": tid,
+            "name": name,
+            "assessment_type": f"dpia_{uuid.uuid4().hex[:8]}",
+        },
     )
     return tid
 
@@ -2139,3 +2157,48 @@ def test_evidence_with_nothing_to_derive_a_field_name_from_is_skipped(db):
     assert [i["id"] for i in items] == ["ev_good"], (
         "the underivable item is skipped and its sibling still renders"
     )
+
+
+def test_two_templates_can_be_seeded_in_one_test(db):
+    # The collision this helper used to have with ITSELF. Two unique
+    # constraints — (type, version, revision), and a partial unique index on
+    # type WHERE is_active — meant a hardcoded assessment_type could only ever
+    # produce one active template. Tests that needed two grew local
+    # workarounds; this asserts they no longer have to.
+    first = _seed_template(db)
+    second = _seed_template(db)
+    db.flush()
+
+    assert first != second
+    types = db.execute(
+        sqlalchemy.text(
+            "SELECT assessment_type FROM assessment_template WHERE id = ANY(:ids)"
+        ),
+        {"ids": [first, second]},
+    ).scalars().all()
+    assert len(set(types)) == 2, (
+        f"both templates share an assessment_type ({types}), so only one can "
+        "be active and the second insert is a collision waiting to happen"
+    )
+
+
+def test_seeding_survives_a_pre_existing_template_in_the_database(db):
+    # The collision this helper used to have with LEFTOVER DATA. A single
+    # committed row from a review's live probe broke six unrelated tests,
+    # reporting a unique-constraint violation rather than the actual cause.
+    # Standing in for that row with an uncommitted one is enough: it occupies
+    # the key inside this transaction, and seeding must still succeed.
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO assessment_template "
+            "(id, version, name, assessment_type, region, is_active) "
+            "VALUES (:id, '1.0', 'Leftover', 'dpia', 'KE', true)"
+        ),
+        {"id": f"tpl_{uuid.uuid4().hex[:8]}"},
+    )
+    db.flush()
+
+    seeded = _seed_template(db)
+    db.flush()
+
+    assert seeded, "seeding must not depend on the database being empty"

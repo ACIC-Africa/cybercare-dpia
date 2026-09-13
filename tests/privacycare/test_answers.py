@@ -301,26 +301,12 @@ def test_recompute_completeness_excludes_non_complete_statuses(db):
 
 
 def _seed_second_template(db) -> str:
-    # _seed_template/_seed_template_named (test_api_assessments.py) both
-    # hardcode assessment_type="dpia", version="1.0" — calling either of
-    # them twice in the same test collides with
-    # uq_assessment_template_type_version_revision (verified against the
-    # live schema: UNIQUE on assessment_type, version, fides_revision).
-    # This test needs two genuinely DISTINCT templates, so it seeds a
-    # second one with a different assessment_type directly, rather than
-    # duplicating either helper's full body for a case they don't support.
-    import uuid
-
-    tid = f"tpl_{uuid.uuid4().hex[:8]}"
-    db.execute(
-        sqlalchemy.text(
-            "INSERT INTO assessment_template "
-            "(id, version, name, assessment_type, region, is_active) "
-            "VALUES (:id, '1.0', 'A Different Template', 'gdpr', 'EU', true)"
-        ),
-        {"id": tid},
-    )
-    return tid
+    # A second, genuinely distinct template. This used to hand-roll its own
+    # INSERT because _seed_template hardcoded assessment_type="dpia" and so
+    # collided with itself on the second call. That default is now unique per
+    # call, so this is simply the shared helper — one seeding path, not two
+    # that can drift.
+    return _seed_template(db)
 
 
 def _seed_complete_answer_directly(db, assessment_id: str, question_id: str) -> None:
