@@ -71,10 +71,13 @@ def _registered_paths() -> set[str]:
 # plus/chat/questionnaire/messages/{param} came out here in task 4: the
 # transcript route now exists and is registered, so this becomes a live
 # assertion rather than a skip.
+#
+# plus/privacy-assessments/config and .../config/defaults came out here in
+# task 1 of the config-and-pdf plan (fides/api/privacycare/api/config.py):
+# both are built and registered, so — same as the chat transcript route
+# above — this becomes a live assertion rather than a skip.
 NOT_BUILT_YET = frozenset(
     {
-        "plus/privacy-assessments/config",
-        "plus/privacy-assessments/config/defaults",
         "plus/privacy-assessments/{param}/pdf",
         "plus/privacy-assessments/{param}/questionnaire",
         "plus/privacy-assessments/{param}/questionnaire/reminders",

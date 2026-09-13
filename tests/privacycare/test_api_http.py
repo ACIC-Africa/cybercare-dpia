@@ -31,6 +31,11 @@ GET_ROUTE_SUFFIXES = [
     f"/{_ASSESSMENT_ID}/evidence",
     "/tasks",
     "/tasks/does-not-matter",
+    # The config singleton's two GETs (task 1, config-and-pdf plan). PUT
+    # /config is a write, not a GET, so it is not part of this set — same
+    # split every PUT/DELETE route on this surface already sits outside it.
+    "/config",
+    "/config/defaults",
 ]
 
 

@@ -27,6 +27,9 @@ from fides.api.privacycare.api.schemas import (
     CreateAssessmentTaskRequest,
     CreateAssessmentTaskResponse,
     EvidenceItem,
+    PrivacyAssessmentConfigDefaults,
+    PrivacyAssessmentConfigResponse,
+    PrivacyAssessmentConfigUpdate,
     PrivacyAssessmentDetailResponse,
     QuestionEvidence,
     QuestionGroup,
@@ -861,3 +864,75 @@ def test_the_chat_feature_types_were_actually_read():
     assert len(_feature_interface_fields("StartChatResponse")) == 4
     assert len(_feature_interface_fields("ChatReplyResponse")) == 4
     assert len(_feature_interface_fields("QuestionnaireChatMessage")) == 6
+
+
+# Task 1 of the config-and-pdf plan: the assessment configuration
+# singleton. Parity is pinned against the FEATURE-FOLDER interfaces, not
+# the generated PrivacyAssessmentConfig*.ts trio in TS_DIR — the two
+# disagree on nullability for reassessment_enabled/reassessment_cron (the
+# generated file marks them optional-and-nullable; the feature file marks
+# them optional-but-never-null), and privacy-assessments.slice.ts imports
+# all three names `from "./types"` (the feature folder), so that file is
+# the one the shipped UI actually compiles against — same precedent as
+# AssessmentTaskResponse's own generated-vs-feature split above, just the
+# opposite file winning.
+def test_privacy_assessment_config_response_matches_the_shipped_contract():
+    assert set(
+        PrivacyAssessmentConfigResponse.model_fields
+    ) == _feature_interface_fields("PrivacyAssessmentConfigResponse")
+
+
+def test_privacy_assessment_config_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "PrivacyAssessmentConfigResponse"
+    ).items():
+        pydantic_required = PrivacyAssessmentConfigResponse.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        PrivacyAssessmentConfigResponse,
+        _feature_interface_raw_specs("PrivacyAssessmentConfigResponse"),
+    )
+
+
+def test_privacy_assessment_config_update_matches_the_shipped_contract():
+    assert set(PrivacyAssessmentConfigUpdate.model_fields) == _feature_interface_fields(
+        "PrivacyAssessmentConfigUpdate"
+    )
+
+
+def test_privacy_assessment_config_update_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "PrivacyAssessmentConfigUpdate"
+    ).items():
+        pydantic_required = PrivacyAssessmentConfigUpdate.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+    _assert_admits_none_where_ts_nullable(
+        PrivacyAssessmentConfigUpdate,
+        _feature_interface_raw_specs("PrivacyAssessmentConfigUpdate"),
+    )
+
+
+def test_privacy_assessment_config_defaults_matches_the_shipped_contract():
+    assert set(
+        PrivacyAssessmentConfigDefaults.model_fields
+    ) == _feature_interface_fields("PrivacyAssessmentConfigDefaults")
+
+
+def test_privacy_assessment_config_defaults_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "PrivacyAssessmentConfigDefaults"
+    ).items():
+        pydantic_required = PrivacyAssessmentConfigDefaults.model_fields[
+            field
+        ].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_config_feature_types_were_actually_read():
+    assert len(_feature_interface_fields("PrivacyAssessmentConfigResponse")) == 11
+    assert len(_feature_interface_fields("PrivacyAssessmentConfigUpdate")) == 6
+    assert len(_feature_interface_fields("PrivacyAssessmentConfigDefaults")) == 3

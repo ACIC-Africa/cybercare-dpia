@@ -607,6 +607,97 @@ class ChatReplyResponse(BaseModel):
 # asserts that equivalence directly rather than defining a second model.
 
 
+# Task 1 (config-and-pdf plan): the assessment configuration singleton.
+#
+# All three models below mirror the same-named interfaces in
+# clients/admin-ui/src/features/privacy-assessments/types.ts — the
+# HAND-AUTHORED feature-folder file, not the generated
+# clients/admin-ui/src/types/api/models/PrivacyAssessmentConfig*.ts trio.
+# privacy-assessments.slice.ts imports all three names `from "./types"`
+# (the feature folder), so that file — not the generated one, which marks
+# several of the same fields differently (e.g. reassessment_enabled/
+# reassessment_cron as nullable-and-optional there, non-nullable here) —
+# is what the shipped UI actually compiles against.
+class PrivacyAssessmentConfigResponse(BaseModel):
+    # Every field is required, non-optional in the feature contract (no
+    # `?` anywhere) — the four override/Slack fields are required-but-
+    # NULLABLE (`string | null`, no default, same precedent as
+    # AssessmentMetadata.model_used above); everything else is required
+    # and non-nullable.
+    id: str
+    assessment_model_override: Optional[str]
+    chat_model_override: Optional[str]
+    # Computed, never stored: override or the platform default. Imported
+    # from fides.api.privacycare.llm.DEFAULT_MODEL — the exact constant
+    # generation and questionnaire chat both call — never retyped here, so
+    # this screen cannot disagree with what the running code actually
+    # uses (D-CFG-2).
+    effective_assessment_model: str
+    effective_chat_model: str
+    reassessment_enabled: bool
+    reassessment_cron: str
+    slack_channel_id: Optional[str]
+    slack_channel_name: Optional[str]
+    created_at: str
+    updated_at: str
+
+
+class PrivacyAssessmentConfigUpdate(BaseModel):
+    # Every field carries `?` in the feature contract — genuinely optional
+    # REQUEST fields, same "TS `?` -> Pydantic default" precedent as
+    # UpdatePrivacyAssessmentRequest below. The PUT route reads this via
+    # `model_dump(exclude_unset=True)`: a field ABSENT from the request
+    # body is left alone; a field sent as explicit `null` clears it back to
+    # the platform default (D-CFG-3). That distinction is the entire
+    # reason this is exclude_unset rather than a plain `.dict()` — Pydantic
+    # can't tell "never sent" from "sent as null" any other way.
+    #
+    # No `questionnaire_tone_prompt` field, deliberately: that column has no
+    # TypeScript counterpart (see PrivacyAssessmentConfig, the ORM model,
+    # for the same note on the other side) and is never touched by this
+    # request or exposed by PrivacyAssessmentConfigResponse above — adding
+    # a field for it here would be "helpfully" wiring up a column that was
+    # never meant to reach this surface.
+    assessment_model_override: Optional[str] = None
+    chat_model_override: Optional[str] = None
+    reassessment_enabled: Optional[bool] = None
+    reassessment_cron: Optional[str] = None
+    slack_channel_id: Optional[str] = None
+    slack_channel_name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _reject_explicit_null_for_not_null_columns(
+        self,
+    ) -> "PrivacyAssessmentConfigUpdate":
+        # Same reasoning, same shape, as UpdatePrivacyAssessmentRequest's
+        # validator of the same name below: reassessment_enabled and
+        # reassessment_cron are NOT NULL at the DB level (verified against
+        # the live schema and against PrivacyAssessmentConfig, the ORM
+        # model — both declare `nullable=False`), so an explicit
+        # `reassessment_cron: null` can never be applied without violating
+        # that constraint. Rejected here as a 422, before a single
+        # statement reaches Postgres, rather than surfacing as a raw
+        # IntegrityError / 500.
+        #
+        # The four override/Slack fields are the opposite case and are NOT
+        # covered by this guard: their columns are genuinely nullable, and
+        # an explicit null for one of them is the deliberate "clear the
+        # override" action D-CFG-3 exists to support.
+        for field in ("reassessment_enabled", "reassessment_cron"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} may be omitted, but must not be null")
+        return self
+
+
+class PrivacyAssessmentConfigDefaults(BaseModel):
+    # Mirrors the same-named feature-folder interface. All three fields are
+    # required there — this is a read-only report of "what the platform
+    # would use", always fully populated, never partial.
+    default_assessment_model: str
+    default_chat_model: str
+    default_reassessment_cron: str
+
+
 def template_key(name: str, id: Optional[str] = None) -> str:
     # Derive the `key` the UI contract requires but the table does not store.
     # Lowercase, non-alphanumerics collapsed to underscores, trimmed.

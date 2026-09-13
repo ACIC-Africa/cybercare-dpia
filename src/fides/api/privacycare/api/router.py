@@ -81,34 +81,43 @@ def register() -> None:
     # process gets it from fides.api.privacycare.worker.
     importlib.import_module("fides.api.privacycare.tasks")
 
-    # THE ORDER OF THE NEXT TWO IMPORTS IS LOAD-BEARING. Do not sort them.
+    # THE ORDER OF THE NEXT THREE IMPORTS IS LOAD-BEARING. Do not sort them.
     #
-    # Both route modules decorate the SHARED privacycare_router at import
-    # time, so the order they are imported in IS the order their routes are
-    # registered in — and Starlette matches in registration order, stopping
-    # at the first match. api/tasks.py binds POST "", GET "/tasks" and GET
-    # "/tasks/{task_id}"; api/assessments.py binds GET "/{assessment_id}".
-    # If assessments bound first, a request for "/tasks" would match IT
-    # (assessment_id="tasks") and the progress bar would 404 forever against
-    # a route that demonstrably exists.
-    # test_the_tasks_route_is_matched_before_the_assessment_id_route fails
-    # if these two lines are swapped.
+    # All three route modules decorate the SHARED privacycare_router at
+    # import time, so the order they are imported in IS the order their
+    # routes are registered in — and Starlette matches in registration
+    # order, stopping at the first match. api/tasks.py binds POST "", GET
+    # "/tasks" and GET "/tasks/{task_id}"; api/config.py binds GET "/config",
+    # PUT "/config" and GET "/config/defaults"; api/assessments.py binds GET
+    # "/{assessment_id}" (and its PUT/DELETE siblings on the same path). If
+    # assessments bound before either of the other two, a request for
+    # "/tasks" or "/config" would match IT instead (assessment_id="tasks" /
+    # "config") and that route would 404 forever against a screen that
+    # demonstrably exists. test_the_tasks_route_is_matched_before_the_
+    # assessment_id_route (test_api_tasks.py) and
+    # test_the_config_routes_are_matched_before_the_assessment_id_route
+    # (test_api_config.py) both fail if assessments is moved ahead of
+    # either. tasks vs config have no ordering constraint between each
+    # other — neither path can ever match the other's — so their relative
+    # order here is free; assessments must simply come last of the three.
     #
     # importlib, not `from ... import ...`, precisely BECAUSE the order
     # matters: ruff's I001 alphabetises an import block and would silently
-    # put assessments first. An `# isort: off` comment does not suppress it
-    # here (verified with `ruff check --diff`). These two imports exist only
-    # for their route-binding side effect (they carried unused-import
-    # suppressions before), so nothing is lost by making the side effect,
-    # and its order, explicit.
+    # put assessments before config and config before tasks. An
+    # `# isort: off` comment does not suppress it here (verified with
+    # `ruff check --diff`). These imports exist only for their route-binding
+    # side effect (they carried unused-import suppressions before), so
+    # nothing is lost by making the side effect, and its order, explicit.
     #
-    # This works only because the two route modules do not import each
+    # This works only because the three route modules do not import each
     # other: the helper they share, _created_by_from_client, lives in
-    # api/identity.py, which neither depends on. An import of one route
-    # module from the other would bind ALL of that module's routes at import
-    # time and defeat the ordering however these lines are written. That is
-    # exactly what happened once already, and why identity.py exists.
+    # api/identity.py, which none of them depends on. An import of one
+    # route module from another would bind ALL of that module's routes at
+    # import time and defeat the ordering however these lines are written.
+    # That is exactly what happened once already, and why identity.py
+    # exists.
     importlib.import_module("fides.api.privacycare.api.tasks")
+    importlib.import_module("fides.api.privacycare.api.config")
     importlib.import_module("fides.api.privacycare.api.assessments")
     importlib.import_module("fides.api.privacycare.api.processes")
 

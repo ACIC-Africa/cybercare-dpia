@@ -21,6 +21,12 @@ EXPECTED_READ_SUFFIXES = {
     "/{assessment_id}/evidence",
     "/tasks",
     "/tasks/{task_id}",
+    # The config singleton (task 1, config-and-pdf plan): GET+PUT share the
+    # "/config" path, GET "/config/defaults" is its own — three routes
+    # across two unique suffixes, same "one entry covers every method on
+    # that path" precedent as "/{assessment_id}" above (GET+PUT+DELETE).
+    "/config",
+    "/config/defaults",
 }
 
 PRIVACYCARE_PATH_PREFIX = PRIVACYCARE_PREFIX

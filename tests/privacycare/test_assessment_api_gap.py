@@ -12,11 +12,19 @@ polling routes) to the served surface, so those two moved out of
 EXPECTED_STILL_ABSENT_ROUTES and into EXPECTED_READ_ROUTES below — they were
 placeholders for "not built yet", not "never will be".
 
+Task 1 of the config-and-pdf plan adds `GET .../config` and
+`GET .../config/defaults` (fides/api/privacycare/api/config.py) — the same
+move: both come out of EXPECTED_STILL_ABSENT_ROUTES and into
+EXPECTED_READ_ROUTES below. (`PUT .../config` also exists now, but this
+list only ever tracked GETs — same precedent as
+"plus/privacy-assessments/{assessment_id}" above, which also carries a PUT
+that this list does not separately enumerate.)
+
 The remaining paths in the original gap list (single-question fetch,
-questionnaire, questionnaire reminders, PDF export, and config) are
-WRITE-adjacent or not part of this read surface — they belong to plan 04 and
-are still correctly absent. That absence is intentional, not a regression:
-see `test_write_and_other_routes_still_absent` below.
+questionnaire, questionnaire reminders, and PDF export) are WRITE-adjacent
+or not part of this read surface — they belong to a later plan and are
+still correctly absent. That absence is intentional, not a regression: see
+`test_write_and_other_routes_still_absent` below.
 
 `GET /{assessment_id}/questions` was a sixth READ path here, but nothing
 called it — the UI's slice defines a PUT on that path, never a GET — and
@@ -36,18 +44,19 @@ EXPECTED_READ_ROUTES = [
     "plus/privacy-assessments/{assessment_id}/evidence",
     "plus/privacy-assessments/tasks",
     "plus/privacy-assessments/tasks/{task_id}",
+    "plus/privacy-assessments/config",
+    "plus/privacy-assessments/config/defaults",
 ]
 
-# Not part of this read surface (plan 04, write paths) — still absent, and
-# that is correct. Kept here (with the original `{id}` naming from the gap
-# list) so a later reader sees the absence was checked, not overlooked.
+# Not part of this read surface (still-pending write/other paths) — still
+# absent, and that is correct. Kept here (with the original `{id}` naming
+# from the gap list) so a later reader sees the absence was checked, not
+# overlooked.
 EXPECTED_STILL_ABSENT_ROUTES = [
     "plus/privacy-assessments/{id}/questions/{question_id}",
     "plus/privacy-assessments/{id}/questionnaire",
     "plus/privacy-assessments/{id}/questionnaire/reminders",
     "plus/privacy-assessments/{id}/pdf",
-    "plus/privacy-assessments/config",
-    "plus/privacy-assessments/config/defaults",
 ]
 
 
