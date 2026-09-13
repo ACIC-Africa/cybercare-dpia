@@ -6,6 +6,8 @@
 # gateway call. The `_stub_llm` fixture below applies a default stub to every
 # test in this module (autouse), and individual tests override judge_reply's
 # stub where the test is specifically about a non-responsive reply.
+from typing import List
+
 import pytest
 import sqlalchemy
 from fastapi import HTTPException
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.api.chat import (
     _session_by_id,
+    get_questionnaire_chat_messages,
     reply_to_questionnaire_chat,
     start_questionnaire_chat,
 )
@@ -328,6 +331,76 @@ def test_chat_reply_request_assessment_id_is_not_required():
     # required Pydantic field despite that, or a body genuinely missing it
     # (as the UI sends) would 422 rather than reach the route at all.
     assert not ChatReplyRequest.model_fields["assessment_id"].is_required()
+
+
+# --- GET plus/chat/questionnaire/messages/{questionnaire_id} ---
+
+
+def test_get_messages_returns_the_transcript_oldest_first(db, monkeypatch):
+    questionnaire_id = _started_session(db, monkeypatch, question_count=2)
+
+    reply_to_questionnaire_chat(
+        ChatReplyRequest(
+            questionnaire_id=questionnaire_id,
+            message_text="We rely on consent, captured at signup.",
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    messages = get_questionnaire_chat_messages(questionnaire_id, db=db)
+
+    # start's own bot question, then the officer's reply, then the two bot
+    # turns reply produces (echo + next question) — four rows, oldest
+    # first, exactly matching chat.transcript's own ORDER BY.
+    assert [m.text for m in messages] == [
+        "[phrased] q0",
+        "We rely on consent, captured at signup.",
+        'Recorded as your answer: "We rely on consent, captured at signup."',
+        "[phrased] q1",
+    ]
+    assert [m.is_bot_message for m in messages] == [True, False, True, True]
+    assert messages[1].sender_email == "carol@example.com"
+    assert all(m.timestamp for m in messages), "transcript() always stamps a timestamp"
+
+
+def test_get_messages_is_the_bare_array_the_slice_declares():
+    # getQuestionnaireChatMessages (privacy-assessments.slice.ts) types its
+    # query as build.query<QuestionnaireChatMessage[], string> — a bare
+    # array, not an envelope with e.g. a `messages` key. The route's own
+    # response_model carries this; this test pins the return type of the
+    # handler itself so a future refactor cannot silently wrap it.
+    assert get_questionnaire_chat_messages.__annotations__["return"] == List[
+        QuestionnaireChatMessage
+    ]
+
+
+def test_get_messages_on_a_session_with_nothing_said_yet_is_a_200_with_an_empty_list(
+    db, monkeypatch
+):
+    # A session that exists but has no messages (chat.py's "nothing
+    # pending" branch never writes a bot message) must not be confused
+    # with an unknown questionnaire_id — that is a 404, this is a 200.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Nothing Pending For Transcript DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, "Already answered before chat started.", "alice@example.com")
+    db.flush()
+    _no_commit(db, monkeypatch)
+    questionnaire_id = start_questionnaire_chat(
+        StartChatRequest(assessment_id=aid), db=db
+    ).questionnaire_id
+
+    messages = get_questionnaire_chat_messages(questionnaire_id, db=db)
+
+    assert messages == []
+
+
+def test_get_messages_unknown_questionnaire_id_is_a_404(db, monkeypatch):
+    _no_commit(db, monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        get_questionnaire_chat_messages("qnr_doesnotexist", db=db)
+    assert exc_info.value.status_code == 404
 
 
 # --- TS parity: the shipped contract this module's schemas mirror ---

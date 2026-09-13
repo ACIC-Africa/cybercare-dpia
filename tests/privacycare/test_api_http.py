@@ -79,3 +79,16 @@ def test_unauthenticated_business_process_write_is_rejected(client):
         f"POST {PRIVACYCARE_PROCESSES_PREFIX} did not reject an "
         f"unauthenticated caller (got {response.status_code})"
     )
+
+
+# The questionnaire chat's own router (task 4), a third namespace. Same bar
+# as the two surfaces above: a privacy product must not serve a DPIA
+# conversation's transcript to an anonymous caller.
+def test_unauthenticated_chat_transcript_get_is_rejected(client):
+    from fides.api.privacycare.api.router import PRIVACYCARE_CHAT_PREFIX
+
+    response = client.get(f"{PRIVACYCARE_CHAT_PREFIX}/messages/does-not-matter")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"{PRIVACYCARE_CHAT_PREFIX}/messages/does-not-matter did not reject "
+        f"an unauthenticated caller (got {response.status_code})"
+    )

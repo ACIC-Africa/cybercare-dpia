@@ -67,9 +67,12 @@ def _registered_paths() -> set[str]:
 # PRIVACYCARE_PATH_PREFIXES) already happened twice for. An exact set of the
 # URLs still unbuilt does not silently widen to swallow a route a later task
 # ships.
+#
+# plus/chat/questionnaire/messages/{param} came out here in task 4: the
+# transcript route now exists and is registered, so this becomes a live
+# assertion rather than a skip.
 NOT_BUILT_YET = frozenset(
     {
-        "plus/chat/questionnaire/messages/{param}",
         "plus/privacy-assessments/config",
         "plus/privacy-assessments/config/defaults",
         "plus/privacy-assessments/{param}/pdf",

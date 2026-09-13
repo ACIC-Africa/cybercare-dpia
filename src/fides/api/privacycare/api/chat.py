@@ -1,4 +1,5 @@
-"""The two routes that drive the questionnaire chat: start and reply.
+"""The three routes that drive the questionnaire chat: start, reply, and
+the read-only transcript.
 
 fides.api.privacycare.chat (the core, task 1) owns the session state
 machine — opening/resuming a questionnaire, tracking which question is
@@ -27,6 +28,8 @@ chain is append-only (write_answer's own contract), a wrong echo is not a
 disaster either — the officer's correction becomes version 2 with both
 preserved.
 """
+from typing import List
+
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security
 from fastapi import status as status_codes
@@ -342,3 +345,41 @@ def reply_to_questionnaire_chat(
         )
     db.commit()
     return response
+
+
+@privacycare_chat_router.get(
+    "/messages/{questionnaire_id}",
+    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
+    response_model=List[QuestionnaireChatMessage],
+)
+def get_questionnaire_chat_messages(
+    questionnaire_id: str, *, db: Session = Depends(get_db)
+) -> List[QuestionnaireChatMessage]:
+    """The conversation so far, oldest first — exactly what
+    getQuestionnaireChatMessages (privacy-assessments.slice.ts) types its
+    query as: `build.query<QuestionnaireChatMessage[], string>`, a bare
+    array, not an envelope. No wrapper is invented here to "tidy" that
+    shape; the slice is the actual contract, not the TS interface file in
+    isolation, and it declares an array.
+
+    `transcript()` alone cannot distinguish "no such questionnaire" from
+    "this questionnaire exists but nothing has been said yet" — its SQL is
+    a plain WHERE questionnaire_id = ... with no existence check, so an
+    unknown id and a genuinely empty session both come back as `[]`. Those
+    are different situations (one is a 404, the other a 200 with an empty
+    list) and must not collapse into each other, so _session_by_id's own
+    existence check runs first and its LookupError is what actually maps
+    to 404 — the same shape start/reply already use.
+
+    No `client` parameter: this is a pure read, nothing is filed on the
+    caller's behalf, so there is no authorship to attribute — same
+    reasoning as start_questionnaire_chat's own docstring above.
+    """
+    try:
+        session = _session_by_id(db, questionnaire_id)
+    except LookupError:
+        raise HTTPException(
+            status_code=status_codes.HTTP_404_NOT_FOUND,
+            detail=f"No questionnaire with id {questionnaire_id}",
+        )
+    return [_chat_message_from_row(row) for row in transcript(db, session.id)]

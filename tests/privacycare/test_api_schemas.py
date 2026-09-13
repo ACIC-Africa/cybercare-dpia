@@ -23,13 +23,16 @@ from fides.api.privacycare.api.schemas import (
     AssessmentTaskSystemInfo,
     BulkUpdateAnswersRequest,
     BulkUpdateAnswersResponse,
+    ChatReplyResponse,
     CreateAssessmentTaskRequest,
     CreateAssessmentTaskResponse,
     EvidenceItem,
     PrivacyAssessmentDetailResponse,
     QuestionEvidence,
     QuestionGroup,
+    QuestionnaireChatMessage,
     RiskLevel,
+    StartChatResponse,
     TemplateResponse,
     UpdateAnswerRequest,
     UpdateAnswerResponse,
@@ -796,3 +799,65 @@ def test_template_key_falls_back_to_id_when_name_is_empty():
 def test_template_key_is_never_empty():
     for name, id_ in [("", None), ("!!!", None), ("---", None), ("", "")]:
         assert template_key(name, id=id_) != ""
+
+
+# --- Questionnaire chat contracts (task 4) ---
+#
+# QuestionnaireChatMessage, StartChatResponse and ChatReplyResponse are all
+# hand-authored interfaces in the same FEATURE_TS_PATH file this module
+# already reads for AssessmentSummaryResponse etc., so _feature_interface_
+# fields/_feature_interface_field_specs (defined above, same helpers
+# test_api_chat.py imports from this module) are the right tool — no new
+# parsing helper needed. These three models are also exercised end-to-end
+# by the questionnaire-chat routes themselves in test_api_chat.py, whose
+# own field-set parity tests these mirror; this file remains the canonical
+# home for the "does this Pydantic model equal the shipped .ts contract"
+# question, the same as every other model above.
+
+
+def test_start_chat_response_matches_the_shipped_contract():
+    assert set(StartChatResponse.model_fields) == _feature_interface_fields(
+        "StartChatResponse"
+    )
+
+
+def test_start_chat_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "StartChatResponse"
+    ).items():
+        pydantic_required = StartChatResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_chat_reply_response_matches_the_shipped_contract():
+    assert set(ChatReplyResponse.model_fields) == _feature_interface_fields(
+        "ChatReplyResponse"
+    )
+
+
+def test_chat_reply_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "ChatReplyResponse"
+    ).items():
+        pydantic_required = ChatReplyResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_questionnaire_chat_message_matches_the_shipped_contract():
+    assert set(QuestionnaireChatMessage.model_fields) == _feature_interface_fields(
+        "QuestionnaireChatMessage"
+    )
+
+
+def test_questionnaire_chat_message_optionality_matches_the_shipped_contract():
+    for field, is_optional in _feature_interface_field_specs(
+        "QuestionnaireChatMessage"
+    ).items():
+        pydantic_required = QuestionnaireChatMessage.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_the_chat_feature_types_were_actually_read():
+    assert len(_feature_interface_fields("StartChatResponse")) == 4
+    assert len(_feature_interface_fields("ChatReplyResponse")) == 4
+    assert len(_feature_interface_fields("QuestionnaireChatMessage")) == 6

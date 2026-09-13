@@ -2,7 +2,10 @@
 # These tests prove our routes are registered, correctly pathed, and — in a
 # privacy product, non-negotiably — authenticated with the right scope.
 from fides.api.oauth.utils import verify_oauth_client
-from fides.api.privacycare.api.router import PRIVACYCARE_PREFIX
+from fides.api.privacycare.api.router import (
+    PRIVACYCARE_CHAT_PREFIX,
+    PRIVACYCARE_PREFIX,
+)
 from fides.common.scope_registry import SYSTEM_READ
 
 # Suffixes, composed against the real prefix below. This file's job is "these
@@ -26,6 +29,21 @@ EXPECTED_READ_PATHS = {
     f"{PRIVACYCARE_PATH_PREFIX}{suffix}" for suffix in EXPECTED_READ_SUFFIXES
 }
 
+# The questionnaire chat's own router (task 3/4), a separate prefix from
+# PRIVACYCARE_PATH_PREFIX above — see api/router.py's own comment on why it
+# is a distinct APIRouter. Two of the three are writes (start/reply are
+# POST), not reads; kept in their own set rather than folded into
+# EXPECTED_READ_PATHS so that name stays honest about what it lists.
+EXPECTED_CHAT_SUFFIXES = {
+    "/start",
+    "/reply",
+    "/messages/{questionnaire_id}",
+}
+
+EXPECTED_CHAT_PATHS = {
+    f"{PRIVACYCARE_CHAT_PREFIX}{suffix}" for suffix in EXPECTED_CHAT_SUFFIXES
+}
+
 
 def _app():
     import fides.api.privacycare.asgi as asgi
@@ -46,16 +64,28 @@ def _privacycare_routes():
     # path-keyed lookup would check only one of them. Iterating app.routes
     # directly means a later method added to an existing path still gets
     # its own dependency check here.
+    #
+    # Both prefixes, not just PRIVACYCARE_PATH_PREFIX: the questionnaire
+    # chat router is a separate APIRouter on its own prefix (see
+    # api/router.py), and the scope assertion below is meant to cover
+    # every route this module registers, not just the original
+    # plus/privacy-assessments surface.
+    prefixes = (PRIVACYCARE_PATH_PREFIX, PRIVACYCARE_CHAT_PREFIX)
     return [
         r
         for r in _app().routes
-        if getattr(r, "path", "").startswith(PRIVACYCARE_PATH_PREFIX)
+        if getattr(r, "path", "").startswith(prefixes)
     ]
 
 
 def test_read_routes_are_registered():
     missing = EXPECTED_READ_PATHS - set(_routes())
     assert not missing, f"routes not registered: {sorted(missing)}"
+
+
+def test_chat_routes_are_registered():
+    missing = EXPECTED_CHAT_PATHS - set(_routes())
+    assert not missing, f"chat routes not registered: {sorted(missing)}"
 
 
 def test_every_assessment_route_requires_verify_oauth_client_with_system_read():
