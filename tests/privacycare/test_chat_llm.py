@@ -69,6 +69,28 @@ def test_an_unreachable_gateway_accepts_the_human_s_answer(monkeypatch):
     assert judge_reply({"question_text": "Q?"}, "An answer.") is True
 
 
+def test_an_empty_gateway_reply_accepts_the_human_s_answer(monkeypatch):
+    # An empty completion is a MODEL failure, not a judgement, and takes the
+    # same default as an unreachable gateway. It used to be routed through
+    # _is_decline, which reads an empty string as a decline — correct for
+    # generator.py, exactly backwards here — so a gateway answering 200 with
+    # an empty body discarded the officer's typed reply and re-asked the
+    # question. To the officer that is the same lost work GatewayUnavailable
+    # was specifically defaulted to avoid, arrived at through another door.
+    for empty in ("", "   ", "\n\t"):
+        monkeypatch.setattr("fides.api.privacycare.chat_llm.complete",
+                            lambda *a, _v=empty, **k: _v)
+        assert judge_reply({"question_text": "Q?"}, "Consent, at signup.") is True, (
+            f"an empty completion ({empty!r}) discarded the officer's answer"
+        )
+
+
+def test_a_gateway_reply_of_none_accepts_the_human_s_answer(monkeypatch):
+    monkeypatch.setattr("fides.api.privacycare.chat_llm.complete",
+                        lambda *a, **k: None)
+    assert judge_reply({"question_text": "Q?"}, "Consent, at signup.") is True
+
+
 def test_a_very_long_reply_is_truncated_before_it_reaches_the_gateway(monkeypatch):
     # The officer types into a chat box and nothing upstream bounds what
     # arrives. A pasted policy document would otherwise go to the gateway

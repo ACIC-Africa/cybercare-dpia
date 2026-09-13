@@ -174,7 +174,9 @@ def judge_reply(question: dict, reply: str, *, model: str | None = None) -> bool
     never in doubt on their end. This is the opposite default to
     phrase_question above, deliberately: there the failure is ours to
     absorb cheaply (ask less conversationally); here the failure would be
-    passed on to the officer as lost work, which is not ours to spend.
+    passed on to the officer as lost work, which is not ours to spend. An
+    EMPTY completion takes the same default, for the same reason — see the
+    branch below the call.
 
     NOT_ANSWERED is recognised through generator._is_decline, reused
     rather than re-implemented: a model that wraps ITS one-word sentinel
@@ -198,4 +200,24 @@ def judge_reply(question: dict, reply: str, *, model: str | None = None) -> bool
         )
         return True
 
-    return not _is_decline(verdict or "", NOT_ANSWERED_SENTINEL)
+    # An empty completion is a MODEL FAILURE, not a judgement, and takes the
+    # same default as the unreachable gateway above: accept.
+    #
+    # This branch has to be written out rather than left to _is_decline,
+    # which returns True for an empty string — correctly, for the caller it
+    # was written for (generator.py, where an empty draft is nothing to
+    # file), and exactly backwards here. A gateway answering 200 with an
+    # empty body used to discard the officer's typed reply and re-ask the
+    # question: the "lost work" outcome this function's documented default
+    # exists to prevent, reached through a different door than
+    # GatewayUnavailable. To the officer the two failures are the same
+    # failure, so they get the same answer.
+    if not (verdict or "").strip():
+        logger.warning(
+            "PrivacyCare chat accepted a reply the gateway returned an empty "
+            "judgement for ({})",
+            question.get("question_key", question["question_text"]),
+        )
+        return True
+
+    return not _is_decline(verdict, NOT_ANSWERED_SENTINEL)
