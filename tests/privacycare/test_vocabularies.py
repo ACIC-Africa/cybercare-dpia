@@ -170,6 +170,21 @@ def test_expected_coverage_vocabulary_matches_the_shipped_questions():
     )
 
 
+def test_questionnaire_statuses_agree_with_database_ui_and_upstream():
+    # questionnaire.status IS a native Postgres enum (verified against the
+    # live schema: information_schema.columns reports udt_name
+    # 'questionnairestatus', a USER-DEFINED type — unlike
+    # privacy_assessment_task.status, which is a plain varchar). All three
+    # authorities apply, same as EQUAL_THREE_WAYS above.
+    from fides.api.models.questionnaire import QuestionnaireStatus
+    from fides.api.privacycare.chat import QUESTIONNAIRE_STATUSES
+
+    ours = set(QUESTIONNAIRE_STATUSES)
+    assert ours == _pg_labels("questionnairestatus")
+    assert ours == _ts_enum("QuestionnaireSessionStatus")
+    assert ours == _py_enum(QuestionnaireStatus)
+
+
 def test_every_fides_sources_root_is_either_supplied_or_recorded_as_unsupported():
     # Derived from the live templates, not from our own frozenset — the
     # previous version of this check restated UNSUPPORTED_SOURCE_ROOTS back to
