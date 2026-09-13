@@ -76,8 +76,21 @@ _SELECT_CONFIG_FOR_UPDATE_SQL = sqlalchemy.text(
     "ORDER BY created_at ASC NULLS LAST, id ASC LIMIT 1 FOR UPDATE"
 )
 
+# An ADVISORY lock, not LOCK TABLE. Both serialise the bootstrap correctly,
+# and a two-connection probe confirmed the table lock genuinely blocks — but
+# SHARE ROW EXCLUSIVE blocks every writer of privacy_assessment_config for the
+# duration, including Ethyca code this module cannot see. We are a guest in
+# their schema: taking a table-wide lock on their table to solve a problem
+# entirely of our own making is more coupling than the job needs.
+#
+# pg_advisory_xact_lock never touches the table's lock manager at all. It
+# serialises only callers that ask for this same key, which is exactly and
+# only this function's bootstrap path, and it releases with the transaction so
+# no caller can leak one. The key is an arbitrary constant chosen to be
+# recognisable in pg_locks when someone is debugging a stall.
+_CONFIG_BOOTSTRAP_LOCK_KEY = 8_675_309
 _LOCK_CONFIG_TABLE_SQL = sqlalchemy.text(
-    "LOCK TABLE privacy_assessment_config IN SHARE ROW EXCLUSIVE MODE"
+    "SELECT pg_advisory_xact_lock(:key)"
 )
 
 # Column-less INSERT, same shape as the seeding migration's own `INSERT INTO
@@ -114,7 +127,7 @@ def _lock_config_row(db: Session) -> dict:
        exactly the shape of the named race: two concurrent callers each
        run step 1, each see zero rows, and with nothing locked yet, both
        would proceed to insert. So when (and only when) step 1 comes back
-       empty, this escalates to `LOCK TABLE ... SHARE ROW EXCLUSIVE MODE`,
+       empty, this escalates to an advisory lock,
        which DOES serialize against a second caller doing the same thing —
        the second transaction to reach this statement blocks until the
        first commits or rolls back. Once unblocked, it re-reads (this same
@@ -131,7 +144,7 @@ def _lock_config_row(db: Session) -> dict:
     if row is not None:
         return dict(row)
 
-    db.execute(_LOCK_CONFIG_TABLE_SQL)
+    db.execute(_LOCK_CONFIG_TABLE_SQL, {"key": _CONFIG_BOOTSTRAP_LOCK_KEY})
     row = db.execute(_SELECT_CONFIG_FOR_UPDATE_SQL).mappings().first()
     if row is not None:
         return dict(row)

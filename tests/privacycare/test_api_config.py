@@ -178,29 +178,54 @@ def test_get_or_create_config_core_is_idempotent(db, monkeypatch):
 
 
 def test_update_config_core_rejects_a_field_outside_the_allow_list(db):
-    # The SET-clause allow-list guard: _update_config must never receive a
-    # dict with a key outside _UPDATABLE_CONFIG_FIELDS, but if it somehow
-    # did (a future field added to the request model without updating the
-    # allow-list), it must raise — not silently interpolate an
-    # attacker/bug-controlled identifier into SQL.
+    # The SET clause interpolates column NAMES — values bind, identifiers
+    # cannot — so this allow-list is the only thing between a caller-supplied
+    # key and the SQL. It must RAISE, not assert: `python -O` strips asserts,
+    # and the guard would then vanish under an optimisation flag.
+    #
+    # This used to assert the CONTENTS of _UPDATABLE_CONFIG_FIELDS, which
+    # proved the set had the values someone typed and nothing about whether
+    # the guard exists. Deleting the raise left it green. It now calls the
+    # function with a key outside the set.
+    # Stands in for the future change this guards against: a field added to
+    # the request contract without being added to the allow-list. Nothing can
+    # construct that state through PrivacyAssessmentConfigUpdate today, which
+    # is why the guard needs a stand-in rather than a real payload.
+    class _ContractWithAnUnlistedField:
+        def model_dump(self, **_kwargs):
+            return {"completeness": 1.0}
+
+    with pytest.raises(ValueError, match="_UPDATABLE_CONFIG_FIELDS"):
+        _update_config(db, _ContractWithAnUnlistedField())
+
+
+def test_the_allow_list_covers_exactly_the_updatable_contract_fields(db):
+    # Separate from the guard test above, and for a different reason: a field
+    # the UI can send that is NOT in the allow-list would be silently dropped
+    # from every update, and the settings screen would appear to save a value
+    # it never wrote.
     from fides.api.privacycare.api.config import _UPDATABLE_CONFIG_FIELDS
+    from fides.api.privacycare.api.schemas import PrivacyAssessmentConfigUpdate
 
-    assert _UPDATABLE_CONFIG_FIELDS == {
-        "assessment_model_override",
-        "chat_model_override",
-        "reassessment_enabled",
-        "reassessment_cron",
-        "slack_channel_id",
-        "slack_channel_name",
-    }
+    assert set(PrivacyAssessmentConfigUpdate.model_fields) == set(
+        _UPDATABLE_CONFIG_FIELDS
+    ), (
+        "the update contract and the SET allow-list disagree; a field in the "
+        "contract but not the allow-list is silently discarded on every save"
+    )
 
 
-def test_defaults_core_matches_the_route():
-    assert _defaults() == {
-        "default_assessment_model": get_assessment_config_defaults().default_assessment_model,
-        "default_chat_model": get_assessment_config_defaults().default_chat_model,
-        "default_reassessment_cron": get_assessment_config_defaults().default_reassessment_cron,
-    }
+def test_the_defaults_are_the_constants_the_platform_actually_uses():
+    # This used to compare _defaults() against the route that wraps it — the
+    # function against itself, which holds however wrong both are. The
+    # authority is llm.DEFAULT_MODEL, the constant generation and chat call.
+    from fides.api.privacycare.llm import DEFAULT_MODEL
+
+    defaults = _defaults()
+
+    assert defaults["default_assessment_model"] == DEFAULT_MODEL
+    assert defaults["default_chat_model"] == DEFAULT_MODEL
+    assert defaults["default_reassessment_cron"], "a cron default must exist"
 
 
 def test_the_config_routes_are_matched_before_the_assessment_id_route():
