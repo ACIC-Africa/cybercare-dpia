@@ -56,13 +56,32 @@ def _registered_paths() -> set[str]:
     }
 
 
+# Endpoints a later plan still owns — genuinely not built yet, so this test
+# must fail for a WRONG path, not for an unbuilt one.
+#
+# This used to be a substring match on ("questionnaire", "chat/", "config",
+# "pdf"), which would have kept silently skipping plus/chat/questionnaire/
+# start and plus/chat/questionnaire/reply even after task 3 built and
+# registered both — exactly the kind of stale skip masking real coverage
+# this plan's router-prefix mistake (test_response_model_ts_parity.py's
+# PRIVACYCARE_PATH_PREFIXES) already happened twice for. An exact set of the
+# URLs still unbuilt does not silently widen to swallow a route a later task
+# ships.
+NOT_BUILT_YET = frozenset(
+    {
+        "plus/chat/questionnaire/messages/{param}",
+        "plus/privacy-assessments/config",
+        "plus/privacy-assessments/config/defaults",
+        "plus/privacy-assessments/{param}/pdf",
+        "plus/privacy-assessments/{param}/questionnaire",
+        "plus/privacy-assessments/{param}/questionnaire/reminders",
+    }
+)
+
+
 @pytest.mark.parametrize("url", _slice_urls())
 def test_every_url_the_shipped_ui_calls_reaches_a_registered_route(url):
-    # Skips the endpoints a later plan owns (questionnaire, chat, config, pdf)
-    # — they are genuinely not built yet, and this test must fail for a WRONG
-    # path, not for an unbuilt one.
-    not_built_yet = ("questionnaire", "chat/", "config", "pdf")
-    if any(token in url for token in not_built_yet):
+    if url in NOT_BUILT_YET:
         pytest.skip(f"{url} belongs to a workstream that is not built yet")
 
     expected = f"{_api_base()}/{url}"

@@ -524,6 +524,82 @@ class AssessmentTaskResponse(BaseModel):
     updated_at: Optional[str]
 
 
+class QuestionnaireSessionStatus(str, Enum):
+    # Mirrors the `export enum QuestionnaireSessionStatus` in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. Same three
+    # values as chat.py's QUESTIONNAIRE_STATUSES (the questionnaire.status
+    # pg_enum labels) — that module's own docstring already pins this set
+    # against the database and Ethyca's Python; this pins the same set
+    # against the UI contract, and test_the_question_status_enum_matches_
+    # the_shipped_contract (test_api_chat.py) asserts the two never drift
+    # apart from each other.
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    STOPPED = "stopped"
+
+
+class QuestionnaireChatMessage(BaseModel):
+    # Mirrors QuestionnaireChatMessage in
+    # clients/admin-ui/src/features/privacy-assessments/types.ts. Every
+    # field but `text`/`is_bot_message` is required-but-nullable in that
+    # contract (no `?`, `| null` instead) — no defaults, same precedent as
+    # EvidenceItem.citation_number above.
+    text: str
+    is_bot_message: bool
+    sender_email: Optional[str]
+    sender_display_name: Optional[str]
+    timestamp: Optional[str]
+    question_index: Optional[int]
+
+
+class StartChatRequest(BaseModel):
+    # Mirrors StartChatRequest in the same feature types.ts file.
+    # `include_question_ids` carries a genuine `?` there (an optional
+    # narrowing of which questions this session covers, per chat.py's
+    # open_or_resume) — Optional[...] = None is the right shape, same
+    # precedent as UpdatePrivacyAssessmentRequest's fields.
+    assessment_id: str
+    include_question_ids: Optional[List[str]] = None
+
+
+class StartChatResponse(BaseModel):
+    # Mirrors StartChatResponse in the same feature types.ts file. All four
+    # fields are required, non-nullable there (no `?`, no `| null`) — no
+    # defaults.
+    questionnaire_id: str
+    assessment_id: str
+    messages: List[QuestionnaireChatMessage]
+    total_questions: int
+
+
+class ChatReplyRequest(BaseModel):
+    # Mirrors ChatReplyRequest in the same feature types.ts file, WITH ONE
+    # DELIBERATE DEVIATION from that contract: the TS interface types
+    # `assessment_id` as required (`string`, no `?`), but
+    # privacy-assessments.slice.ts's chat mutation strips it before the
+    # request ever reaches the wire (`query: ({ assessment_id: _, ...body })
+    # => body`) — the officer's assessment_id is not sent on a reply, only
+    # on start. Typing this field as Optional[str] = None, against the
+    # letter of the TS interface, is therefore the correct read of the
+    # ACTUAL contract: "required-but-nullable" is for a key that is always
+    # present with a possibly-null value, and this key is not present at
+    # all. The questionnaire is looked up by questionnaire_id alone; nothing
+    # in api/chat.py reads this field.
+    assessment_id: Optional[str] = None
+    questionnaire_id: str
+    message_text: str
+
+
+class ChatReplyResponse(BaseModel):
+    # Mirrors ChatReplyResponse in the same feature types.ts file. All four
+    # fields are required there (no `?`) and `status` is typed against the
+    # QuestionnaireSessionStatus enum, not a bare string.
+    bot_messages: List[QuestionnaireChatMessage]
+    status: QuestionnaireSessionStatus
+    answered_questions: int
+    total_questions: int
+
+
 # GroupedAssessmentsResponse is fastapi_pagination.Page[AssessmentGroupResponse].
 # Its field set (items/total/page/size/pages) already matches the
 # GroupedAssessmentsResponse TS contract field-for-field — see

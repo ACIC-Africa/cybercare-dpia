@@ -31,6 +31,7 @@ import typing
 from pydantic import BaseModel
 
 from fides.api.privacycare.api.router import (
+    PRIVACYCARE_CHAT_PREFIX,
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
 )
@@ -172,7 +173,18 @@ ALLOWLIST: dict[str, dict] = {
 # and a walk anchored on the assessments prefix alone would have skipped that
 # whole router in silence — a passing test measuring nothing, which is exactly
 # the failure this file exists to catch.
-PRIVACYCARE_PATH_PREFIXES = (PRIVACYCARE_PREFIX, PRIVACYCARE_PROCESSES_PREFIX)
+#
+# PRIVACYCARE_CHAT_PREFIX (task 3, the questionnaire chat's own router) is the
+# THIRD router added to this app, and the second time one was added without
+# this tuple being updated to match — the walk silently covered nothing for
+# the whole plan (fix round for the processes router) until someone noticed.
+# Do not let a fourth router repeat it: if `register()` in api/router.py ever
+# gains another `app_setup.ROUTERS.append(...)`, its prefix belongs here too.
+PRIVACYCARE_PATH_PREFIXES = (
+    PRIVACYCARE_PREFIX,
+    PRIVACYCARE_PROCESSES_PREFIX,
+    PRIVACYCARE_CHAT_PREFIX,
+)
 
 
 def _privacycare_response_models():

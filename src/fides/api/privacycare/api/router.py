@@ -42,6 +42,18 @@ privacycare_processes_router = APIRouter(
     prefix=PRIVACYCARE_PROCESSES_PREFIX, tags=["PrivacyCare"]
 )
 
+# The questionnaire chat surface. A THIRD, separate prefix family — neither
+# the shipped UI's own `plus/privacy-assessments` path nor our own
+# `privacycare/business-processes` namespace, but a third shipped path the
+# admin UI's chat slice calls directly (StartChatRequest/ChatReplyRequest in
+# clients/admin-ui/src/features/privacy-assessments/types.ts). It gets its
+# own router for the same reason privacycare_processes_router does: a
+# different URL prefix cannot live on an APIRouter already constructed with
+# a different one.
+PRIVACYCARE_CHAT_PREFIX = f"{V1_URL_PREFIX}/plus/chat/questionnaire"
+
+privacycare_chat_router = APIRouter(prefix=PRIVACYCARE_CHAT_PREFIX, tags=["PrivacyCare"])
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -100,6 +112,12 @@ def register() -> None:
     importlib.import_module("fides.api.privacycare.api.assessments")
     importlib.import_module("fides.api.privacycare.api.processes")
 
+    # chat.py decorates its OWN router (privacycare_chat_router, a distinct
+    # prefix), so it carries none of the tasks-vs-assessments matching-order
+    # hazard above — nothing here is registered against privacycare_router.
+    importlib.import_module("fides.api.privacycare.api.chat")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
+    app_setup.ROUTERS.append(privacycare_chat_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
