@@ -1,8 +1,7 @@
 # The questionnaire chat session core, against real rows. Inserts are
 # rolled back.
-import json
-
 import dataclasses
+import json
 
 import pytest
 import sqlalchemy

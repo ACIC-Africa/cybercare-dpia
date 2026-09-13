@@ -5,8 +5,8 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.api.assessments import _assessment_detail
 from fides.api.privacycare.api.answers import write_answer
+from fides.api.privacycare.api.assessments import _assessment_detail
 from fides.api.privacycare.report import Report, ReportCitation, build_report
 from tests.privacycare.test_api_assessments import (
     _seed_answer_with_evidence,
