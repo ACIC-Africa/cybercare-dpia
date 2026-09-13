@@ -29,6 +29,7 @@ chain is append-only (write_answer's own contract), a wrong echo is not a
 disaster either — the officer's correction becomes version 2 with both
 preserved.
 """
+
 from typing import List
 
 import sqlalchemy
@@ -63,6 +64,7 @@ from fides.api.privacycare.chat import (
 )
 from fides.api.privacycare.chat_llm import judge_reply, phrase_question
 from fides.api.privacycare.context import GenerationTarget, build_context
+from fides.api.privacycare.settings import resolve_chat_model
 from fides.common.scope_registry import SYSTEM_READ
 
 # The one bot message shown once nothing is left to ask — either because
@@ -72,8 +74,7 @@ from fides.common.scope_registry import SYSTEM_READ
 # Never sent as an empty string or omitted: an assistant turn with nothing
 # to say reads to the officer as the app having silently failed.
 _SESSION_COMPLETE_MESSAGE = (
-    "That's everything for this session — thank you. "
-    "The questionnaire is now complete."
+    "That's everything for this session — thank you. The questionnaire is now complete."
 )
 
 _QUESTIONNAIRE_BY_ID_SQL = sqlalchemy.text(
@@ -203,7 +204,12 @@ def _start_chat(db: Session, request: StartChatRequest) -> StartChatResponse:
             session = advance(db, session, from_index=session.current_question_index)
     elif not question_already_asked(db, session.id, session.current_question_index):
         context = _context_for(db, session.assessment_id)
-        text = phrase_question(question, context)
+        # The model the officer's settings screen says the chat uses. Chat
+        # carries no per-request model, so this is the configured override
+        # or llm.DEFAULT_MODEL — see privacycare/settings.py. Passed
+        # explicitly rather than left to chat_llm's `model or DEFAULT_MODEL`
+        # fallback, which would silently ignore the override.
+        text = phrase_question(question, context, model=resolve_chat_model(db))
         record_message(
             db,
             session.id,
@@ -221,7 +227,9 @@ def _start_chat(db: Session, request: StartChatRequest) -> StartChatResponse:
     )
 
 
-def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReplyResponse:
+def _reply(
+    db: Session, request: ChatReplyRequest, created_by: str
+) -> ChatReplyResponse:
     """Persist the officer's message, judge it, and respond.
 
     Answered: record_answer_and_advance files it verbatim and moves the
@@ -257,6 +265,11 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
     session = begin_turn(db, _session_by_id(db, request.questionnaire_id))
     session = skip_unresolvable_questions(db, session)
     question = current_question(db, session)
+    # One resolution for the whole turn: judging a reply and phrasing the
+    # next question are one exchange with the officer and must not be able
+    # to land on two different models if the setting changes mid-turn. See
+    # privacycare/settings.py for the precedence.
+    model = resolve_chat_model(db)
 
     record_message(
         db,
@@ -292,7 +305,7 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
         if session.status != "completed":
             session = advance(db, session, from_index=session.current_question_index)
         bot_turns.append((_SESSION_COMPLETE_MESSAGE, None))
-    elif judge_reply(question, request.message_text):
+    elif judge_reply(question, request.message_text, model=model):
         answered_index = session.current_question_index
         session = record_answer_and_advance(
             db, session, request.message_text, created_by
@@ -305,7 +318,10 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
         if next_question is not None:
             context = _context_for(db, session.assessment_id)
             bot_turns.append(
-                (phrase_question(next_question, context), session.current_question_index)
+                (
+                    phrase_question(next_question, context, model=model),
+                    session.current_question_index,
+                )
             )
         else:
             bot_turns.append((_SESSION_COMPLETE_MESSAGE, None))
@@ -315,7 +331,10 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
         # guess at one.
         context = _context_for(db, session.assessment_id)
         bot_turns.append(
-            (phrase_question(question, context), session.current_question_index)
+            (
+                phrase_question(question, context, model=model),
+                session.current_question_index,
+            )
         )
 
     for text, question_index in bot_turns:

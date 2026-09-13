@@ -41,6 +41,7 @@ from tests.privacycare.test_api_schemas import (
     _feature_interface_fields,
     _ts_enum_values,
 )
+from tests.privacycare.test_settings import _set_model_overrides
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -81,26 +82,34 @@ def _no_commit(db, monkeypatch):
 
 
 def _answer_row(db, assessment_id: str, question_id: str):
-    return db.execute(
-        sqlalchemy.text(
-            "SELECT av.answer_text, av.answer_status, av.answer_source, "
-            "       av.change_type, av.created_by "
-            "FROM assessment_answer a "
-            "JOIN answer_version av ON av.id = a.current_version_id "
-            "WHERE a.assessment_id = :aid AND a.question_id = :qid"
-        ),
-        {"aid": assessment_id, "qid": question_id},
-    ).mappings().first()
+    return (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT av.answer_text, av.answer_status, av.answer_source, "
+                "       av.change_type, av.created_by "
+                "FROM assessment_answer a "
+                "JOIN answer_version av ON av.id = a.current_version_id "
+                "WHERE a.assessment_id = :aid AND a.question_id = :qid"
+            ),
+            {"aid": assessment_id, "qid": question_id},
+        )
+        .mappings()
+        .first()
+    )
 
 
 def _questionnaire_row(db, questionnaire_id: str):
-    return db.execute(
-        sqlalchemy.text(
-            "SELECT status, current_question_index FROM questionnaire "
-            "WHERE id = :id"
-        ),
-        {"id": questionnaire_id},
-    ).mappings().first()
+    return (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT status, current_question_index FROM questionnaire "
+                "WHERE id = :id"
+            ),
+            {"id": questionnaire_id},
+        )
+        .mappings()
+        .first()
+    )
 
 
 # --- POST plus/chat/questionnaire/start ---
@@ -137,20 +146,96 @@ def test_start_on_an_assessment_with_nothing_pending_returns_a_completed_session
     # would require a session to already be open) — pending_question_ids
     # (chat.py) excludes a 'complete' answer, so the FIRST session
     # open_or_resume ever creates here has zero questions to ask.
-    write_answer(db, aid, qid, "Already answered before chat started.", "alice@example.com")
+    write_answer(
+        db, aid, qid, "Already answered before chat started.", "alice@example.com"
+    )
     db.flush()
     _no_commit(db, monkeypatch)
 
     response = start_questionnaire_chat(StartChatRequest(assessment_id=aid), db=db)
 
     assert response.total_questions == 0
-    assert response.messages == [], (
-        "nothing pending must not be shown an empty prompt"
-    )
+    assert response.messages == [], "nothing pending must not be shown an empty prompt"
     # The underlying session really is completed, not merely reported as if
     # it were — advance() is what actually transitions it.
     row = _questionnaire_row(db, response.questionnaire_id)
     assert row["status"] == "completed"
+
+
+def _models_chat_called_with(db, monkeypatch, override) -> dict:
+    """Start one chat turn and report which model each chat_llm call got.
+
+    Captured at the call site the review found empty-handed: api/chat.py
+    passed NO model at all, so chat always fell through to
+    llm.DEFAULT_MODEL and chat_model_override was read by nothing.
+    """
+    _set_model_overrides(db, chat=override)
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Chat Model DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    db.flush()
+    _no_commit(db, monkeypatch)
+
+    seen: dict = {}
+
+    def _phrase(question, context, **kw):
+        seen["phrase"] = kw.get("model")
+        return "[phrased]"
+
+    monkeypatch.setattr("fides.api.privacycare.api.chat.phrase_question", _phrase)
+
+    start_questionnaire_chat(StartChatRequest(assessment_id=aid), db=db)
+    assert "phrase" in seen, "phrase_question was never called"
+    return seen
+
+
+def test_chat_uses_the_model_the_settings_screen_configured(db, monkeypatch):
+    seen = _models_chat_called_with(db, monkeypatch, "claude-opus-5")
+
+    assert seen["phrase"] == "claude-opus-5"
+
+
+def test_chat_falls_back_to_the_platform_default_with_no_override(db, monkeypatch):
+    from fides.api.privacycare.llm import DEFAULT_MODEL
+
+    seen = _models_chat_called_with(db, monkeypatch, None)
+
+    assert seen["phrase"] == DEFAULT_MODEL
+
+
+def test_judging_a_reply_uses_the_configured_chat_model_too(db, monkeypatch):
+    """Judging is a gateway call on the officer's own words, exactly like
+    phrasing. If only phrasing honoured the setting, the screen would be
+    half-true — and "which model saw our personal data" would have two
+    answers.
+    """
+    _set_model_overrides(db, chat="claude-opus-5")
+    questionnaire_id = _started_session(db, monkeypatch, question_count=2)
+
+    seen: dict = {}
+
+    def _judge(question, reply, **kw):
+        seen["judge"] = kw.get("model")
+        return True
+
+    def _phrase(question, context, **kw):
+        seen["phrase"] = kw.get("model")
+        return "[phrased]"
+
+    monkeypatch.setattr("fides.api.privacycare.api.chat.judge_reply", _judge)
+    monkeypatch.setattr("fides.api.privacycare.api.chat.phrase_question", _phrase)
+
+    reply_to_questionnaire_chat(
+        ChatReplyRequest(
+            questionnaire_id=questionnaire_id,
+            message_text="We retain fuel card records for seven years.",
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert seen["judge"] == "claude-opus-5"
+    assert seen["phrase"] == "claude-opus-5"
 
 
 def test_start_unknown_assessment_is_a_404(db, monkeypatch):
@@ -176,7 +261,9 @@ def _started_session(db, monkeypatch, *, question_count: int = 2) -> str:
         _seed_question(db, tid, f"q{i}", "necessity", i + 1)
     db.flush()
     _no_commit(db, monkeypatch)
-    return start_questionnaire_chat(StartChatRequest(assessment_id=aid), db=db).questionnaire_id
+    return start_questionnaire_chat(
+        StartChatRequest(assessment_id=aid), db=db
+    ).questionnaire_id
 
 
 def test_reply_files_the_answer_verbatim_and_returns_the_next_bot_message(
@@ -381,7 +468,8 @@ def test_get_messages_is_the_bare_array_the_slice_declares():
     route = next(
         r
         for r in app.routes
-        if getattr(r, "path", "") == f"{PRIVACYCARE_CHAT_PREFIX}/messages/{{questionnaire_id}}"
+        if getattr(r, "path", "")
+        == f"{PRIVACYCARE_CHAT_PREFIX}/messages/{{questionnaire_id}}"
         and "GET" in getattr(r, "methods", set())
     )
     assert route.response_model == List[QuestionnaireChatMessage], (
@@ -399,7 +487,9 @@ def test_get_messages_on_a_session_with_nothing_said_yet_is_a_200_with_an_empty_
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Nothing Pending For Transcript DPIA")
     qid = _seed_question(db, tid, "q1", "necessity", 1)
-    write_answer(db, aid, qid, "Already answered before chat started.", "alice@example.com")
+    write_answer(
+        db, aid, qid, "Already answered before chat started.", "alice@example.com"
+    )
     db.flush()
     _no_commit(db, monkeypatch)
     questionnaire_id = start_questionnaire_chat(
@@ -486,17 +576,21 @@ def _seeded_chat(db, monkeypatch, question_count: int):
 
 def _filed(db, assessment_id: str) -> dict:
     """{question_key: [answer_text, ...]} — every version, oldest first."""
-    rows = db.execute(
-        sqlalchemy.text(
-            "SELECT q.question_key, av.answer_text, av.version_number "
-            "FROM assessment_answer a "
-            "JOIN answer_version av ON av.answer_id = a.id "
-            "JOIN assessment_question q ON q.id = a.question_id "
-            "WHERE a.assessment_id = :aid "
-            "ORDER BY q.question_key, av.version_number"
-        ),
-        {"aid": assessment_id},
-    ).mappings().all()
+    rows = (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT q.question_key, av.answer_text, av.version_number "
+                "FROM assessment_answer a "
+                "JOIN answer_version av ON av.answer_id = a.id "
+                "JOIN assessment_question q ON q.id = a.question_id "
+                "WHERE a.assessment_id = :aid "
+                "ORDER BY q.question_key, av.version_number"
+            ),
+            {"aid": assessment_id},
+        )
+        .mappings()
+        .all()
+    )
     filed: dict = {}
     for row in rows:
         filed.setdefault(row["question_key"], []).append(row["answer_text"])
@@ -534,8 +628,10 @@ def test_two_interleaved_replies_ask_every_question_exactly_once(db, monkeypatch
     )
     monkeypatch.setattr(
         "fides.api.privacycare.api.chat.phrase_question",
-        lambda question, context, **kw: asked.append(question["question_key"])
-        or f"[phrased] {question['question_key']}",
+        lambda question, context, **kw: (
+            asked.append(question["question_key"])
+            or f"[phrased] {question['question_key']}"
+        ),
     )
     # Every reply is handed the same index-0 handle — the shape an unlocked
     # read produces when two replies are in flight at once.
@@ -767,14 +863,18 @@ def test_starting_twice_returns_the_transcript_without_re_asking(db, monkeypatch
     calls: list = []
     monkeypatch.setattr(
         "fides.api.privacycare.api.chat.phrase_question",
-        lambda question, context, **kw: calls.append(question["question_key"])
-        or f"[phrased] {question['question_key']}",
+        lambda question, context, **kw: (
+            calls.append(question["question_key"])
+            or f"[phrased] {question['question_key']}"
+        ),
     )
     _, questionnaire_id = _seeded_chat(db, monkeypatch, 2)
     assert calls == ["q0"]
 
     again = start_questionnaire_chat(
-        StartChatRequest(assessment_id=_session_by_id(db, questionnaire_id).assessment_id),
+        StartChatRequest(
+            assessment_id=_session_by_id(db, questionnaire_id).assessment_id
+        ),
         db=db,
     )
 
@@ -810,8 +910,10 @@ def test_resuming_onto_a_question_nobody_has_asked_yet_does_ask_it(db, monkeypat
     )
     monkeypatch.setattr(
         "fides.api.privacycare.api.chat.phrase_question",
-        lambda question, context, **kw: calls.append(question["question_key"])
-        or f"[phrased] {question['question_key']}",
+        lambda question, context, **kw: (
+            calls.append(question["question_key"])
+            or f"[phrased] {question['question_key']}"
+        ),
     )
 
     again = start_questionnaire_chat(StartChatRequest(assessment_id=aid), db=db)
@@ -867,7 +969,9 @@ def test_the_404_for_a_genuinely_missing_questionnaire_still_names_it(db, monkey
     assert exc_info.value.detail == "No questionnaire with id qnr_doesnotexist"
 
 
-def test_the_404_for_a_missing_assessment_on_start_names_the_assessment(db, monkeypatch):
+def test_the_404_for_a_missing_assessment_on_start_names_the_assessment(
+    db, monkeypatch
+):
     _no_commit(db, monkeypatch)
     with pytest.raises(HTTPException) as exc_info:
         start_questionnaire_chat(StartChatRequest(assessment_id="pa_not_here"), db=db)

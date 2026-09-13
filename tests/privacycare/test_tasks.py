@@ -32,6 +32,7 @@ import sqlalchemy
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from fides.api.privacycare.llm import DEFAULT_MODEL
 from fides.api.privacycare.tasks import run_generation
 from tests.privacycare.test_api_assessments import _seed_question, _seed_template
 from tests.privacycare.test_context import (
@@ -39,6 +40,7 @@ from tests.privacycare.test_context import (
     _seed_declaration,
     _seed_system,
 )
+from tests.privacycare.test_settings import _set_model_overrides
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -89,15 +91,17 @@ def _seed_task(
     use_llm=False,
     high_risk_only=False,
     created_by="alice@example.com",
+    llm_model=None,
 ) -> str:
     task_id = f"pat_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
             "INSERT INTO privacy_assessment_task "
             "(id, action_type, status, celery_id, assessment_types, "
-            " system_fides_keys, created_by, use_llm, high_risk_only) "
+            " system_fides_keys, created_by, use_llm, high_risk_only, "
+            " llm_model) "
             "VALUES (:id, 'generate', 'pending', :celery_id, :types, "
-            " :keys, :created_by, :use_llm, :high_risk_only)"
+            " :keys, :created_by, :use_llm, :high_risk_only, :llm_model)"
         ),
         {
             "id": task_id,
@@ -107,42 +111,55 @@ def _seed_task(
             "created_by": created_by,
             "use_llm": use_llm,
             "high_risk_only": high_risk_only,
+            "llm_model": llm_model,
         },
     )
     return task_id
 
 
 def _timestamps(db, task_id):
-    return db.execute(
-        sqlalchemy.text(
-            "SELECT created_at, updated_at FROM privacy_assessment_task "
-            "WHERE id = :id"
-        ),
-        {"id": task_id},
-    ).mappings().first()
+    return (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT created_at, updated_at FROM privacy_assessment_task "
+                "WHERE id = :id"
+            ),
+            {"id": task_id},
+        )
+        .mappings()
+        .first()
+    )
 
 
 def _task_row(db, task_id):
-    return db.execute(
-        sqlalchemy.text(
-            "SELECT status, total_count, completed_count, message "
-            "FROM privacy_assessment_task WHERE id = :id"
-        ),
-        {"id": task_id},
-    ).mappings().first()
+    return (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT status, total_count, completed_count, message "
+                "FROM privacy_assessment_task WHERE id = :id"
+            ),
+            {"id": task_id},
+        )
+        .mappings()
+        .first()
+    )
 
 
 def _assessments_for_task(db, task_id):
-    return db.execute(
-        sqlalchemy.text(
-            "SELECT id, name, status, system_fides_key, declaration_id, "
-            "       data_use, data_categories, template_id, created_by, "
-            "       context_snapshot, last_evaluated_at "
-            "FROM privacy_assessment WHERE privacy_assessment_task_id = :id "
-            "ORDER BY name"
-        ),
-        {"id": task_id},
-    ).mappings().all()
+    return (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT id, name, status, system_fides_key, declaration_id, "
+                "       data_use, data_categories, template_id, created_by, "
+                "       context_snapshot, last_evaluated_at "
+                "FROM privacy_assessment WHERE privacy_assessment_task_id = :id "
+                "ORDER BY name"
+            ),
+            {"id": task_id},
+        )
+        .mappings()
+        .all()
+    )
 
 
 def _full_coverage_template(db, assessment_type: str) -> str:
@@ -178,6 +195,64 @@ def test_generation_creates_one_assessment_per_declaration(db):
         "marketing.advertising",
         "essential.service.payment_processing",
     }
+
+
+def _captured_generation_model(db, monkeypatch, **task_kwargs) -> str:
+    """Run one generation and return the model answer_questions was given.
+
+    Captured at the boundary the review found broken: tasks.run_generation
+    used to hand answer_questions `task["llm_model"]` directly, so the
+    configured override could never reach the gateway however it was set.
+    """
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    _seed_declaration(db, _seed_system(db, key, name="CRM"), "marketing.advertising")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(
+        db, assessment_types=[atype], system_fides_keys=[key], **task_kwargs
+    )
+    db.flush()
+
+    captured = {}
+
+    def _capture(db_, assessment_id, context, *, use_llm, model):
+        captured["model"] = model
+        return 0
+
+    monkeypatch.setattr("fides.api.privacycare.tasks.answer_questions", _capture)
+    run_generation(db, task_id)
+
+    assert "model" in captured, "answer_questions was never called"
+    return captured["model"]
+
+
+def test_generation_uses_the_model_the_settings_screen_configured(db, monkeypatch):
+    # The finding: an officer set assessment_model_override and generation
+    # carried on calling llm.DEFAULT_MODEL, because nothing outside
+    # api/config.py ever read the config row.
+    _set_model_overrides(db, assessment="claude-opus-5")
+
+    assert _captured_generation_model(db, monkeypatch) == "claude-opus-5"
+
+
+def test_a_task_that_chose_its_own_model_is_not_overridden_by_the_config(
+    db, monkeypatch
+):
+    # Rung 1: the officer who started THIS run picked a model for it.
+    _set_model_overrides(db, assessment="claude-opus-5")
+
+    model = _captured_generation_model(db, monkeypatch, llm_model="claude-haiku-5")
+
+    assert model == "claude-haiku-5"
+
+
+def test_generation_falls_back_to_the_platform_default_with_no_override(
+    db, monkeypatch
+):
+    _set_model_overrides(db, assessment=None)
+
+    assert _captured_generation_model(db, monkeypatch) == DEFAULT_MODEL
 
 
 def test_a_finished_assessment_is_in_progress_not_generating(db):
@@ -344,7 +419,7 @@ def test_completeness_is_recomputed_after_generation(db):
     key = f"sys-{uuid.uuid4().hex[:6]}"
     _seed_declaration(db, _seed_system(db, key), "marketing.advertising")
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
-    _full_coverage_template(db, atype)   # exactly one question, full coverage
+    _full_coverage_template(db, atype)  # exactly one question, full coverage
     db.flush()
     task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
     db.flush()
@@ -487,9 +562,7 @@ def test_a_status_change_moves_updated_at_off_created_at(db):
 
     after = _timestamps(db, task_id)
     assert after["updated_at"] > after["created_at"]
-    assert after["created_at"] == before["created_at"], (
-        "created_at must not move"
-    )
+    assert after["created_at"] == before["created_at"], "created_at must not move"
 
 
 def test_every_later_status_write_moves_updated_at_again(db):

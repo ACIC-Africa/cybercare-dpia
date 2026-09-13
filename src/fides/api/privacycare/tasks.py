@@ -5,6 +5,7 @@ a Session, so it is testable directly against the database with no broker.
 generate_assessments() is a thin Celery wrapper that opens a session and
 calls it. Nothing that matters lives in the wrapper.
 """
+
 import json
 import uuid
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from fides.api.privacycare.context import (
     unresolvable_roots,
 )
 from fides.api.privacycare.generator import GENERATOR_AUTHOR, answer_questions
+from fides.api.privacycare.settings import resolve_assessment_model
 from fides.api.tasks import (
     PRIVACY_ASSESSMENTS_QUEUE_NAME,
     DatabaseTask,
@@ -149,9 +151,11 @@ def _resolve_templates(db: Session, assessment_types: list[str]) -> dict[str, st
     """
     resolved: dict[str, str] = {}
     for assessment_type in assessment_types:
-        rows = db.execute(
-            _ACTIVE_TEMPLATE_SQL, {"assessment_type": assessment_type}
-        ).mappings().all()
+        rows = (
+            db.execute(_ACTIVE_TEMPLATE_SQL, {"assessment_type": assessment_type})
+            .mappings()
+            .all()
+        )
         if not rows:
             raise LookupError(
                 f"no active assessment template for type {assessment_type!r}"
@@ -189,12 +193,10 @@ def _log_coverage_gaps(
     customer's data is thin" are reading two different, correctly-labelled
     lists rather than one undifferentiated set.
     """
-    rows = db.execute(
-        _TEMPLATE_SOURCES_SQL, {"template_id": template_id}
-    ).mappings().all()
-    source_paths = [
-        path for row in rows for path in (row["fides_sources"] or [])
-    ]
+    rows = (
+        db.execute(_TEMPLATE_SOURCES_SQL, {"template_id": template_id}).mappings().all()
+    )
+    source_paths = [path for row in rows for path in (row["fides_sources"] or [])]
     if not source_paths:
         return
 
@@ -270,6 +272,16 @@ def run_generation(db: Session, task_id: str) -> None:
     _set_status(db, task_id, "in_processing", total, 0, None)
     db.commit()
 
+    # Resolved ONCE for the whole run, not per assessment: every assessment
+    # in one run must be drafted by the same model, or the task's own
+    # metadata ("which model produced this?") describes only some of what it
+    # produced. `task["llm_model"]` is what the officer chose for THIS run
+    # when they started it and takes precedence; with no per-run choice this
+    # falls back to the configured override and then to llm.DEFAULT_MODEL.
+    # See privacycare/settings.py for the precedence and why the settings
+    # screen needed a reader at all.
+    model = resolve_assessment_model(db, task["llm_model"])
+
     completed = 0
     failures: list[str] = []
     for target in targets:
@@ -315,7 +327,7 @@ def run_generation(db: Session, task_id: str) -> None:
                     assessment_id,
                     context,
                     use_llm=bool(task["use_llm"]),
-                    model=task["llm_model"],
+                    model=model,
                 )
                 recompute_completeness(db, assessment_id)
                 db.execute(

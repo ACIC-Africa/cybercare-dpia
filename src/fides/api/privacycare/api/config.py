@@ -31,6 +31,33 @@
 # when the table is empty, which is the one case a row lock cannot help
 # with — FOR UPDATE against zero matching rows locks nothing at all).
 #
+# WHICH OF THESE SETTINGS ACTUALLY GOVERN ANYTHING. Not all of them, and
+# the difference is not guessable from this file — so it is written down
+# here rather than left to a reader to discover by grepping:
+#
+#   LIVE (a reader exists, and changing the value changes what runs):
+#     assessment_model_override  -> privacycare/settings.py
+#                                   resolve_assessment_model, called by
+#                                   tasks.run_generation
+#     chat_model_override        -> privacycare/settings.py
+#                                   resolve_chat_model, called by
+#                                   api/chat.py for phrase_question and
+#                                   judge_reply
+#
+#   STORED BUT NOT YET CONSUMED (persisted and returned faithfully; NO code
+#   path reads them — setting one changes nothing today):
+#     reassessment_enabled, reassessment_cron  -> the scheduled
+#         re-assessment workstream, which is not built
+#     slack_channel_id, slack_channel_name     -> the Slack notification
+#         workstream, which is not built
+#
+# Those four are deliberately NOT wired here. Inventing a scheduler or a
+# Slack client to honour them would be building two unplanned workstreams
+# sideways, through a settings screen; the honest thing is to say plainly
+# that they are storage awaiting their feature. _UNCONSUMED_CONFIG_FIELDS
+# below is the same statement in code, so a test can assert it and the next
+# person to wire one has an obvious place to remove a name from.
+#
 # `questionnaire_tone_prompt` (added by a later migration, ca2c622bad39) is
 # NEVER read, written, or exposed by this module. It has no TypeScript
 # counterpart — see PrivacyAssessmentConfigUpdate's and
@@ -56,6 +83,7 @@ from fides.api.privacycare.api.schemas import (
     PrivacyAssessmentConfigUpdate,
 )
 from fides.api.privacycare.llm import DEFAULT_MODEL
+from fides.api.privacycare.settings import CONFIG_SINGLETON_ORDER_BY
 from fides.common.scope_registry import SYSTEM_READ
 
 # Every column PrivacyAssessmentConfigResponse can ever need, and NOT ONE
@@ -73,7 +101,7 @@ _CONFIG_COLUMNS = (
 # about which row is "the" singleton once both can see it.
 _SELECT_CONFIG_FOR_UPDATE_SQL = sqlalchemy.text(
     f"SELECT {_CONFIG_COLUMNS} FROM privacy_assessment_config "
-    "ORDER BY created_at ASC NULLS LAST, id ASC LIMIT 1 FOR UPDATE"
+    f"{CONFIG_SINGLETON_ORDER_BY} LIMIT 1 FOR UPDATE"
 )
 
 # An ADVISORY lock, not LOCK TABLE. Both serialise the bootstrap correctly,
@@ -89,9 +117,7 @@ _SELECT_CONFIG_FOR_UPDATE_SQL = sqlalchemy.text(
 # no caller can leak one. The key is an arbitrary constant chosen to be
 # recognisable in pg_locks when someone is debugging a stall.
 _CONFIG_BOOTSTRAP_LOCK_KEY = 8_675_309
-_LOCK_CONFIG_TABLE_SQL = sqlalchemy.text(
-    "SELECT pg_advisory_xact_lock(:key)"
-)
+_LOCK_CONFIG_TABLE_SQL = sqlalchemy.text("SELECT pg_advisory_xact_lock(:key)")
 
 # Column-less INSERT, same shape as the seeding migration's own `INSERT INTO
 # privacy_assessment_config (id) VALUES (:id)`: every other column's server_
@@ -102,6 +128,20 @@ _LOCK_CONFIG_TABLE_SQL = sqlalchemy.text(
 _INSERT_CONFIG_ROW_SQL = sqlalchemy.text(
     f"INSERT INTO privacy_assessment_config (id) VALUES (:id) "
     f"RETURNING {_CONFIG_COLUMNS}"
+)
+
+
+# The columns above that nothing reads yet — see the module docstring. This
+# is documentation with a name, not a guard: nothing enforces it, and the
+# fix when one of these grows a reader is to delete it from this set in the
+# same commit.
+_UNCONSUMED_CONFIG_FIELDS = frozenset(
+    {
+        "reassessment_enabled",
+        "reassessment_cron",
+        "slack_channel_id",
+        "slack_channel_name",
+    }
 )
 
 
@@ -176,7 +216,12 @@ def _shape_config(row: dict) -> dict:
     `effective_assessment_model`/`effective_chat_model` are `override or
     DEFAULT_MODEL` — DEFAULT_MODEL is IMPORTED from
     fides.api.privacycare.llm, never retyped, so this can never disagree
-    with the constant generation and chat actually call (D-CFG-2). An
+    with the constant generation and chat actually call (D-CFG-2). They now
+    report something true of the running system rather than of this module
+    alone: settings.resolve_assessment_model/resolve_chat_model apply
+    exactly this `override or DEFAULT_MODEL` rule at the two call sites,
+    under a task's own explicitly-chosen model where there is one (see that
+    module's precedence list). An
     empty-string override is not a case this needs to guard against: the
     column is nullable, not a `CHECK (override <> '')`, and nothing in this
     module or PrivacyAssessmentConfigUpdate ever writes `""` — `or` here is
