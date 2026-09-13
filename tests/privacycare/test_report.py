@@ -241,6 +241,39 @@ def test_the_percentage_can_never_disagree_with_the_counts(db, statuses):
     assert 0.0 <= report.completeness <= 100.0
 
 
+@pytest.mark.parametrize("blank", ["", "   \n\t "])
+def test_an_answer_with_no_text_is_not_counted_as_answered(db, blank):
+    """UpdateAnswerRequest.answer_text has no minimum length and
+    write_answer defaults answer_status to "complete", so `PUT
+    .../questions/{id}` with `{"answer_text": ""}` files a COMPLETE answer
+    with nothing in it. It used to count toward the filed document's
+    completion figure. An answer with no text is not an answer.
+
+    The screen still counts it (this module does not change what
+    _assessment_detail reports); the filed document does not — and it can
+    only ever count DOWN, never up.
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Blank Answer DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, blank, "carol@example.com")
+    db.flush()
+
+    detail = _assessment_detail(db, aid)
+    assert sum(g.answered_count for g in detail.question_groups) == 1, (
+        "the blank answer was not filed as complete — this test is no longer "
+        "exercising the case it exists for"
+    )
+
+    report = build_report(db, aid)
+    assert report.total_count == 1
+    assert report.answered_count == 0
+    assert report.completeness == 0.0
+    # The row itself is still printed, with its recorded status — the
+    # document must not silently drop a question (D-PDF-5).
+    assert len(report.sections[0].questions) == 1
+
+
 def test_export_mode_is_carried(db):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Export Mode DPIA")

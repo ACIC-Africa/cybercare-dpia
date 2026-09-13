@@ -449,6 +449,7 @@ def _seed_answer_with_evidence(
     answer_source: str = "ai_analysis",
     created_by: str = "ai@cybota.com",
     answer_status: str = "complete",
+    answer_text: str = "Seeded answer text.",
     updated_at: str | None = None,
 ) -> str:
     # assessment_answer <-> answer_version is a circular FK (verified against
@@ -465,6 +466,13 @@ def _seed_answer_with_evidence(
     # last_updated_at/last_updated_by's "most recently updated" derivation;
     # relying on real wall-clock ordering between two inserts in the same
     # test would be flaky.
+    # `answer_text` defaults to real, non-empty text because that is what
+    # every production write path produces (write_answer takes it as a
+    # positional argument): an answer_version with a NULL answer_text is
+    # not "an answered question" to anything that reads the record —
+    # report._is_answered excludes it from the filed document's completion
+    # figure precisely because an answer with no text is not an answer.
+    # Pass answer_text="" deliberately to seed that case.
     answer_id = f"aa_{uuid.uuid4().hex[:8]}"
     version_id = f"av_{uuid.uuid4().hex[:8]}"
     db.execute(
@@ -477,15 +485,17 @@ def _seed_answer_with_evidence(
     db.execute(
         sqlalchemy.text(
             "INSERT INTO answer_version "
-            "(id, answer_id, answer_status, answer_source, change_type, "
-            " created_by, evidence) "
-            "VALUES (:id, :answer_id, :answer_status, :answer_source, 'ai_generated', "
-            " :created_by, CAST(:evidence AS JSONB))"
+            "(id, answer_id, answer_status, answer_text, answer_source, "
+            " change_type, created_by, evidence) "
+            "VALUES (:id, :answer_id, :answer_status, :answer_text, "
+            " :answer_source, 'ai_generated', :created_by, "
+            " CAST(:evidence AS JSONB))"
         ),
         {
             "id": version_id,
             "answer_id": answer_id,
             "answer_status": answer_status,
+            "answer_text": answer_text,
             "answer_source": answer_source,
             "created_by": created_by,
             "evidence": json.dumps(evidence),
@@ -1420,9 +1430,7 @@ def test_update_assessment_rejects_a_field_outside_the_allow_list(db):
 
 def test_update_assessment_name_only_leaves_status_and_risk_level_alone(db):
     tid = _seed_template(db)
-    aid = _seed_assessment(
-        db, tid, "Old Name", status="outdated", risk_level="medium"
-    )
+    aid = _seed_assessment(db, tid, "Old Name", status="outdated", risk_level="medium")
     db.flush()
 
     response = _update_assessment(db, aid, {"name": "New Name"})
@@ -1434,9 +1442,7 @@ def test_update_assessment_name_only_leaves_status_and_risk_level_alone(db):
 
 def test_update_assessment_can_change_all_three_fields_at_once(db):
     tid = _seed_template(db)
-    aid = _seed_assessment(
-        db, tid, "Old Name", status="in_progress", risk_level="low"
-    )
+    aid = _seed_assessment(db, tid, "Old Name", status="in_progress", risk_level="low")
     db.flush()
 
     response = _update_assessment(
@@ -1550,9 +1556,7 @@ def test_update_answer_404s_rather_than_500s_if_the_question_read_back_is_gone(
         _update_answer(db, aid, qid, "An answer.", "alice@example.com")
 
 
-def test_update_answer_route_maps_a_vanished_question_read_back_to_404(
-    db, monkeypatch
-):
+def test_update_answer_route_maps_a_vanished_question_read_back_to_404(db, monkeypatch):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Vanished Question Route DPIA")
     qid = _seed_question(db, tid, "q1", "necessity", 1)
@@ -1793,7 +1797,9 @@ def test_delete_assessment_cascades_to_assessment_answer_and_answer_version(db):
     aid = _seed_assessment(db, tid, "Cascade DPIA")
     qid = _seed_question(db, tid, "q1", "necessity", 1)
     write_answer(db, aid, qid, "An answer with a version history.", "alice@example.com")
-    write_answer(db, aid, qid, "A second version of the same answer.", "alice@example.com")
+    write_answer(
+        db, aid, qid, "A second version of the same answer.", "alice@example.com"
+    )
     db.flush()
 
     answer_count_before = db.execute(
@@ -1860,9 +1866,7 @@ def test_delete_assessment_cascade_leaves_no_dangling_answer_version_rows(db):
     _delete_assessment(db, aid, "alice@example.com")
 
     remaining = db.execute(
-        sqlalchemy.text(
-            "SELECT COUNT(*) FROM answer_version WHERE id = ANY(:ids)"
-        ),
+        sqlalchemy.text("SELECT COUNT(*) FROM answer_version WHERE id = ANY(:ids)"),
         {"ids": version_ids},
     ).scalar()
     assert remaining == 0, (
@@ -1965,9 +1969,7 @@ def test_delete_assessment_route_names_the_authenticated_client_never_the_body(
     monkeypatch.setattr(db, "commit", lambda: None)
 
     with _captured_logs() as messages:
-        delete_assessment(
-            aid, db=db, client=_fake_client(None, id="api_client_abc123")
-        )
+        delete_assessment(aid, db=db, client=_fake_client(None, id="api_client_abc123"))
 
     logged = "\n".join(messages)
     assert "client:api_client_abc123" in logged, logged
@@ -2039,8 +2041,7 @@ def test_delete_assessment_route_logs_no_commit_confirmation_when_commit_fails(
     logged = "\n".join(messages)
     assert "DELETED" in logged, "the attempt is still recorded"
     assert "COMMITTED" not in logged, (
-        "nothing was destroyed, so nothing may claim it was confirmed — "
-        f"got {logged!r}"
+        f"nothing was destroyed, so nothing may claim it was confirmed — got {logged!r}"
     )
 
 
@@ -2065,9 +2066,7 @@ def test_delete_assessment_route_commits_on_success(db, monkeypatch):
     committed = []
     monkeypatch.setattr(db, "commit", lambda: committed.append(True))
 
-    response = delete_assessment(
-        aid, db=db, client=_fake_client("alice@example.com")
-    )
+    response = delete_assessment(aid, db=db, client=_fake_client("alice@example.com"))
 
     assert committed, "delete_assessment must commit once _delete_assessment succeeds"
     assert response.id == aid
@@ -2170,12 +2169,16 @@ def test_two_templates_can_be_seeded_in_one_test(db):
     db.flush()
 
     assert first != second
-    types = db.execute(
-        sqlalchemy.text(
-            "SELECT assessment_type FROM assessment_template WHERE id = ANY(:ids)"
-        ),
-        {"ids": [first, second]},
-    ).scalars().all()
+    types = (
+        db.execute(
+            sqlalchemy.text(
+                "SELECT assessment_type FROM assessment_template WHERE id = ANY(:ids)"
+            ),
+            {"ids": [first, second]},
+        )
+        .scalars()
+        .all()
+    )
     assert len(set(types)) == 2, (
         f"both templates share an assessment_type ({types}), so only one can "
         "be active and the second insert is a collision waiting to happen"

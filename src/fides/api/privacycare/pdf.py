@@ -179,8 +179,24 @@ def _escaped(text: str | None) -> str:
     return xml_escape(text or "").replace("\n", "<br/>\n")
 
 
+def _has_text(question: ReportQuestion) -> bool:
+    """Is there anything in this answer for a regulator to read?
+
+    The renderer's own predicate, and deliberately looser than report.py's
+    _is_answered (which also requires `complete`): an answer that is only
+    `partial` still has words in it and is printed, with its status shown
+    as PARTIAL. What is NOT printed as an answer is an EMPTY one — and
+    "empty" is not the same as "needs_input", because
+    UpdateAnswerRequest.answer_text has no minimum length and write_answer
+    defaults answer_status to "complete", so a blank string can arrive
+    filed as COMPLETE. Keyed on the text, not the status, so it cannot be
+    fooled by one.
+    """
+    return bool((question.answer_text or "").strip())
+
+
 def _status_label(question: ReportQuestion) -> str:
-    if question.answer_status == "needs_input" and not question.answer_text:
+    if not _has_text(question):
         return "NOT YET ANSWERED"
     return question.answer_status.replace("_", " ").upper()
 
@@ -409,7 +425,12 @@ def _question_flowables(
 ) -> list:
     flowables: list = [Paragraph(_escaped(question.question_text), question_style)]
 
-    if question.answer_status == "needs_input" and not question.answer_text:
+    if not _has_text(question):
+        # No attribution line in this branch, deliberately: an empty answer
+        # must not print as "Author: ... - Source: ... - Status: COMPLETE"
+        # under a question with nothing beneath it. report.py's
+        # _is_answered excludes the same answers from the completion
+        # figure, so the page and the sentence at the top of it agree.
         flowables.append(Paragraph(_status_label(question), unanswered_style))
     else:
         flowables.append(Paragraph(_escaped(question.answer_text), body_style))

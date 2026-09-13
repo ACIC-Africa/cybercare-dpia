@@ -393,6 +393,33 @@ def test_the_printed_completion_sentence_cannot_contradict_itself(db):
     assert "100.0% complete" not in text
 
 
+def test_an_empty_answer_prints_as_unanswered_not_as_an_authored_one(db):
+    """A blank answer filed as COMPLETE used to render as
+
+        Q1?
+        Author: carol@example.com - Source: user_input - Status: COMPLETE
+
+    — a question the regulator reads as answered and attributed, with no
+    answer under it. It must print as unanswered, with no attribution, and
+    the completion sentence must agree.
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Blank Answer DPIA")
+    qid = _seed_question(db, tid, "q1", "necessity", 1)
+    write_answer(db, aid, qid, "", "carol@example.com")
+    db.flush()
+
+    text = _extract_text(render_pdf(build_report(db, aid)))
+
+    assert "NOT YET ANSWERED" in text
+    assert "carol@example.com" not in text, (
+        "an empty answer printed an author, which reads as a finished answer"
+    )
+    assert "Status: COMPLETE" not in text
+    assert "0 of 1 question(s) answered (0.0% complete)" in text
+    assert "1 question(s) remain UNANSWERED" in text
+
+
 def test_export_mode_is_printed_in_the_footer(db):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Footer Mode DPIA")

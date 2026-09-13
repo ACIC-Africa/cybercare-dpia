@@ -15,8 +15,8 @@
 # from (questions, answers, statuses, evidence, answered_count,
 # completeness). A report that disagrees with what the screen showed the DPO
 # is worse than no report: the officer signs one artifact and the regulator
-# reads a different one. answered_count/total_count are summed straight off
-# _assessment_detail's own question_groups — never a second query here.
+# reads a different one. answered_count/total_count are counted off the
+# question rows that same function returned — never a second query here.
 #
 # WHAT THAT EQUALITY DOES AND DOES NOT BUY. An earlier revision of this
 # docstring said the three numbers "cannot drift from" _assessment_detail.
@@ -175,6 +175,29 @@ def _metadata_rows(detail: PrivacyAssessmentDetailResponse) -> list[tuple[str, s
     ]
 
 
+def _is_answered(question: ReportQuestion) -> bool:
+    """Does this question count as answered in the filed document?
+
+    Two conditions, not one. `answer_status == "complete"` is the screen's
+    own predicate (see _questions_for's answered_count) and excludes a
+    machine draft, which is always `partial`. The second condition —
+    non-blank text — is this module's: UpdateAnswerRequest.answer_text has
+    no minimum length and write_answer defaults answer_status to
+    "complete", so `PUT .../questions/{id}` with `{"answer_text": ""}`
+    files a COMPLETE answer with nothing in it. That answer used to count
+    toward the completion figure and print as a finished, attributed
+    answer ("Author: carol@acme.io - Source: user_input - Status:
+    COMPLETE") under a question with no answer beneath it. An answer with
+    no text is not an answer, least of all to a regulator; this is the one
+    place the report deliberately counts differently from the screen, and
+    it counts DOWN — it can never make an assessment look more finished
+    than the screen said.
+    """
+    return question.answer_status == "complete" and bool(
+        (question.answer_text or "").strip()
+    )
+
+
 def _completeness(answered_count: int, total_count: int) -> float:
     """The percentage the document prints, derived from the two counts it
     prints beside it — 0-100, matching privacy_assessment.completeness's
@@ -202,17 +225,22 @@ def build_report(
     authors = _author_lookup(db, assessment_id)
 
     sections = [_report_section(group, authors) for group in detail.question_groups]
-    answered_count = sum(g.answered_count for g in detail.question_groups)
-    total_count = sum(g.total_count for g in detail.question_groups)
+    questions = [question for section in sections for question in section.questions]
+    answered_count = sum(1 for question in questions if _is_answered(question))
+    total_count = len(questions)
 
     return Report(
         title=f"Data Protection Impact Assessment: {detail.name}",
         metadata=_metadata_rows(detail),
         sections=sections,
-        # Summed directly off _assessment_detail's own per-group counts —
-        # the exact numbers QuestionGroupPanel.tsx renders as "Fields:
-        # {answeredCount}/{totalCount}" for each group on the screen — never
-        # recomputed by a second query here. See the module docstring.
+        # Counted off the questions THIS DOCUMENT PRINTS — the sections
+        # above — not off a second query, and not off a number that could
+        # describe a different set of questions than the ones on the page.
+        # The predicate is _assessment_detail's own ("complete"), narrowed
+        # by _is_answered to exclude a blank answer; see its docstring.
+        # Equal to the screen's per-group "Fields: {answeredCount}/
+        # {totalCount}" in every case except that blank one, which is
+        # pinned by test_counts_match_the_detail_screen_exactly.
         answered_count=answered_count,
         total_count=total_count,
         # Derived from the two counts above, NOT read from
