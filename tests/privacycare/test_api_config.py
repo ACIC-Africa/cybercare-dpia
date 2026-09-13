@@ -144,6 +144,35 @@ def test_explicit_null_is_rejected_for_the_not_null_columns():
         PrivacyAssessmentConfigUpdate(reassessment_enabled=None)
 
 
+def test_a_null_timestamp_is_reported_empty_rather_than_crashing(db, monkeypatch):
+    """created_at/updated_at are DB-nullable but the TypeScript contract
+    declares both required, non-nullable strings — so a row with a NULL
+    timestamp used to make this screen a 500 on serialisation. The screen
+    whose whole purpose is to be reachable (D-CFG-1) must not 500 on a row
+    it can read perfectly well.
+    """
+    import uuid
+
+    monkeypatch.setattr(db, "commit", lambda: None)
+    db.execute(sqlalchemy.text("DELETE FROM privacy_assessment_config"))
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacy_assessment_config (id, created_at, updated_at) "
+            "VALUES (:id, NULL, NULL)"
+        ),
+        {"id": f"pri_{uuid.uuid4()}"},
+    )
+
+    config = get_assessment_config(db=db)
+
+    assert config.created_at == ""
+    assert config.updated_at == ""
+    # Everything else still reads normally — the null is absorbed, not
+    # turned into a partial response.
+    assert config.id
+    assert config.reassessment_cron
+
+
 def test_the_defaults_route_reports_what_the_platform_would_use(db):
     from fides.api.privacycare.llm import DEFAULT_MODEL
 

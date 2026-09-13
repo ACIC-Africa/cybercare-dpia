@@ -208,6 +208,38 @@ def _as_str(value):
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
+def _timestamp(row: dict, column: str) -> str:
+    """A row timestamp as the string PrivacyAssessmentConfigResponse
+    requires.
+
+    privacy_assessment_config.created_at/updated_at are DB-NULLABLE
+    (verified against the live schema) even though every write path
+    server_defaults them to now(), while the TypeScript contract declares
+    both `string` — required, no `?`, no `| null`
+    (features/privacy-assessments/types.ts). Declaring them Optional here
+    would fix the crash and break that contract; leaving them bare `str`
+    made a NULL a 500 on serialisation, on a screen whose whole job is to
+    be reachable. Same precedent, same reasoning, as _metadata_for's
+    handling of privacy_assessment_task.created_at in api/assessments.py:
+    the contract wins, the null is absorbed at this boundary, and the
+    anomaly is logged rather than silently dressed up as a real timestamp.
+    An empty string is visibly "we do not have this", which no real
+    timestamp can be mistaken for.
+    """
+    value = _as_str(row[column])
+    if value is None:
+        logger.warning(
+            "privacy_assessment_config {} has a null {}; reporting it as "
+            "empty rather than violating PrivacyAssessmentConfigResponse's "
+            "required {}",
+            row.get("id"),
+            column,
+            column,
+        )
+        return ""
+    return value
+
+
 def _shape_config(row: dict) -> dict:
     """Turn a raw privacy_assessment_config row into the dict
     PrivacyAssessmentConfigResponse expects: every stored column this
@@ -237,8 +269,8 @@ def _shape_config(row: dict) -> dict:
         "reassessment_cron": row["reassessment_cron"],
         "slack_channel_id": row["slack_channel_id"],
         "slack_channel_name": row["slack_channel_name"],
-        "created_at": _as_str(row["created_at"]),
-        "updated_at": _as_str(row["updated_at"]),
+        "created_at": _timestamp(row, "created_at"),
+        "updated_at": _timestamp(row, "updated_at"),
     }
 
 
