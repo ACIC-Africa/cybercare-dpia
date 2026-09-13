@@ -115,7 +115,18 @@ def _phrase_prompt(question: dict, context: dict) -> str:
     )
 
 
+# The officer types into a chat box; nothing upstream bounds what arrives.
+# A pasted policy document would otherwise go to the gateway whole — cost,
+# latency, and a redaction surface far larger than the turn requires. The
+# judgement only needs enough of the reply to tell an answer from a
+# deflection, and a deflection is short by nature. Truncation is marked so
+# the model is not misled into judging a sentence that was cut mid-word.
+_MAX_REPLY_CHARS_FOR_JUDGEMENT = 2000
+
+
 def _judge_prompt(question: dict, reply: str) -> str:
+    if len(reply) > _MAX_REPLY_CHARS_FOR_JUDGEMENT:
+        reply = reply[:_MAX_REPLY_CHARS_FOR_JUDGEMENT] + "\n[…truncated for judgement…]"
     return (
         f"QUESTION ASKED:\n{question['question_text']}\n\n"
         f"OFFICER'S MESSAGE:\n{reply}"

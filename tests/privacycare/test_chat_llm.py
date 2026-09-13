@@ -5,7 +5,7 @@ dependency, and neither do these tests.
 """
 import pytest
 
-from fides.api.privacycare.chat_llm import judge_reply, phrase_question
+from fides.api.privacycare.chat_llm import CHAT_CALLER, judge_reply, phrase_question
 from fides.api.privacycare.llm import GatewayUnavailable
 
 
@@ -67,3 +67,49 @@ def test_an_unreachable_gateway_accepts_the_human_s_answer(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(GatewayUnavailable("429")),
     )
     assert judge_reply({"question_text": "Q?"}, "An answer.") is True
+
+
+def test_a_very_long_reply_is_truncated_before_it_reaches_the_gateway(monkeypatch):
+    # The officer types into a chat box and nothing upstream bounds what
+    # arrives. A pasted policy document would otherwise go to the gateway
+    # whole — cost, latency, and a far larger redaction surface than one
+    # conversational turn needs. What is FILED is still the reply in full;
+    # only the judgement sees a bounded prefix.
+    captured = {}
+
+    def _fake(caller, messages, *, model, max_tokens, system=None):
+        captured["prompt"] = messages[0]["content"]
+        return "ANSWERED"
+
+    monkeypatch.setattr("fides.api.privacycare.chat_llm.complete", _fake)
+
+    judge_reply({"question_text": "Q?"}, "x" * 10_000)
+
+    assert len(captured["prompt"]) < 5_000, (
+        f"an unbounded reply reached the gateway: {len(captured['prompt'])} chars"
+    )
+    assert "truncated" in captured["prompt"]
+
+
+def test_both_calls_send_their_system_prompt(monkeypatch):
+    # Without this, a refactor that dropped `system=` would pass the whole
+    # suite while removing the only instruction telling the model to ask
+    # rather than answer on the officer's behalf.
+    from fides.api.privacycare.chat_llm import (
+        _JUDGE_SYSTEM_PROMPT,
+        _PHRASE_SYSTEM_PROMPT,
+    )
+
+    seen = {}
+
+    def _fake(caller, messages, *, model, max_tokens, system=None):
+        seen[caller] = system
+        return "ANSWERED"
+
+    monkeypatch.setattr("fides.api.privacycare.chat_llm.complete", _fake)
+
+    phrase_question({"question_text": "Q?", "guidance": None}, {})
+    assert seen[CHAT_CALLER] == _PHRASE_SYSTEM_PROMPT
+
+    judge_reply({"question_text": "Q?"}, "An answer.")
+    assert seen[CHAT_CALLER] == _JUDGE_SYSTEM_PROMPT
