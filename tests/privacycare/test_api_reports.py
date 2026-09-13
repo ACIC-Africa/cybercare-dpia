@@ -621,3 +621,31 @@ def test_a_non_latin_title_still_yields_a_distinguishable_filename(db, monkeypat
     assert _ADMIN_UI_FILENAME_REGEX.search(f'attachment; filename="{first}.pdf"'), (
         "the disambiguated filename no longer survives the UI's own regex"
     )
+
+
+def test_the_font_comes_from_the_package_not_the_host():
+    # The bug this guards was exactly this: the font was located with
+    # `fc-list`, which the deployed image does not have, so the export 503'd
+    # everywhere while passing here because THIS host has DejaVu installed.
+    #
+    # The existing guards check that fc-list is not called. That is not the
+    # same claim: a hardcoded /usr/share/fonts path calls nothing and still
+    # fails in the image. This asserts the resolved file lives INSIDE the
+    # installed package, which is the property that actually makes the export
+    # work wherever the distribution is installed.
+    import pathlib
+
+    import fides.api.privacycare as privacycare_pkg
+    from fides.api.privacycare.pdf import _REGULAR_FONT_FILE, _vendored_font
+
+    resolved = _vendored_font(_REGULAR_FONT_FILE)
+    assert resolved is not None, "the vendored font is missing from the package"
+
+    package_root = pathlib.Path(privacycare_pkg.__file__).parent.resolve()
+    font_path = pathlib.Path(str(resolved)).resolve()
+
+    assert package_root in font_path.parents, (
+        f"the font resolved to {font_path}, outside the installed package at "
+        f"{package_root}. Anything outside the package is host configuration, "
+        "which is what made the export 503 in every real deployment."
+    )

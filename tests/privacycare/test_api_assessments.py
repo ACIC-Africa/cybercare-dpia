@@ -2205,3 +2205,39 @@ def test_seeding_survives_a_pre_existing_template_in_the_database(db):
     db.flush()
 
     assert seeded, "seeding must not depend on the database being empty"
+
+
+def test_model_used_reports_the_model_that_actually_ran(db, monkeypatch):
+    # privacy_assessment_task.llm_model holds only what the REQUEST asked
+    # for, and is null whenever it asked for nothing. That used to mean
+    # DEFAULT_MODEL deterministically; since the settings screen became live
+    # it can also mean "whatever assessment_model_override said". Reporting
+    # the raw column makes "which model saw our personal data" unanswerable —
+    # the one question this field exists to answer.
+    from fides.api.privacycare.api.config import _update_config
+    from fides.api.privacycare.api.schemas import PrivacyAssessmentConfigUpdate
+
+    monkeypatch.setattr(db, "commit", lambda: None)
+    _update_config(
+        db, PrivacyAssessmentConfigUpdate(assessment_model_override="claude-opus-5")
+    )
+
+    tid = _seed_template(db)
+    task_id = f"pat_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacy_assessment_task "
+            "(id, action_type, status, celery_id, assessment_types, use_llm) "
+            "VALUES (:id, 'generate', 'complete', :cid, '{}', true)"
+        ),
+        {"id": task_id, "cid": str(uuid.uuid4())},
+    )
+    aid = _seed_assessment(db, tid, "Model Used DPIA", task_id=task_id)
+    db.flush()
+
+    detail = _assessment_detail(db, aid)
+
+    assert detail.metadata.model_used == "claude-opus-5", (
+        "the task row's llm_model is null, so this reported null and the "
+        f"config override that actually ran was invisible: {detail.metadata!r}"
+    )

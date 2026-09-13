@@ -42,6 +42,7 @@ from fides.api.privacycare.api.schemas import (
     UpdatePrivacyAssessmentRequest,
     template_key,
 )
+from fides.api.privacycare.settings import resolve_assessment_model
 from fides.common.scope_registry import SYSTEM_READ
 
 # Status values that make an assessment "open" work — matches AssessmentStatus
@@ -625,7 +626,19 @@ def _metadata_for(db: Session, task_id: str | None) -> AssessmentMetadata | None
         return None
     return AssessmentMetadata(
         generation_timestamp=_as_str(row["created_at"]),
-        model_used=row["llm_model"],
+        # The model that ACTUALLY processed this assessment's data, not the
+        # column. privacy_assessment_task.llm_model holds only what the
+        # request explicitly asked for, and is null whenever it asked for
+        # nothing — which used to mean DEFAULT_MODEL deterministically, and
+        # since the settings screen became live can also mean "whatever
+        # assessment_model_override said at the time". Reporting null there
+        # makes "which model saw our personal data" unanswerable, which is
+        # the whole reason this field exists.
+        #
+        # resolve_assessment_model applies the same precedence generation
+        # itself applies — request, then config override, then the platform
+        # default — so this reports what ran rather than a fragment of it.
+        model_used=resolve_assessment_model(db, row["llm_model"]),
         use_llm=row["use_llm"],
     )
 
