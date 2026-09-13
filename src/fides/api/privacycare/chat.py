@@ -17,11 +17,10 @@
 # module writes rows into them and never alters their schema.
 import json
 import uuid
+from dataclasses import dataclass
 
 import sqlalchemy
 from sqlalchemy.orm import Session
-
-from dataclasses import dataclass
 
 from fides.api.privacycare.api.answers import write_answer
 
