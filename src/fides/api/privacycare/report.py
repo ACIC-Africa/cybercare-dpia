@@ -15,9 +15,30 @@
 # from (questions, answers, statuses, evidence, answered_count,
 # completeness). A report that disagrees with what the screen showed the DPO
 # is worse than no report: the officer signs one artifact and the regulator
-# reads a different one. answered_count/total_count/completeness below are
-# summed straight off _assessment_detail's own question_groups/completeness
-# — never recomputed here — so they cannot drift from it.
+# reads a different one. answered_count/total_count are summed straight off
+# _assessment_detail's own question_groups — never a second query here.
+#
+# WHAT THAT EQUALITY DOES AND DOES NOT BUY. An earlier revision of this
+# docstring said the three numbers "cannot drift from" _assessment_detail.
+# That is true of each number against its counterpart on the screen, and
+# FALSE of the three numbers against EACH OTHER, because the detail
+# response mixes two clocks: its per-group counts are counted live at read
+# time, while its `completeness` is privacy_assessment.completeness, a
+# column written at ANSWER time. Nothing refreshes that column when the
+# template gains questions underneath a finished assessment — and Ethyca's
+# own migrations add questions to an existing template in place — so
+# reading it here produced sentences like "4 of 30 question(s) answered
+# (16.7% complete)" (4/30 is 13.3%) and, worse, "24 of 30 question(s)
+# answered (100.0% complete). 6 question(s) remain UNANSWERED". Inside one
+# sentence of a DPA 2019 s31 filing, with the error in the direction that
+# overstates compliance to the regulator.
+#
+# So this module does NOT read that column. `completeness` below is
+# computed from answered_count/total_count — the same two numbers the
+# document prints beside it — which is what makes the printed sentence
+# incapable of contradicting itself whatever the column says. The column is
+# left exactly as it is: other surfaces read it, and changing its semantics
+# is a bigger question than one report.
 #
 # The one thing _assessment_detail's validated response does NOT carry is
 # per-question authorship: AssessmentQuestionResponse mirrors the admin-UI's
@@ -73,6 +94,8 @@ class Report:
     sections: list[ReportSection]
     answered_count: int
     total_count: int
+    # 0-100. Computed from answered_count/total_count by _completeness —
+    # never privacy_assessment.completeness. See the module docstring.
     completeness: float
     export_mode: str
 
@@ -152,6 +175,21 @@ def _metadata_rows(detail: PrivacyAssessmentDetailResponse) -> list[tuple[str, s
     ]
 
 
+def _completeness(answered_count: int, total_count: int) -> float:
+    """The percentage the document prints, derived from the two counts it
+    prints beside it — 0-100, matching privacy_assessment.completeness's
+    unit (not 0-1) and the `{:.1f}%` the renderer formats it with.
+
+    A template with no questions is 0.0% complete, not 100%: an assessment
+    nobody has been asked anything about has not been completed, and a
+    ZeroDivisionError in a report build would surface to the officer as a
+    503 on a document that is merely empty.
+    """
+    if total_count <= 0:
+        return 0.0
+    return (answered_count / total_count) * 100
+
+
 def build_report(
     db: Session, assessment_id: str, *, export_mode: str = "external"
 ) -> Report:
@@ -164,6 +202,8 @@ def build_report(
     authors = _author_lookup(db, assessment_id)
 
     sections = [_report_section(group, authors) for group in detail.question_groups]
+    answered_count = sum(g.answered_count for g in detail.question_groups)
+    total_count = sum(g.total_count for g in detail.question_groups)
 
     return Report(
         title=f"Data Protection Impact Assessment: {detail.name}",
@@ -173,8 +213,15 @@ def build_report(
         # the exact numbers QuestionGroupPanel.tsx renders as "Fields:
         # {answeredCount}/{totalCount}" for each group on the screen — never
         # recomputed by a second query here. See the module docstring.
-        answered_count=sum(g.answered_count for g in detail.question_groups),
-        total_count=sum(g.total_count for g in detail.question_groups),
-        completeness=detail.completeness or 0.0,
+        answered_count=answered_count,
+        total_count=total_count,
+        # Derived from the two counts above, NOT read from
+        # privacy_assessment.completeness. See the module docstring: the
+        # stored column is written at answer time and is not refreshed when
+        # a template gains questions, so printing it next to live counts is
+        # how one sentence came to say "24 of 30 answered (100.0%
+        # complete). 6 question(s) remain UNANSWERED". One number, one
+        # source, inside one document.
+        completeness=_completeness(answered_count, total_count),
         export_mode=export_mode,
     )

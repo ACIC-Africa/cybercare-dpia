@@ -130,9 +130,15 @@ def test_citations_carry_source_key_and_number(db):
     ]
 
 
-def test_counts_and_completeness_match_the_detail_screen_exactly(db):
+def test_counts_match_the_detail_screen_exactly(db):
     # Rule 2: assert this equality directly, not "looks about right". A PDF
     # that disagrees with the screen is worse than no PDF.
+    #
+    # The COUNTS are asserted equal to the screen's. The percentage is not,
+    # and deliberately: see
+    # test_the_percentage_is_derived_from_the_counts_not_the_stored_column
+    # below — the screen's own percentage comes from a stored column that
+    # can disagree with its own live counts.
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Reconciled DPIA")
     q1 = _seed_question(db, tid, "q1", "necessity", 1)
@@ -153,11 +159,86 @@ def test_counts_and_completeness_match_the_detail_screen_exactly(db):
         g.answered_count for g in detail.question_groups
     )
     assert report.total_count == sum(g.total_count for g in detail.question_groups)
-    assert report.completeness == detail.completeness
     # Concretely, not just "equal to itself": one of three questions is
     # complete.
     assert report.answered_count == 1
     assert report.total_count == 3
+    assert report.completeness == pytest.approx(100 / 3)
+
+
+def test_the_percentage_is_derived_from_the_counts_not_the_stored_column(db):
+    """The contradiction, reproduced and closed.
+
+    privacy_assessment.completeness is written at ANSWER time; the counts
+    are read live. Nothing refreshes the column when a template gains
+    questions, and Ethyca's migrations add questions to an existing
+    template in place — so the column can say 100 while 1 of 3 questions
+    is answered, and the document printed both numbers in one sentence.
+
+    This forces the exact divergence (a stored 100.0 over a live 1-of-3)
+    rather than waiting for a migration to produce it, and pins that the
+    report ignores the column. Mutation check: restoring
+    `completeness=detail.completeness` makes this fail.
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Contradiction DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_question(db, tid, "q3", "security", 2)
+    _seed_answer_with_evidence(
+        db, aid, q1, {"id": "ev_1", "type": "ai_analysis"}, answer_status="complete"
+    )
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment SET completeness = 100 WHERE id = :aid"
+        ),
+        {"aid": aid},
+    )
+    db.flush()
+
+    detail = _assessment_detail(db, aid)
+    assert detail.completeness == 100, "the stored column was not made to lie"
+
+    report = build_report(db, aid)
+    assert report.answered_count == 1
+    assert report.total_count == 3
+    assert report.completeness == pytest.approx(100 / 3)
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        (),
+        ("complete",),
+        ("complete", "partial"),
+        ("complete", "complete", "partial"),
+    ],
+)
+def test_the_percentage_can_never_disagree_with_the_counts(db, statuses):
+    """The property, not one example: whatever the shape, the number the
+    document prints as a percentage IS the two numbers it prints beside it.
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Invariant DPIA")
+    for index, status in enumerate(statuses):
+        qid = _seed_question(db, tid, f"q{index}", "necessity", 1)
+        _seed_answer_with_evidence(
+            db,
+            aid,
+            qid,
+            {"id": f"ev_{index}", "type": "ai_analysis"},
+            answer_status=status,
+        )
+    db.flush()
+
+    report = build_report(db, aid)
+    expected = (
+        (report.answered_count / report.total_count) * 100
+        if report.total_count
+        else 0.0
+    )
+    assert report.completeness == pytest.approx(expected)
+    assert 0.0 <= report.completeness <= 100.0
 
 
 def test_export_mode_is_carried(db):
@@ -199,6 +280,5 @@ def test_the_officers_words_pass_through_untouched(db):
 
     answers = [q.answer_text for s in report.sections for q in s.questions]
     assert awkward in answers, (
-        "the officer's text was altered on the way into the report model: "
-        f"{answers!r}"
+        f"the officer's text was altered on the way into the report model: {answers!r}"
     )

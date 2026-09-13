@@ -360,6 +360,39 @@ def test_pdf_bytes_contain_name_answer_author_citation_and_unanswered_status(
     assert "1 question(s) remain UNANSWERED" in text
 
 
+def test_the_printed_completion_sentence_cannot_contradict_itself(db):
+    """One sentence of a DPA 2019 s31 filing used to be able to say both
+    "(100.0% complete)" and "6 question(s) remain UNANSWERED", because the
+    counts were live and the percentage came from a stored column nothing
+    refreshes when a template gains questions.
+
+    This makes the column lie (100 over a live 1-of-3) and reads the real
+    sentence back out of the rendered PDF: the percentage must be the two
+    counts printed next to it, and the UNANSWERED clause must agree with
+    both. Mutation check: restoring `completeness=detail.completeness` in
+    build_report makes this fail.
+    """
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Self Consistent DPIA")
+    q1 = _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 1)
+    _seed_question(db, tid, "q3", "security", 2)
+    write_answer(db, aid, q1, "Only this one is answered.", "carol@example.com")
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment SET completeness = 100 WHERE id = :aid"
+        ),
+        {"aid": aid},
+    )
+    db.flush()
+
+    text = _extract_text(render_pdf(build_report(db, aid)))
+
+    assert "1 of 3 question(s) answered (33.3% complete)" in text, text
+    assert "2 question(s) remain UNANSWERED" in text
+    assert "100.0% complete" not in text
+
+
 def test_export_mode_is_printed_in_the_footer(db):
     tid = _seed_template(db)
     aid = _seed_assessment(db, tid, "Footer Mode DPIA")
