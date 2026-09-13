@@ -351,7 +351,15 @@ def current_question_id(session: ChatSession) -> str | None:
     end, complete; id is not None but current_question is None -> this
     entry is bad, skip it and move on (skip_unresolvable_questions).
     """
-    if session.current_question_index >= len(session.question_ids):
+    # Only the upper bound used to be guarded. questionnaire.
+    # current_question_index carries no CHECK constraint — it is an Ethyca
+    # table we do not alter — so a negative value from any other writer would
+    # index the frozen list FROM THE END: the answer lands on the last
+    # question and the cursor then resets to 0, re-walking the whole
+    # questionnaire. Same class as the concurrency defect this module already
+    # shipped once. Treating it as "nothing current" makes it visible and
+    # inert rather than quietly wrong.
+    if not 0 <= session.current_question_index < len(session.question_ids):
         return None
     return session.question_ids[session.current_question_index]
 

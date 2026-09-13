@@ -2,6 +2,8 @@
 # rolled back.
 import json
 
+import dataclasses
+
 import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
@@ -496,3 +498,24 @@ def test_question_already_asked_sees_only_bot_turns_at_that_index(db):
                    question_index=0)
     assert question_already_asked(db, session.id, 0) is True
     assert question_already_asked(db, session.id, 1) is False
+
+
+def test_a_negative_cursor_names_no_question_rather_than_the_last_one(db):
+    # current_question_index has no CHECK constraint (Ethyca's table, which we
+    # do not alter), so a negative value from any other writer would index the
+    # frozen list from the END — filing the answer against the LAST question
+    # and resetting the cursor to 0 to re-walk the questionnaire. In a DPIA
+    # that is an answer recorded against a question nobody was asked.
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Negative Cursor DPIA")
+    _seed_question(db, tid, "q1", "necessity", 1)
+    _seed_question(db, tid, "q2", "necessity", 2)
+    db.flush()
+    session = open_or_resume(db, aid)
+
+    corrupted = dataclasses.replace(session, current_question_index=-1)
+
+    assert current_question_id(corrupted) is None, (
+        "a negative cursor resolved to a real question id, so an answer would "
+        "be filed against a question the officer was never asked"
+    )
