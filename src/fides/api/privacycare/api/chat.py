@@ -11,7 +11,8 @@ turn it asks chat.py what to do, asks chat_llm.py how to say it, and
 persists the result as a chat_message row via chat.record_message.
 
 Same conventions as api/tasks.py: route commits, the `_`-prefixed core
-below does not; LookupError maps to 404; `status` is imported as
+below does not; LookupError maps to 404, carrying the message its raise
+site wrote so the 404 names what was actually absent (_not_found); `status` is imported as
 `status_codes` because `status` is also this module's own vocabulary (a
 questionnaire's session status) — see tasks.py's own comment for why that
 shadowing risk is worth naming explicitly rather than just avoiding by
@@ -335,6 +336,28 @@ def _reply(db: Session, request: ChatReplyRequest, created_by: str) -> ChatReply
     )
 
 
+def _not_found(exc: LookupError, fallback: str) -> HTTPException:
+    """Turn a LookupError into a 404 that names what was actually absent.
+
+    Three different causes reach each route's handler — a missing
+    questionnaire row (_session_by_id, chat.begin_turn), a missing
+    privacy_assessment (_context_for, chat._lock_assessment_and_get_name),
+    and a session with no question at the index an answer was being filed
+    against (chat.record_answer). Every one of them used to be reported as
+    the same sentence naming the id the caller supplied, which is a true
+    statement about something that did not fail: an operator reading
+    "No questionnaire with id qnr_ab12" could not tell that the assessment
+    underneath it was the thing that had gone. Each raise site already
+    names its own cause; this passes that text through rather than
+    discarding it, and falls back to the route-shaped sentence only if a
+    LookupError ever arrives with no message at all.
+    """
+    return HTTPException(
+        status_code=status_codes.HTTP_404_NOT_FOUND,
+        detail=str(exc) or fallback,
+    )
+
+
 @privacycare_chat_router.post(
     "/start",
     dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_READ])],
@@ -355,11 +378,8 @@ def start_questionnaire_chat(
     """
     try:
         response = _start_chat(db, request)
-    except LookupError:
-        raise HTTPException(
-            status_code=status_codes.HTTP_404_NOT_FOUND,
-            detail=f"No assessment with id {request.assessment_id}",
-        )
+    except LookupError as exc:
+        raise _not_found(exc, f"No assessment with id {request.assessment_id}")
     db.commit()
     return response
 
@@ -389,11 +409,8 @@ def reply_to_questionnaire_chat(
     created_by = _created_by_from_client(client)
     try:
         response = _reply(db, request, created_by)
-    except LookupError:
-        raise HTTPException(
-            status_code=status_codes.HTTP_404_NOT_FOUND,
-            detail=f"No questionnaire with id {request.questionnaire_id}",
-        )
+    except LookupError as exc:
+        raise _not_found(exc, f"No questionnaire with id {request.questionnaire_id}")
     db.commit()
     return response
 
@@ -428,9 +445,6 @@ def get_questionnaire_chat_messages(
     """
     try:
         session = _session_by_id(db, questionnaire_id)
-    except LookupError:
-        raise HTTPException(
-            status_code=status_codes.HTTP_404_NOT_FOUND,
-            detail=f"No questionnaire with id {questionnaire_id}",
-        )
+    except LookupError as exc:
+        raise _not_found(exc, f"No questionnaire with id {questionnaire_id}")
     return [_chat_message_from_row(row) for row in transcript(db, session.id)]

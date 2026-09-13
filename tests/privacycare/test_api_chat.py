@@ -29,7 +29,7 @@ from fides.api.privacycare.api.schemas import (
     StartChatRequest,
     StartChatResponse,
 )
-from fides.api.privacycare.chat import QUESTIONNAIRE_STATUSES
+from fides.api.privacycare.chat import QUESTIONNAIRE_STATUSES, ChatSession
 from tests.privacycare.test_api_assessments import (
     _fake_client,
     _seed_assessment,
@@ -818,3 +818,57 @@ def test_resuming_onto_a_question_nobody_has_asked_yet_does_ask_it(db, monkeypat
 
     assert calls == ["q1"]
     assert [m.text for m in again.messages] == ["[phrased] q0", "[phrased] q1"]
+
+
+# --- The whole-range review's MINOR: a 404 that names what was absent ---
+
+
+def test_the_404_names_the_missing_assessment_not_the_questionnaire(db, monkeypatch):
+    # Three different causes used to report one message naming the id the
+    # CALLER supplied — a true statement about something that had not
+    # failed. Here the questionnaire is found and the privacy_assessment
+    # underneath it is not: an operator reading "No questionnaire with id
+    # qnr_..." would go looking for the wrong missing row.
+    _, questionnaire_id = _seeded_chat(db, monkeypatch, 1)
+    orphan = _session_by_id(db, questionnaire_id)
+    monkeypatch.setattr(
+        "fides.api.privacycare.api.chat._session_by_id",
+        lambda _db, _qid: ChatSession(
+            id=orphan.id,
+            assessment_id="pa_vanished",
+            status=orphan.status,
+            current_question_index=orphan.current_question_index,
+            question_ids=orphan.question_ids,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        reply_to_questionnaire_chat(
+            ChatReplyRequest(questionnaire_id=questionnaire_id, message_text="Hi"),
+            db=db,
+            client=_fake_client("carol@example.com"),
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "No assessment with id pa_vanished", (
+        "the 404 named the questionnaire the caller supplied, which was "
+        f"present; the assessment is what was absent: {exc_info.value.detail}"
+    )
+
+
+def test_the_404_for_a_genuinely_missing_questionnaire_still_names_it(db, monkeypatch):
+    _no_commit(db, monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        reply_to_questionnaire_chat(
+            ChatReplyRequest(questionnaire_id="qnr_doesnotexist", message_text="Hi"),
+            db=db,
+            client=_fake_client("carol@example.com"),
+        )
+    assert exc_info.value.detail == "No questionnaire with id qnr_doesnotexist"
+
+
+def test_the_404_for_a_missing_assessment_on_start_names_the_assessment(db, monkeypatch):
+    _no_commit(db, monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        start_questionnaire_chat(StartChatRequest(assessment_id="pa_not_here"), db=db)
+    assert exc_info.value.detail == "No assessment with id pa_not_here"
