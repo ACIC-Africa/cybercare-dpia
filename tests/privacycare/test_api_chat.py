@@ -367,12 +367,26 @@ def test_get_messages_returns_the_transcript_oldest_first(db, monkeypatch):
 def test_get_messages_is_the_bare_array_the_slice_declares():
     # getQuestionnaireChatMessages (privacy-assessments.slice.ts) types its
     # query as build.query<QuestionnaireChatMessage[], string> — a bare
-    # array, not an envelope with e.g. a `messages` key. The route's own
-    # response_model carries this; this test pins the return type of the
-    # handler itself so a future refactor cannot silently wrap it.
-    assert get_questionnaire_chat_messages.__annotations__["return"] == List[
-        QuestionnaireChatMessage
-    ]
+    # array, not an envelope with e.g. a `messages` key.
+    #
+    # Asserted on the REGISTERED ROUTE's response_model, not on the handler's
+    # return annotation. FastAPI serialises what the decorator declares, so a
+    # refactor that wrapped the response there — the exact mistake that has
+    # shipped three empty screens in this module — would leave the annotation
+    # untouched and pass an annotation-only check.
+    from fides.api.privacycare.api.router import PRIVACYCARE_CHAT_PREFIX
+    from fides.api.privacycare.asgi import app
+
+    route = next(
+        r
+        for r in app.routes
+        if getattr(r, "path", "") == f"{PRIVACYCARE_CHAT_PREFIX}/messages/{{questionnaire_id}}"
+        and "GET" in getattr(r, "methods", set())
+    )
+    assert route.response_model == List[QuestionnaireChatMessage], (
+        f"the registered route serialises {route.response_model!r}, not the "
+        "bare array the slice declares"
+    )
 
 
 def test_get_messages_on_a_session_with_nothing_said_yet_is_a_200_with_an_empty_list(
@@ -406,29 +420,15 @@ def test_get_messages_unknown_questionnaire_id_is_a_404(db, monkeypatch):
 # --- TS parity: the shipped contract this module's schemas mirror ---
 
 
-def test_questionnaire_chat_message_matches_the_shipped_contract():
-    assert set(QuestionnaireChatMessage.model_fields) == _feature_interface_fields(
-        "QuestionnaireChatMessage"
-    )
-
-
-def test_questionnaire_chat_message_optionality_matches_the_shipped_contract():
-    for field, is_optional in _feature_interface_field_specs(
-        "QuestionnaireChatMessage"
-    ).items():
-        pydantic_required = QuestionnaireChatMessage.model_fields[field].is_required()
-        assert pydantic_required == (not is_optional), field
-
-
+# Parity for the chat RESPONSE models lives in test_api_schemas.py alongside
+# every other response-contract test, and is richer there (it adds optionality
+# checks for both responses). It used to be duplicated here; two copies parsing
+# the same .ts is maintenance surface that rots at different rates, and the
+# weaker copy is the one people trust. The REQUEST schemas and the status enum
+# stay here, where the routes that consume them are tested.
 def test_start_chat_request_matches_the_shipped_contract():
     assert set(StartChatRequest.model_fields) == _feature_interface_fields(
         "StartChatRequest"
-    )
-
-
-def test_start_chat_response_matches_the_shipped_contract():
-    assert set(StartChatResponse.model_fields) == _feature_interface_fields(
-        "StartChatResponse"
     )
 
 
@@ -438,12 +438,6 @@ def test_chat_reply_request_field_set_matches_the_shipped_contract():
     # not_required above and ChatReplyRequest's own schemas.py docstring).
     assert set(ChatReplyRequest.model_fields) == _feature_interface_fields(
         "ChatReplyRequest"
-    )
-
-
-def test_chat_reply_response_matches_the_shipped_contract():
-    assert set(ChatReplyResponse.model_fields) == _feature_interface_fields(
-        "ChatReplyResponse"
     )
 
 
