@@ -6,7 +6,17 @@
  * features, retention period). Validation lives on each Form.Item's `rules` array — no Yup.
  */
 
-import { Button, Card, Flex, Form, Input, Select, Spin, Switch } from "fidesui";
+import {
+  Button,
+  Card,
+  Flex,
+  Form,
+  Input,
+  Select,
+  Spin,
+  Switch,
+  useMessage,
+} from "fidesui";
 import { useMemo, useState } from "react";
 
 import { useAppSelector } from "~/app/hooks";
@@ -15,6 +25,7 @@ import {
   useCustomFields,
 } from "~/features/common/custom-fields";
 import { LegacyResourceTypes } from "~/features/common/custom-fields/types";
+import { getErrorMessage } from "~/features/common/helpers";
 // PrivacyCare (spec 2026-09-13 D-KT-5)
 import { useSetDeclarationGroundMutation } from "~/features/privacycare/processing-grounds.slice";
 import { selectLockedForGVL } from "~/features/system/dictionary-form/dict-suggestion.slice";
@@ -33,6 +44,7 @@ import {
   DataUse,
   PrivacyDeclarationResponse,
 } from "~/types/api";
+import { RTKErrorResult } from "~/types/errors/api";
 
 import useLegalBasisOptions from "./useLegalBasisOptions";
 import useSpecialCategoryLegalBasisOptions from "./useSpecialCategoryLegalBasisOptions";
@@ -144,6 +156,9 @@ export const PrivacyDeclarationForm = ({
     string | undefined
   >(undefined);
   const [setDeclarationGround] = useSetDeclarationGroundMutation();
+  // PrivacyCare (spec 2026-09-13 D-KT-5): same toast helper
+  // useSystemDataUseCrud's handleResult uses for the system-save error path.
+  const message = useMessage();
 
   const { customFieldValues, upsertCustomFields, isLoading } = useCustomFields({
     resourceType: LegacyResourceTypes.PRIVACY_DECLARATION,
@@ -186,11 +201,30 @@ export const PrivacyDeclarationForm = ({
         // declaration id is known from the system save response. Only the
         // enum-derived fallback options (used while grounds are loading)
         // have no groundId, so there is nothing to record for those.
+        //
+        // The system save above has already succeeded and is NOT rolled
+        // back on a ground-recording failure — that would undo a real save
+        // over a secondary, correctable step. Instead .unwrap() the
+        // mutation so a failure (e.g. the 422 class-mismatch the API
+        // raises, or a network error) surfaces the same way
+        // useSystemDataUseCrud's handleResult reports a failed system
+        // save: message.error with getErrorMessage's extracted detail,
+        // falling back to a message that tells the consultant exactly what
+        // to do next rather than a generic "something went wrong".
         if (selectedGroundId) {
-          await setDeclarationGround({
-            id: matched.id,
-            processing_ground_id: selectedGroundId,
-          });
+          try {
+            await setDeclarationGround({
+              id: matched.id,
+              processing_ground_id: selectedGroundId,
+            }).unwrap();
+          } catch (error) {
+            message.error(
+              getErrorMessage(
+                error as RTKErrorResult["error"],
+                "The legal basis ground was not recorded. Please re-select it and save again.",
+              ),
+            );
+          }
         }
       }
     }
