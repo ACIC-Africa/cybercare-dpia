@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import subprocess
 import sys
+import uuid
 
 import pytest
 import sqlalchemy
@@ -10,9 +11,11 @@ from sqlalchemy.orm import Session
 
 from fides.api.privacycare.taxonomy import kenyan
 from fides.api.privacycare.taxonomy.loader import (
+    count_declarations_referencing_created_keys,
     load_kenyan_taxonomy,
     revert_kenyan_taxonomy,
 )
+from tests.privacycare.test_context import _seed_declaration, _seed_system
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -288,3 +291,136 @@ def test_database_url_honours_privacycare_database_url_override(monkeypatch):
     monkeypatch.setenv("FIDES__DATABASE__PORT", "1")
     monkeypatch.setenv("FIDES__DATABASE__DB", "d")
     assert cli._database_url() == "postgresql://u:p@h:1/d"
+
+
+# --- I3: the revert guard --------------------------------------------------
+# privacydeclaration.data_categories / .data_subjects are text arrays with no
+# foreign key, so DELETEing a taxonomy row a declaration names always
+# succeeds — and leaves that declaration naming a key nobody can resolve, at
+# which point Fides' own validate_privacy_declarations (db/system.py) rejects
+# the next save of the system and the admin UI cannot edit it any more. The
+# guard is the only thing between an operator running `--revert --commit` on
+# a populated tenant and that outcome.
+CREATED_CATEGORY_KEY = "user.health_and_medical.hiv_status"
+CREATED_SUBJECT_KEY = "authorized_signatory"
+
+
+def _seed_declaration_naming_created_keys(db, **kwargs):
+    system = _seed_system(db, f"sys-{uuid.uuid4().hex[:6]}")
+    return _seed_declaration(db, system, "marketing.advertising", **kwargs)
+
+
+def test_revert_refuses_while_a_declaration_names_a_created_category(db):
+    load_kenyan_taxonomy(db)
+    _seed_declaration_naming_created_keys(db, categories=[CREATED_CATEGORY_KEY])
+
+    assert count_declarations_referencing_created_keys(db) == 1
+
+    with pytest.raises(ValueError) as exc_info:
+        revert_kenyan_taxonomy(db)
+
+    assert "1 privacy declaration(s)" in str(exc_info.value)
+    # Nothing was deleted: the guard runs before the first DELETE.
+    assert db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_categories WHERE fides_key = :key"
+    ), {"key": CREATED_CATEGORY_KEY}).scalar() == 1
+
+
+def test_revert_refuses_while_a_declaration_names_a_created_subject(db):
+    # The subject half of the guard: data_subjects is a second text array on
+    # the same row, and a revert strips 33 created subject keys as well.
+    load_kenyan_taxonomy(db)
+    system = _seed_system(db, f"sys-{uuid.uuid4().hex[:6]}")
+    decl = _seed_declaration(db, system, "marketing.advertising")
+    db.execute(sqlalchemy.text(
+        "UPDATE privacydeclaration SET data_subjects = ARRAY[:key] WHERE id = :id"
+    ), {"key": CREATED_SUBJECT_KEY, "id": decl})
+
+    assert count_declarations_referencing_created_keys(db) == 1
+
+    with pytest.raises(ValueError):
+        revert_kenyan_taxonomy(db)
+
+    assert db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_subjects WHERE fides_key = :key"
+    ), {"key": CREATED_SUBJECT_KEY}).scalar() == 1
+
+
+def test_revert_with_force_proceeds_anyway(db):
+    # --force is the operator saying "I accept that those declarations will
+    # name keys that no longer exist". It must actually revert, not just
+    # skip the count.
+    load_kenyan_taxonomy(db)
+    _seed_declaration_naming_created_keys(db, categories=[CREATED_CATEGORY_KEY])
+
+    revert_kenyan_taxonomy(db, force=True)
+
+    counts = db.execute(sqlalchemy.text(
+        "SELECT (SELECT count(*) FROM ctl_data_subjects), "
+        "(SELECT count(*) FROM ctl_data_categories), "
+        "(SELECT count(*) FROM ctl_data_categories WHERE :tag = ANY(tags))"
+    ), {"tag": kenyan.SPECIAL_TAG}).one()
+    assert counts == (15, 85, 0)
+
+
+def test_a_declaration_naming_only_default_keys_does_not_block_revert(db):
+    # The guard counts CREATED keys only. A declaration naming Fides' own
+    # default categories (the overwhelmingly common case, and the state of
+    # the live database today) must not make revert unusable.
+    load_kenyan_taxonomy(db)
+    _seed_declaration_naming_created_keys(db, categories=["user.contact.email"])
+
+    assert count_declarations_referencing_created_keys(db) == 0
+
+    revert_kenyan_taxonomy(db)
+
+
+# --- I4: the read-back drift check ----------------------------------------
+def test_loading_over_a_drifted_row_raises(db):
+    # The INSERTs are ON CONFLICT DO NOTHING, so a content change in
+    # kenyan.py silently never reaches an already-loaded database. Simulate
+    # the diverged state the way it would really arise (the DB holding
+    # different content from the module) and prove the loader refuses to
+    # report success over it.
+    load_kenyan_taxonomy(db)
+    db.execute(sqlalchemy.text(
+        "UPDATE ctl_data_categories SET name = 'Something Else' WHERE fides_key = :key"
+    ), {"key": CREATED_CATEGORY_KEY})
+
+    with pytest.raises(ValueError) as exc_info:
+        load_kenyan_taxonomy(db)
+
+    assert CREATED_CATEGORY_KEY in str(exc_info.value)
+    assert "--revert" in str(exc_info.value), "the message must name the remedy"
+
+
+def test_loading_over_a_drifted_subject_raises(db):
+    load_kenyan_taxonomy(db)
+    db.execute(sqlalchemy.text(
+        "UPDATE ctl_data_subjects SET description = 'not what kenyan.py says' "
+        "WHERE fides_key = :key"
+    ), {"key": CREATED_SUBJECT_KEY})
+
+    with pytest.raises(ValueError) as exc_info:
+        load_kenyan_taxonomy(db)
+
+    assert CREATED_SUBJECT_KEY in str(exc_info.value)
+
+
+def test_a_deleted_created_row_is_restored_by_the_next_load(db):
+    # The other half of the read-back check: a MISSING key is not the
+    # unfixable case a content edit is, because ON CONFLICT DO NOTHING still
+    # inserts a row that is not there. The loader re-creates it and the
+    # read-back then agrees, so no drift is reported — the check fires on
+    # content that cannot be updated in place, not on absence that can.
+    load_kenyan_taxonomy(db)
+    db.execute(sqlalchemy.text(
+        "DELETE FROM ctl_data_categories WHERE fides_key = :key"
+    ), {"key": CREATED_CATEGORY_KEY})
+
+    load_kenyan_taxonomy(db)
+
+    restored = db.execute(sqlalchemy.text(
+        "SELECT name FROM ctl_data_categories WHERE fides_key = :key"
+    ), {"key": CREATED_CATEGORY_KEY}).scalar()
+    assert restored == "HIV Status"

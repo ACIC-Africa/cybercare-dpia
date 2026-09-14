@@ -20,6 +20,23 @@ the single persistence switch — it commits whichever operation --revert
 selected. --revert --commit really does persist the revert (F10); the
 loader/reverter functions themselves never commit — the caller's session
 boundary decides that (see loader.py's module docstring).
+
+CHANGING THE CONTENT OF AN ALREADY-LOADED ROW (I4). The taxonomy INSERTs are
+ON CONFLICT (fides_key) DO NOTHING, so editing a created row's name,
+description or parent_key in kenyan.py and re-running this script does NOT
+update the database — the mapping table (an upsert) would record the new
+decision while ctl_data_categories / ctl_data_subjects kept the old one. The
+loader now refuses to finish in that state (it reads every created key back
+and raises on the difference). The remedy is two runs:
+
+    load_taxonomy.py --revert --commit    # then
+    load_taxonomy.py --commit
+
+subject to the revert guard: --revert refuses while any privacy declaration
+still names one of the created keys (the count is printed on every run as
+"declarations referencing created keys"), because deleting a category a
+declaration names makes Fides reject the next save of that system. --force
+overrides the guard and accepts that consequence deliberately.
 """
 import argparse
 import os
@@ -30,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from fides.api.privacycare.taxonomy.loader import (
     LoadSummary,
+    count_declarations_referencing_created_keys,
     load_kenyan_taxonomy,
     revert_kenyan_taxonomy,
 )
@@ -83,7 +101,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Revert the Kenyan taxonomy load instead of loading it. Dry run unless "
         "--commit is also passed.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Revert even though privacy declarations still name keys this loader "
+        "created — they will be left naming keys that no longer exist, and Fides "
+        "will reject the next save of those systems. Only meaningful with --revert.",
+    )
     args = parser.parse_args(argv)
+    if args.force and not args.revert:
+        parser.error("--force is only meaningful with --revert")
     return args
 
 
@@ -97,8 +124,16 @@ def main(argv: list[str]) -> int:
     # try/finally gets the same close-on-exit guarantee without tripping it.
     db = Session(engine)
     try:
+        # I3: printed on every run, dry or not, in both directions — it is
+        # the number that decides whether a revert is safe, and an operator
+        # should see it before running one rather than by reading a
+        # traceback after.
+        print(
+            "declarations referencing created keys: "
+            f"{count_declarations_referencing_created_keys(db)}"
+        )
         if args.revert:
-            revert_kenyan_taxonomy(db)
+            revert_kenyan_taxonomy(db, force=args.force)
             print("revert_kenyan_taxonomy: done")
         else:
             summary = load_kenyan_taxonomy(db)

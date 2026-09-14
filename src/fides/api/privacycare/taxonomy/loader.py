@@ -244,6 +244,75 @@ def _load_grounds(db: Session) -> None:
         )
 
 
+_SELECT_CREATED_CATEGORIES_SQL = sqlalchemy.text(
+    "SELECT fides_key, name, description, parent_key FROM ctl_data_categories "
+    "WHERE fides_key = ANY(:keys)"
+)
+
+_SELECT_CREATED_SUBJECTS_SQL = sqlalchemy.text(
+    "SELECT fides_key, name, description FROM ctl_data_subjects "
+    "WHERE fides_key = ANY(:keys)"
+)
+
+
+def _verify_created_rows(db: Session) -> None:
+    """I4: the INSERTs above are ON CONFLICT DO NOTHING, so editing a created
+    row's name/description/parent_key in kenyan.py and re-running the loader
+    leaves the database on the OLD content while
+    privacycare_taxonomy_mapping (an upsert) records the new decision — the
+    two halves of D-KT-7's audit trail diverge, silently, and LoadSummary
+    cannot see it because it is computed from the module rather than from
+    rowcounts (Ruling F1).
+
+    So read every created key back and compare it to what kenyan.py says it
+    should be. A mismatch is not a load that half-worked; it is a database
+    the module no longer describes, and the remedy (documented in
+    scripts/privacycare/load_taxonomy.py) is `--revert --commit` then
+    `--commit`, subject to the revert guard below. A missing key counts as
+    drift too: it means the INSERT did not take and nothing else would say
+    so."""
+    drifted: list[str] = []
+
+    wanted_categories = {
+        c.fides_key: (c.term, c.reason, c.parent_key)
+        for c in kenyan.CATEGORIES
+        if c.action == "create"
+    }
+    live_categories = {
+        row["fides_key"]: (row["name"], row["description"], row["parent_key"])
+        for row in db.execute(
+            _SELECT_CREATED_CATEGORIES_SQL, {"keys": list(wanted_categories)}
+        ).mappings()
+    }
+    for key, wanted in wanted_categories.items():
+        if live_categories.get(key) != wanted:
+            drifted.append(f"data_category {key}")
+
+    wanted_subjects = {
+        s.fides_key: (s.term, s.reason)
+        for s in kenyan.SUBJECTS
+        if s.action == "create"
+    }
+    live_subjects = {
+        row["fides_key"]: (row["name"], row["description"])
+        for row in db.execute(
+            _SELECT_CREATED_SUBJECTS_SQL, {"keys": list(wanted_subjects)}
+        ).mappings()
+    }
+    for key, wanted_subject in wanted_subjects.items():
+        if live_subjects.get(key) != wanted_subject:
+            drifted.append(f"data_subject {key}")
+
+    if drifted:
+        raise ValueError(
+            "kenyan.py and the database disagree about "
+            f"{len(drifted)} created row(s): {', '.join(sorted(drifted))}. "
+            "The taxonomy INSERTs are ON CONFLICT DO NOTHING, so a content "
+            "change to an already-loaded key never reaches the database: "
+            "revert the load (--revert --commit) and load it again."
+        )
+
+
 def load_kenyan_taxonomy(db: Session) -> LoadSummary:
     """Idempotent; never commits — the caller's session boundary decides
     that. Returns a LoadSummary computed from kenyan.SUBJECTS/CATEGORIES/
@@ -255,6 +324,7 @@ def load_kenyan_taxonomy(db: Session) -> LoadSummary:
     _load_subjects(db)
     _load_categories(db)
     _load_grounds(db)
+    _verify_created_rows(db)
 
     subjects_reused = sum(s.action == "reuse" for s in kenyan.SUBJECTS)
     subjects_created = sum(s.action == "create" for s in kenyan.SUBJECTS)
@@ -301,11 +371,53 @@ def load_kenyan_taxonomy(db: Session) -> LoadSummary:
     )
 
 
-def revert_kenyan_taxonomy(db: Session) -> None:
+_COUNT_DECLARATIONS_USING_CREATED_KEYS_SQL = sqlalchemy.text(
+    "SELECT count(*) FROM privacydeclaration d WHERE EXISTS ("
+    "  SELECT 1 FROM unnest(d.data_categories) k "
+    "  JOIN ctl_data_categories c ON c.fides_key = k "
+    "  WHERE c.is_default = false AND 'privacycare:kenyan' = ANY(c.tags)"
+    ") OR EXISTS ("
+    "  SELECT 1 FROM unnest(d.data_subjects) k "
+    "  JOIN ctl_data_subjects s ON s.fides_key = k "
+    "  WHERE s.is_default = false AND 'privacycare:kenyan' = ANY(s.tags)"
+    ")"
+)
+
+
+def count_declarations_referencing_created_keys(db: Session) -> int:
+    """How many privacydeclaration rows name a category or subject key this
+    loader created. privacydeclaration.data_categories / .data_subjects are
+    text arrays with no foreign key, so deleting a taxonomy row a
+    declaration names always succeeds and leaves the declaration naming a
+    key nobody can resolve — at which point Fides' own
+    validate_privacy_declarations (db/system.py) rejects the next save of
+    that system and the system becomes un-editable in the admin UI. Read-only;
+    the number is the whole point of the guard in revert_kenyan_taxonomy."""
+    return db.execute(_COUNT_DECLARATIONS_USING_CREATED_KEYS_SQL).scalar() or 0
+
+
+def revert_kenyan_taxonomy(db: Session, *, force: bool = False) -> None:
     """Deletes the is_default=false rows we created, strips SPECIAL_TAG from
     is_default=true rows, restores the 9 reused names + nulls their rights,
     and deletes our mapping rows. Leaves privacycare_processing_ground alone
-    — declarations may reference it."""
+    — declarations may reference it.
+
+    Refuses to delete anything (ValueError) while a privacydeclaration names
+    one of the created keys, unless `force=True` says the caller accepts
+    leaving those declarations pointing at keys that no longer exist. The
+    check runs BEFORE the first DELETE, so a refusal leaves the taxonomy
+    exactly as it was."""
+    if not force:
+        in_use = count_declarations_referencing_created_keys(db)
+        if in_use:
+            raise ValueError(
+                f"{in_use} privacy declaration(s) still name a data category "
+                "or data subject this loader created; reverting would leave "
+                "them pointing at keys that no longer exist and Fides would "
+                "reject the next save of those systems. Re-point or delete "
+                "those declarations first, or pass force=True (--force) to "
+                "revert anyway."
+            )
     db.execute(
         sqlalchemy.text(
             "DELETE FROM ctl_data_categories WHERE 'privacycare:kenyan' = ANY(tags) AND is_default = false"

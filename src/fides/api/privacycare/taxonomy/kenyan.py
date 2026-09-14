@@ -106,12 +106,9 @@ SUBJECTS = [
     Subject("Government Agency & Staff", "government_agency_staff", "create", "Compound: names the officer through the agency.", True, "officer"),
     Subject("Governmenet Agency & Client", "government_agency_client", "create", "Compound: names the client through the agency. Source spelling 'Governmenet' preserved in name (sic; suggested correction 'Government').", True, "client"),
 ]
-assert len(SUBJECTS) == 43
-assert sum(s.action == "reuse" for s in SUBJECTS) == 9
-assert sum(s.action == "create" for s in SUBJECTS) == 33
-assert sum(s.names_person_directly is True for s in SUBJECTS) == 21
-assert sum(s.names_person_directly is False for s in SUBJECTS) == 11
-assert sum(s.names_person_directly is None and s.action != "dropped" for s in SUBJECTS) == 10
+# Counts checked in _check() at the foot of this module (M2: `assert` is
+# erased under `python -O`, and these counts are guarantees the spec leans
+# on, not debugging aids).
 
 # All 68 categories. Special first (28), then the 40 others.
 H = "user.health_and_medical"
@@ -196,14 +193,7 @@ CATEGORIES = [
     Category("Culture", f"{D}.culture", D, "create", False, "No Fides key."),
     Category("Language", "user.demographic.language", None, "reuse", False, "Exact."),
 ]
-assert len(CATEGORIES) == 68
-assert sum(c.special for c in CATEGORIES) == 28
-assert sum(c.action == "tag" for c in CATEGORIES) == 9
-assert len({c.fides_key for c in CATEGORIES if c.action == "tag"}) == 8  # Race + Ethnic origin share a key
-assert sum(c.action == "create" and c.special for c in CATEGORIES) == 18
-assert sum(c.action == "create" for c in CATEGORIES) == 29
-assert sum(c.action == "deferred" for c in CATEGORIES) == 5
-assert sum(c.action == "not_personal_data" for c in CATEGORIES) == 7
+# Counts checked in _check() at the foot of this module.
 
 # All 23 grounds. `fides_legal_basis` comes ONLY from `source_class`;
 # `suggested` only where the name is unambiguous.
@@ -232,5 +222,62 @@ GROUNDS = [
     Ground("Research", None, None, None),
     Ground("Risk Assessment", None, None, None),
 ]
-assert len(GROUNDS) == 23
-assert sum(g.fides_legal_basis is not None for g in GROUNDS) == 11
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(f"kenyan.py: {message}")
+
+
+def _check() -> None:
+    """The count guarantees the spec, the loader's LoadSummary and the
+    acceptance tests all lean on, checked at import.
+
+    M2: these were bare `assert`s, which `python -O` erases — the module
+    would then load a taxonomy nobody had counted. ValueError is raised
+    instead, so the guarantee survives every way this module can be
+    imported."""
+    # Subjects: 43 terms, 9 reused Fides keys, 33 created, 1 dropped.
+    _require(len(SUBJECTS) == 43, f"expected 43 subjects, got {len(SUBJECTS)}")
+    _require(sum(s.action == "reuse" for s in SUBJECTS) == 9, "expected 9 reused subjects")
+    _require(sum(s.action == "create" for s in SUBJECTS) == 33, "expected 33 created subjects")
+    _require(
+        sum(s.names_person_directly is True for s in SUBJECTS) == 21,
+        "expected 21 subjects naming a person directly",
+    )
+    _require(
+        sum(s.names_person_directly is False for s in SUBJECTS) == 11,
+        "expected 11 institutional subjects",
+    )
+    _require(
+        sum(s.names_person_directly is None and s.action != "dropped" for s in SUBJECTS) == 10,
+        "expected 10 subjects left ambiguous for Carol",
+    )
+    # Categories: 68 terms; 9 tag actions over 8 distinct keys (Race and
+    # Ethnic or Social Origin share race_ethnicity); 29 created, 18 special.
+    _require(len(CATEGORIES) == 68, f"expected 68 categories, got {len(CATEGORIES)}")
+    _require(sum(c.special for c in CATEGORIES) == 28, "expected 28 special-bucket categories")
+    _require(sum(c.action == "tag" for c in CATEGORIES) == 9, "expected 9 tag actions")
+    _require(
+        len({c.fides_key for c in CATEGORIES if c.action == "tag"}) == 8,
+        "expected 8 distinct tagged keys",
+    )
+    _require(
+        sum(c.action == "create" and c.special for c in CATEGORIES) == 18,
+        "expected 18 created special categories",
+    )
+    _require(sum(c.action == "create" for c in CATEGORIES) == 29, "expected 29 created categories")
+    _require(sum(c.action == "deferred" for c in CATEGORIES) == 5, "expected 5 deferred categories")
+    _require(
+        sum(c.action == "not_personal_data" for c in CATEGORIES) == 7,
+        "expected 7 not-personal-data categories",
+    )
+    # Grounds: all 23 from the customer's register, 11 of them classed.
+    _require(len(GROUNDS) == 23, f"expected 23 grounds, got {len(GROUNDS)}")
+    _require(
+        sum(g.fides_legal_basis is not None for g in GROUNDS) == 11,
+        "expected 11 grounds with a fides_legal_basis",
+    )
+
+
+_check()
