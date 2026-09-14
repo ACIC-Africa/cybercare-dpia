@@ -99,3 +99,18 @@ def test_unauthenticated_chat_transcript_get_is_rejected(client):
         f"{PRIVACYCARE_CHAT_PREFIX}/messages/does-not-matter did not reject "
         f"an unauthenticated caller (got {response.status_code})"
     )
+
+
+# The Kenyan processing-grounds surface (D-KT-5), a fourth namespace. Asserts
+# the route is actually routed — 401 (rejected because unauthenticated), not
+# 404 (not wired up at all) — the same distinction PRIVACYCARE_PREFIX's own
+# module docstring above calls out as the thing nothing else here would have
+# caught.
+def test_processing_grounds_route_is_routed_not_missing(client):
+    from fides.api.privacycare.api.router import PRIVACYCARE_GROUNDS_PREFIX
+
+    response = client.get(f"{PRIVACYCARE_GROUNDS_PREFIX}/processing-grounds")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"{PRIVACYCARE_GROUNDS_PREFIX}/processing-grounds did not reject an "
+        f"unauthenticated caller (got {response.status_code})"
+    )

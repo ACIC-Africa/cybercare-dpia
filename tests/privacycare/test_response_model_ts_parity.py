@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from fides.api.privacycare.api.router import (
     PRIVACYCARE_CHAT_PREFIX,
+    PRIVACYCARE_GROUNDS_PREFIX,
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
 )
@@ -164,6 +165,25 @@ ALLOWLIST: dict[str, dict] = {
             "carries its own parity tests in test_api_schemas.py."
         ),
     },
+    # The Kenyan processing-grounds surface (D-KT-5). Same shape of gap as
+    # the business-process ROPA surface above, but for a different reason:
+    # this route is brand-new (Task 5 of the Kenyan-taxonomy plan) and the
+    # hook that will consume it is Task 6 of the SAME plan, not yet written.
+    # It defines its own type when it lands rather than reusing one of
+    # these; these entries come out once that hook exists and can be
+    # checked against a real TS counterpart.
+    "ProcessingGroundResponse": {
+        "ts_name": None,
+        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
+    },
+    "ProcessingGroundListResponse": {
+        "ts_name": None,
+        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
+    },
+    "DeclarationGroundResponse": {
+        "ts_name": None,
+        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
+    },
     "bytes": {
         "ts_name": None,
         "reason": (
@@ -203,6 +223,7 @@ PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
     PRIVACYCARE_CHAT_PREFIX,
+    PRIVACYCARE_GROUNDS_PREFIX,
 )
 
 

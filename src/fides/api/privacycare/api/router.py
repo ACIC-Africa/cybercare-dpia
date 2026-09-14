@@ -54,6 +54,16 @@ PRIVACYCARE_CHAT_PREFIX = f"{V1_URL_PREFIX}/plus/chat/questionnaire"
 
 privacycare_chat_router = APIRouter(prefix=PRIVACYCARE_CHAT_PREFIX, tags=["PrivacyCare"])
 
+# The Kenyan-taxonomy processing-grounds surface (D-KT-5): a FOURTH, separate
+# prefix family. Not `plus/privacy-assessments` (no shipped UI calls it — the
+# hook in Task 6 is new), and not `privacycare/business-processes` (grounds
+# are not business processes) — its own namespace for the same reason
+# privacycare_processes_router and privacycare_chat_router each got their
+# own: a router is constructed with one fixed prefix.
+PRIVACYCARE_GROUNDS_PREFIX = f"{V1_URL_PREFIX}/privacycare"
+
+privacycare_grounds_router = APIRouter(prefix=PRIVACYCARE_GROUNDS_PREFIX, tags=["PrivacyCare"])
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -121,6 +131,11 @@ def register() -> None:
     importlib.import_module("fides.api.privacycare.api.assessments")
     importlib.import_module("fides.api.privacycare.api.processes")
 
+    # grounds.py decorates its OWN router (privacycare_grounds_router, a
+    # distinct prefix), so it carries none of the tasks-vs-assessments
+    # matching-order hazard above either.
+    importlib.import_module("fides.api.privacycare.api.grounds")
+
     # api/reports.py (task 3, config-and-pdf plan) binds GET
     # "/{assessment_id}/pdf" on this SAME privacycare_router — but as a
     # TWO-segment path. Starlette matches a route by its whole path
@@ -139,4 +154,5 @@ def register() -> None:
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
+    app_setup.ROUTERS.append(privacycare_grounds_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
