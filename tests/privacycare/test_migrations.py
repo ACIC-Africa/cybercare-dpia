@@ -302,3 +302,16 @@ def test_c2_privacycare_autogenerate_measures_zero_diff_ops():
         f"clean (0 diff ops expected): "
         f"{[(op[0], getattr(op[1], 'name', op[1])) for op in remove_ops]}"
     )
+
+
+def test_kenyan_taxonomy_tables_exist_after_upgrade():
+    # Plan 09 task 1. The three tables are ours; the C2 test below proves the
+    # models agree with them, this proves the migration created them.
+    engine = _engine()
+    with engine.connect() as conn:
+        names = set(sqlalchemy.inspect(conn).get_table_names())
+    assert {
+        "privacycare_taxonomy_mapping",
+        "privacycare_processing_ground",
+        "privacycare_declaration_ground",
+    } <= names
