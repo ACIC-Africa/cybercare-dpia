@@ -35,6 +35,17 @@ def db():
         session.rollback()
 
 
+@pytest.fixture(autouse=True)
+def _no_commit(db, monkeypatch):
+    # set_declaration_ground commits on its success path (the request's own
+    # session boundary, same as create_business_process in processes.py).
+    # Without this guard, seeded systems/declarations/ground rows were
+    # committed to the live DB once already (a test called the route's
+    # success path without neutralising commit first) — autouse, module-wide,
+    # so no test in this file can forget it again.
+    monkeypatch.setattr(db, "commit", lambda: None)
+
+
 def _ground_id(db, ground: str) -> str:
     return db.execute(
         sqlalchemy.text(
@@ -80,12 +91,7 @@ def test_recording_a_ground_requires_the_enum_to_agree(db):
     assert exc_info.value.status_code == 422
 
 
-def test_recording_a_ground_round_trips(db, monkeypatch):
-    # set_declaration_ground commits on its success path (the request's own
-    # session boundary, same as create_business_process in processes.py) —
-    # neutralised here the same way _create() does in test_api_processes.py
-    # so this test's rows never survive past the db fixture's rollback.
-    monkeypatch.setattr(db, "commit", lambda: None)
+def test_recording_a_ground_round_trips(db):
     load_kenyan_taxonomy(db)
     system = _seed_system(db, f"sys_{uuid4().hex[:8]}")
     decl = _seed_declaration(
@@ -110,12 +116,10 @@ def test_recording_a_ground_round_trips(db, monkeypatch):
     assert again.fides_legal_basis == "Legitimate interests"
 
 
-def test_recording_a_ground_upserts_rather_than_duplicates(db, monkeypatch):
+def test_recording_a_ground_upserts_rather_than_duplicates(db):
     # privacycare_declaration_ground is unique on privacy_declaration_id — a
     # declarant changing their mind about which ground applies must replace
-    # the row, not collide with it. Commit neutralised — see the note on
-    # test_recording_a_ground_round_trips above.
-    monkeypatch.setattr(db, "commit", lambda: None)
+    # the row, not collide with it.
     load_kenyan_taxonomy(db)
     system = _seed_system(db, f"sys_{uuid4().hex[:8]}")
     decl = _seed_declaration(
