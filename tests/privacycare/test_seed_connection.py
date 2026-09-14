@@ -16,6 +16,15 @@ from sqlalchemy.orm import Session
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 KEY = "privacycare_scratch_local_postgres"
 
+# M15 (test hygiene): resolved from __file__ rather than passed as a
+# relative string, so the two subprocess tests below pass regardless of
+# pytest's current working directory — previously they only passed when
+# pytest ran from the repo root.
+_SCRIPT_PATH = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "scripts/privacycare/seed_connection.py"
+)
+
 
 @pytest.fixture
 def db(monkeypatch):
@@ -40,7 +49,7 @@ def _load_cli():
 def test_dry_run_writes_nothing():
     before = _count()
     out = subprocess.run(
-        [sys.executable, "scripts/privacycare/seed_connection.py"],
+        [sys.executable, str(_SCRIPT_PATH)],
         capture_output=True, text=True, check=True,
     ).stdout
     assert "DRY RUN — nothing written" in out
@@ -48,12 +57,29 @@ def test_dry_run_writes_nothing():
 
 
 def test_the_run_names_its_target_and_never_the_password():
+    # M15: this used to assert bare `"fides" in out`, which the DATABASE
+    # NAME satisfies — but "fides" is ALSO _database_url()'s own default
+    # FIDES__DATABASE__PASSWORD literal, so the assertion could not actually
+    # distinguish "the db name was printed" (legitimate) from "the password
+    # leaked" (not). Overriding FIDES__DATABASE__PASSWORD to something
+    # distinctive isn't an option here — the live fides-db genuinely
+    # requires the real password to authenticate, and this test needs the
+    # run to actually succeed. Counting occurrences is the discriminator
+    # instead: the default password and the default db name are the SAME
+    # string ("fides"), so if the password ever leaked too, "fides" would
+    # appear MORE than once — the default username (postgres) and the
+    # host/port never contain it.
     out = subprocess.run(
-        [sys.executable, "scripts/privacycare/seed_connection.py"],
+        [sys.executable, str(_SCRIPT_PATH)],
         capture_output=True, text=True, check=True,
     ).stdout
     assert "target:" in out
-    assert "fides" in out            # the database name
+    target_line = next(line for line in out.splitlines() if line.startswith("target:"))
+    assert target_line.endswith("/fides"), "target line should end with the database name"
+    assert out.count("fides") == 1, (
+        "'fides' should appear exactly once (the database name); "
+        f"got {out.count('fides')} — the password may have leaked"
+    )
     assert "postgres:fides@" not in out   # never a credential-bearing URL
     assert "postgresql://" not in out
 
@@ -79,6 +105,30 @@ def test_the_seeded_connection_is_a_postgres_one(db):
         {"k": KEY},
     ).scalar()
     assert row == "postgres"
+
+
+def test_the_seeded_connection_is_read_only(db):
+    # I5 (final review): the seeded connection points at our OWN fides-db,
+    # which holds connectionconfig (every other connection's encrypted
+    # secrets), client (OAuth secrets) and fidesuser. 'write' access
+    # (AccessLevel's own comment: "we can update/delete items in the
+    # connected database") on our own application database is a live
+    # exposure once plan 11 executes monitors or attaches a DSR policy to
+    # this connection. 'read' demonstrates the exact same configuration
+    # screen with none of that risk.
+    #
+    # seed_connection() is idempotent-by-short-circuit (an existing row is
+    # never updated), so this needs a clean slate — same as the two secrets
+    # tests above — to actually exercise the INSERT path this assertion is
+    # about, rather than reading back whatever the live row already holds.
+    _delete_existing(db)
+    cli = _load_cli()
+    cli.seed_connection(db)
+    access = db.execute(
+        sqlalchemy.text("SELECT access FROM connectionconfig WHERE key = :k"),
+        {"k": KEY},
+    ).scalar()
+    assert access == "read"
 
 
 def _delete_existing(db):
@@ -137,9 +187,14 @@ def test_the_seeded_secrets_host_and_port_are_overridable(db, monkeypatch):
 
 
 def _count() -> int:
+    # M15: dispose the engine this helper creates on every call — same
+    # leaked-connection pattern I4 fixes in the route code, here in test code.
     engine = sqlalchemy.create_engine(DB_URL)
-    with Session(engine) as session:
-        return session.execute(
-            sqlalchemy.text("SELECT count(*) FROM connectionconfig WHERE key = :k"),
-            {"k": KEY},
-        ).scalar()
+    try:
+        with Session(engine) as session:
+            return session.execute(
+                sqlalchemy.text("SELECT count(*) FROM connectionconfig WHERE key = :k"),
+                {"k": KEY},
+            ).scalar()
+    finally:
+        engine.dispose()

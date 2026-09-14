@@ -10,8 +10,13 @@ import pytest
 import sqlalchemy
 from fastapi import HTTPException
 from fastapi_pagination import Params
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from fides.api.models.connectionconfig import ConnectionConfig
+from fides.api.models.detection_discovery.core import MonitorConfig
+from fides.api.models.fides_user import FidesUser
+from fides.api.privacycare.api import monitors as monitors_module
 from fides.api.privacycare.api.monitor_schemas import EditableMonitorConfig
 from fides.api.privacycare.api.monitors import (
     delete_monitor,
@@ -22,6 +27,7 @@ from fides.api.privacycare.api.monitors import (
     list_monitors,
     put_monitor,
 )
+from fides.api.service.connectors import get_connector as real_get_connector
 from tests.privacycare.test_api_assessments import _fake_client
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -132,6 +138,15 @@ def unreachable_connection_key(db):
     return key
 
 
+@pytest.fixture
+def steward_user(db):
+    """A FidesUser row to assign as a monitor steward, rolled back with `db`."""
+    user = FidesUser(username=f"t10_steward_{uuid.uuid4().hex[:8]}")
+    db.add(user)
+    db.flush()
+    return user
+
+
 def _editable(connection_key, **kwargs):
     return EditableMonitorConfig(
         name=kwargs.pop("name", "Retail Postgres"),
@@ -172,6 +187,32 @@ def test_putting_the_same_key_edits_rather_than_duplicating(db, connection_key):
     assert count == 1, "the monitor was duplicated rather than edited"
 
 
+def test_a_monitor_can_be_assigned_a_non_empty_steward_list(db, connection_key, steward_user):
+    # C1: MonitorConfig.stewards is a many-to-many relationship, not a plain
+    # column — this is the default path (the picker is the third field on
+    # the create modal, populated), not an edge case, and no existing test
+    # covered a non-empty steward list before this fix (the rendered check
+    # only passed because the field was left empty).
+    request = _editable(connection_key, stewards=[steward_user.id])
+
+    created = put_monitor(request, db=db, client=_fake_client("carol@example.com"))
+
+    assert [s.id for s in created.stewards] == [steward_user.id]
+
+    fetched = get_monitor(created.key, db=db, client=_fake_client("carol@example.com"))
+    assert [s.id for s in fetched.stewards] == [steward_user.id]
+
+
+def test_assigning_an_unknown_steward_id_is_rejected_with_400(db, connection_key):
+    request = _editable(connection_key, stewards=["no_such_user_id"])
+
+    with pytest.raises(HTTPException) as caught:
+        put_monitor(request, db=db, client=_fake_client("carol@example.com"))
+
+    assert caught.value.status_code == 400
+    assert "no_such_user_id" in caught.value.detail
+
+
 def test_the_list_returns_the_envelope_the_ui_paginates(db, connection_key):
     put_monitor(_editable(connection_key), db=db, client=_fake_client("carol@example.com"))
 
@@ -180,6 +221,42 @@ def test_the_list_returns_the_envelope_the_ui_paginates(db, connection_key):
     )
 
     assert {"items", "total", "page", "size", "pages"} <= set(page.model_dump())
+
+
+def test_list_monitors_filters_by_connection_config_key(db, connection_key):
+    # I2: useMonitorConfigTable.tsx's useGetMonitorsByIntegrationQuery sends
+    # connection_config_key on the Integrations monitor tab, and the RTK
+    # Query slice spreads it straight through — undeclared here, FastAPI
+    # silently dropped it and every integration's tab listed every monitor
+    # in the system. Two connections, one monitor each, proves the filter
+    # actually narrows the result.
+    other_key = f"t10_conn_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO connectionconfig (id, key, name, connection_type, "
+            " access, disabled) "
+            "VALUES (:id, :key, :name, 'postgres', 'write', false)"
+        ),
+        {"id": f"conn_{uuid.uuid4().hex[:12]}", "key": other_key, "name": other_key},
+    )
+    db.flush()
+
+    put_monitor(
+        _editable(connection_key, name="Monitor On A", key=f"t10_mon_{uuid.uuid4().hex[:8]}"),
+        db=db, client=_fake_client("carol@example.com"),
+    )
+    put_monitor(
+        _editable(other_key, name="Monitor On B", key=f"t10_mon_{uuid.uuid4().hex[:8]}"),
+        db=db, client=_fake_client("carol@example.com"),
+    )
+
+    page = list_monitors(
+        connection_config_key=connection_key,
+        params=Params(page=1, size=50), db=db, client=_fake_client("carol@example.com"),
+    )
+
+    assert page.items, "expected at least one monitor for connection_key"
+    assert {item.connection_config_key for item in page.items} == {connection_key}
 
 
 def test_an_unknown_monitor_is_404_not_500(db):
@@ -238,6 +315,9 @@ def test_the_databases_route_lists_what_the_connection_reports(db, connection_ke
     # project, a Postgres schema) — so the test asserts what THIS connector
     # reports rather than a name borrowed from another datasource's vocabulary.
     assert "public" in page.items
+    # M12: information_schema is Postgres system catalog metadata, never a
+    # scannable scope unit — it must never be offered by the picker.
+    assert "information_schema" not in page.items
     assert {"items", "total", "page", "size", "pages"} <= set(page.model_dump())
 
 
@@ -261,6 +341,15 @@ def test_the_databases_route_returns_502_when_the_connection_is_unreachable(
 
     assert caught.value.status_code == 502
     assert unreachable_connection_key in caught.value.detail
+    # I6: the detail must name the connection and NOTHING else — it used to
+    # interpolate the raw target exception, which in dev mode (hide_parameters
+    # = not CONFIG.dev_mode) can carry bound parameters/URIs built from
+    # `secrets`, visible to PRIVACYCARE_DISCOVERY_READ (Viewer, Data Steward).
+    assert caught.value.detail == (
+        f"Could not read databases from connection {unreachable_connection_key}"
+    )
+    assert "refused" not in caught.value.detail.lower()
+    assert "errno" not in caught.value.detail.lower()
 
 
 def test_a_monitor_naming_a_missing_connection_is_rejected(db):
@@ -273,6 +362,153 @@ def test_a_monitor_naming_a_missing_connection_is_rejected(db):
         )
     assert caught.value.status_code == 400
     assert "no_such_connection" in caught.value.detail
+
+
+def test_a_duplicate_monitor_name_is_rejected_with_400_not_500(db, connection_key):
+    # I3: base_class.create() derives key=to_snake_case(name) when no key is
+    # given and raises KeyOrNameAlreadyExists (a plain Exception, not an
+    # HTTPException) on a NAME collision too, with check_name=True (the
+    # route's default). The shipped create form sends no key, so two
+    # monitors named the same thing on two integrations is the live path.
+    put_monitor(
+        _editable(connection_key, name="Retail Postgres", key=f"t10_mon_{uuid.uuid4().hex[:8]}"),
+        db=db, client=_fake_client("carol@example.com"),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        put_monitor(
+            _editable(connection_key, name="Retail Postgres", key=f"t10_mon_{uuid.uuid4().hex[:8]}"),
+            db=db, client=_fake_client("carol@example.com"),
+        )
+
+    assert caught.value.status_code == 400
+
+
+def test_databases_and_excluded_databases_together_is_rejected_with_400_not_500(
+    db, connection_key
+):
+    # I3: MonitorConfig.database_include_exclude_list_is_valid raises a bare
+    # ValueError when both are set — previously an unhandled 500.
+    request = _editable(connection_key, databases=["fides"], excluded_databases=["other"])
+
+    with pytest.raises(HTTPException) as caught:
+        put_monitor(request, db=db, client=_fake_client("carol@example.com"))
+
+    assert caught.value.status_code == 400
+
+
+def test_a_concurrent_create_race_is_a_409_not_a_500(db, connection_key, monkeypatch):
+    # I3 / M14: two concurrent PUTs of the same new key both find `existing
+    # is None` and both call MonitorConfig.create(); the second's INSERT
+    # then collides with the first's at the DB level, raising IntegrityError
+    # — a real, lower-level conflict distinct from the KeyOrNameAlreadyExists
+    # family above, and left uncaught it also escapes as a 500. Forcing the
+    # IntegrityError directly (rather than driving two real overlapping
+    # transactions) exercises the route's own catch clause deterministically.
+    def _boom(cls, db, *, data, check_name=True):
+        raise IntegrityError(
+            "INSERT INTO monitorconfig ...", {}, Exception(
+                "duplicate key value violates unique constraint"
+            ),
+        )
+
+    monkeypatch.setattr(MonitorConfig, "create", classmethod(_boom))
+
+    with pytest.raises(HTTPException) as caught:
+        put_monitor(_editable(connection_key), db=db, client=_fake_client("carol@example.com"))
+
+    assert caught.value.status_code == 409
+
+
+def test_the_databases_route_returns_502_for_an_unsupported_connection_type(db):
+    # I7: get_connector() used to sit ABOVE _list_databases' try, so its
+    # NotImplementedError (a connection_type with no entry in
+    # service/connectors' supported_connectors mapping) escaped as a 500
+    # attributed to us rather than the 502-attributed-to-the-target contract
+    # the function's docstring promises. 'manual' is a real, valid
+    # ConnectionType with no connector class registered (deprecated in
+    # favour of manual_webhook).
+    key = f"t10_conn_unsupported_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO connectionconfig (id, key, name, connection_type, "
+            " access, disabled) "
+            "VALUES (:id, :key, :name, 'manual', 'write', false)"
+        ),
+        {"id": f"conn_{uuid.uuid4().hex[:12]}", "key": key, "name": key},
+    )
+    db.flush()
+    created = put_monitor(_editable(key), db=db, client=_fake_client("carol@example.com"))
+
+    with pytest.raises(HTTPException) as caught:
+        get_monitor_databases(
+            created.key, params=Params(page=1, size=50), db=db,
+            client=_fake_client("carol@example.com"),
+        )
+
+    assert caught.value.status_code == 502
+    assert key in caught.value.detail
+
+
+def _connector_with_tracked_dispose(monkeypatch, connection):
+    """Wrap the REAL connector's create_client() so its returned Engine's
+    dispose() is counted, and patch monitors.get_connector to hand back
+    this same connector. Used by the I4 engine-disposal tests below."""
+    real_connector = real_get_connector(connection)
+    disposed = {"count": 0}
+    real_create_client = real_connector.create_client
+
+    def _tracking_create_client():
+        engine = real_create_client()
+        original_dispose = engine.dispose
+
+        def _tracking_dispose():
+            disposed["count"] += 1
+            original_dispose()
+
+        engine.dispose = _tracking_dispose
+        return engine
+
+    monkeypatch.setattr(real_connector, "create_client", _tracking_create_client)
+    monkeypatch.setattr(monitors_module, "get_connector", lambda conn: real_connector)
+    return disposed
+
+
+def test_list_databases_disposes_its_engine_on_success(db, connection_key, monkeypatch):
+    # I4: create_client() builds a NEW Engine every call (not the cached
+    # `client` property) and _list_databases never disposed of it —
+    # `with engine.connect()` only returns the pooled CONNECTION to that
+    # engine's pool, which then stays open until GC. The picker calls this
+    # on every mount and page, so opening it repeatedly accumulated open
+    # server-side connections.
+    connection = (
+        db.query(ConnectionConfig).filter(ConnectionConfig.key == connection_key).first()
+    )
+    disposed = _connector_with_tracked_dispose(monkeypatch, connection)
+
+    names = monitors_module._list_databases(connection)
+
+    assert disposed["count"] == 1
+    assert "public" in names
+
+
+def test_list_databases_disposes_its_engine_even_on_502(
+    db, unreachable_connection_key, monkeypatch
+):
+    # Same I4 leak, on the error path: create_client() still returns a real
+    # Engine even though connect() then fails, so the leak is just as real
+    # on a 502 as on success.
+    connection = (
+        db.query(ConnectionConfig)
+        .filter(ConnectionConfig.key == unreachable_connection_key)
+        .first()
+    )
+    disposed = _connector_with_tracked_dispose(monkeypatch, connection)
+
+    with pytest.raises(HTTPException):
+        monitors_module._list_databases(connection)
+
+    assert disposed["count"] == 1
 
 
 def test_available_databases_lists_real_names_before_any_monitor_exists(
@@ -356,3 +592,8 @@ def test_available_databases_returns_502_when_the_connection_is_unreachable(
         )
     assert caught.value.status_code == 502
     assert unreachable_connection_key in caught.value.detail
+    # I6: same detail contract as get_monitor_databases' equivalent test —
+    # the connection key only, never the underlying target exception text.
+    assert caught.value.detail == (
+        f"Could not read databases from connection {unreachable_connection_key}"
+    )

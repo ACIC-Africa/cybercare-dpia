@@ -123,11 +123,21 @@ def seed_connection(db: Session) -> None:
     if existing is not None:
         return
 
+    # I5 fix (final review): 'read', not 'write'. Per AccessLevel's own
+    # comment (connectionconfig.py), 'write' means "we can update/delete
+    # items in the connected database" — and the database this connection
+    # points at is our OWN fides-db, which holds connectionconfig (every
+    # other connection's encrypted secrets), client (OAuth secrets) and
+    # fidesuser. Nothing in plan 10 acts on this connection at all; plan 11
+    # executing a monitor (or, later, a DSR policy attached to it) against a
+    # 'write' grant on our own application database would be authorised to
+    # erase rows in it. 'read' demonstrates exactly the same configuration
+    # screen with none of that exposure.
     db.execute(
         sqlalchemy.text(
             "INSERT INTO connectionconfig (id, key, name, connection_type, "
             " access, disabled) "
-            "VALUES (:id, :key, :name, 'postgres', 'write', false)"
+            "VALUES (:id, :key, :name, 'postgres', 'read', false)"
         ),
         {"id": f"conn_{uuid.uuid4().hex[:12]}", "key": KEY, "name": KEY},
     )

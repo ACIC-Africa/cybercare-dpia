@@ -115,8 +115,14 @@ def test_only_name_and_connection_key_are_required():
 
 
 def test_status_response_serialises_straight_off_a_model_row():
-    # from_attributes against the real MonitorConfig properties, not a dict
-    # assembled by hand — if a property is renamed upstream this fails loudly.
+    # T2 fix (final review): this validates a hand-built FakeRow, not the
+    # real MonitorConfig ORM class, so a property renamed on MonitorConfig
+    # itself would NOT fail this test — FakeRow would just keep the old
+    # attribute name, in sync with nothing. What this test actually proves
+    # is narrower: `from_attributes=True` reads attributes off an
+    # ARBITRARY object by name (duck typing, not a dict assembled by hand),
+    # so MonitorStatusResponse can serialise from anything shaped like
+    # MonitorConfig — including the real one — without extra glue code.
     class FakeRow:
         name = "Retail Postgres"
         key = "retail_pg"
@@ -219,6 +225,32 @@ def test_deletion_impact_matches_the_shipped_contract():
 
 def test_linked_dataset_info_matches_the_shipped_contract():
     assert set(LinkedDatasetInfo.model_fields) == _ts_fields("LinkedDatasetInfo")
+
+
+# I8 fix (final review): EditableMonitorConfig is the PUT REQUEST body, not a
+# response_model — the parity gate (test_response_model_ts_parity.py) only
+# ever walks routes' response_models, so it never sees a request body and
+# EditableMonitorConfig was invisible to it. Before this fix it had only the
+# hand-enumerated test_editable_config_carries_every_field_the_ui_sends
+# above, with no direct check against EditableMonitorConfig.ts itself and no
+# optionality check at all. This is also the direction where a mismatch
+# actually loses user data — a field the UI sends that the schema silently
+# drops (extra="ignore" is Pydantic's default) — rather than merely
+# rendering a blank screen, which is exactly what fix round 1 already found
+# once for this same model (stewards / inherit_system_stewards were
+# missing). Same two-test shape as every response model above.
+
+
+def test_editable_config_matches_the_shipped_contract():
+    assert set(EditableMonitorConfig.model_fields) == _ts_fields(
+        "EditableMonitorConfig"
+    )
+
+
+def test_editable_config_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("EditableMonitorConfig").items():
+        pydantic_required = EditableMonitorConfig.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
 
 
 # Fix round 1, Finding 1: the six tests above check field NAMES only. These

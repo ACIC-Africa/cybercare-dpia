@@ -26,7 +26,16 @@ TWO DATABASES ENDPOINTS, NOT ONE (Task 4 fix round 2). The original spec's
 enumeration regex ran `discovery-detection.slice.ts`'s two distinct
 `databases` query definitions together and only one survived into the
 brief: `getDatabasesByMonitor` -> `GET /{monitor_config_id}/databases`
-(`get_monitor_databases` below), used once a monitor row already exists.
+(`get_monitor_databases` below). Final-review finding M11: that hook
+(`useGetDatabasesByMonitorQuery`) has zero consumers anywhere under
+clients/admin-ui — the shipped wizard's picker calls only
+`getAvailableDatabasesByConnection` below. The route is kept anyway: it is
+a correct, already-tested read (existing monitor -> its connection's
+schemas) and plan 12's results surface is the shape of thing that would
+want "what does THIS monitor see" rather than "what does this connection
+see before any monitor exists" — so this stays as the route plan 12 is
+expected to wire a consumer to, not dead code to delete.
+
 The UI's create-monitor wizard, by contrast, must list a connection's
 databases BEFORE any monitor exists to save the picker's selections into —
 it calls `getAvailableDatabasesByConnection` -> `POST /databases` with a
@@ -40,16 +49,22 @@ resolve which `ConnectionConfig` to read: by way of an existing monitor's
 id — action-center.slice.ts's `getMonitorConfig` passes exactly what
 `MonitorStatusResponse.key` returned. Every lookup below is by `key`.
 """
+from typing import List, Optional, cast
+
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security
 from fastapi import status as status_codes
 from fastapi_pagination import Page, Params, paginate
+from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from fides.api.common_exceptions import KeyOrNameAlreadyExists, KeyValidationError
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
 from fides.api.models.connectionconfig import ConnectionConfig
 from fides.api.models.detection_discovery.core import MonitorConfig
+from fides.api.models.fides_user import FidesUser
 from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.monitor_schemas import (
     DeleteMonitorResponse,
@@ -106,14 +121,30 @@ def _monitor_or_404(db: Session, key: str) -> MonitorConfig:
     response_model=Page[MonitorStatusResponse],
 )
 def list_monitors(
+    connection_config_key: Optional[str] = None,
     params: Params = Depends(),
     db: Session = Depends(get_db),
     client: ClientDetail = Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_READ]),
 ) -> Page[MonitorStatusResponse]:
-    """Every configured monitor, for the discovery-monitor list screen."""
-    monitors = (
-        db.query(MonitorConfig).order_by(MonitorConfig.name, MonitorConfig.key).all()
-    )
+    """Every configured monitor, for the discovery-monitor list screen.
+
+    I2 fix: the Integrations monitor tab calls this with
+    `connection_config_key` set to the integration it's showing
+    (useMonitorConfigTable.tsx -> useGetMonitorsByIntegrationQuery), and the
+    RTK Query slice spreads the whole params object through untouched
+    (discovery-detection.slice.ts). Left undeclared, FastAPI silently drops
+    the param and every integration's tab lists every monitor in the
+    system — invisible with one connection, wrong the moment a second
+    exists. When the param is present, filter to monitors whose connection
+    matches it by joining on the connection's key (MonitorConfig only
+    stores connection_config_id).
+    """
+    query = db.query(MonitorConfig)
+    if connection_config_key is not None:
+        query = query.join(
+            ConnectionConfig, MonitorConfig.connection_config_id == ConnectionConfig.id
+        ).filter(ConnectionConfig.key == connection_config_key)
+    monitors = query.order_by(MonitorConfig.name, MonitorConfig.key).all()
     return paginate(
         [MonitorStatusResponse.model_validate(m) for m in monitors], params
     )
@@ -145,7 +176,17 @@ def put_monitor(
             detail=f"No connection configuration with key {request.connection_config_key}",
         )
 
-    data = request.model_dump(exclude={"connection_config_key"})
+    # C1 fix: MonitorConfig.stewards is a many-to-many relationship to
+    # FidesUser (secondary="monitorsteward"), not a plain column — passing
+    # the request's `stewards: List[str]` (user IDs) straight into
+    # data/create()/update() assigns raw strings to a relationship
+    # collection and blows up with an AttributeError deep inside SQLAlchemy
+    # (500). Popped out of `data` here, resolved to real FidesUser rows
+    # below, and assigned to the relationship separately once the monitor
+    # row itself exists. This is the DEFAULT path, not an edge case: the
+    # steward picker is the third field on the create modal and is re-sent
+    # on every enable/disable toggle (MonitorConfigEnableCell.tsx).
+    data = request.model_dump(exclude={"connection_config_key", "stewards"})
     data["connection_config_id"] = connection.id
 
     # `enabled` and `inherit_system_stewards` are NOT NULL columns on
@@ -162,15 +203,71 @@ def put_monitor(
         if data.get(optional_flag) is None:
             data.pop(optional_flag, None)
 
+    # Resolve steward IDs to real FidesUser rows BEFORE writing the monitor,
+    # so an unknown ID is rejected with a 400 naming it rather than silently
+    # dropped or blown up mid-write.
+    stewards: List[FidesUser] = []
+    if request.stewards:
+        stewards = (
+            db.query(FidesUser).filter(FidesUser.id.in_(request.stewards)).all()
+        )
+        found_ids = {user.id for user in stewards}
+        missing_ids = [sid for sid in request.stewards if sid not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=status_codes.HTTP_400_BAD_REQUEST,
+                detail=f"No user(s) with id: {', '.join(missing_ids)}",
+            )
+
     existing = db.query(MonitorConfig).filter(MonitorConfig.key == request.key).first()
     # create() and update() are overridden on MonitorConfig and carry the
     # databases / excluded_databases validation. Never write the row directly.
-    monitor = (
-        existing.update(db=db, data=data)
-        if existing
-        else MonitorConfig.create(db=db, data=data)
-    )
-    db.commit()
+    #
+    # I3 fix: base_class.create() derives a snake-cased key from `name` when
+    # none is given and raises KeyOrNameAlreadyExists on either a key OR a
+    # name collision (check_name=True, the default here) — the shipped
+    # create form sends no key, so two monitors named the same thing on two
+    # integrations is a live collision path, not a theoretical one.
+    # MonitorConfig.database_include_exclude_list_is_valid raises a bare
+    # ValueError when both databases and excluded_databases are set.
+    # KeyValidationError is the third member of that family. All three are
+    # plain Exception subclasses (KeyOrNameAlreadyExists/KeyValidationError)
+    # or a generic ValueError, so none of them are HTTPExceptions on their
+    # own — left uncaught they escape as an unhandled 500. Caught here and
+    # turned into a 400 naming the reason. IntegrityError (M14: two
+    # concurrent PUTs of the same new key both find `existing is None` and
+    # both call create()) is a real, lower-level DB conflict and gets its
+    # own 409 instead.
+    try:
+        # cast: MonitorConfig.update()'s declared return type is the base
+        # class's FidesBase (it doesn't narrow the override's signature),
+        # but both branches actually return this same MonitorConfig row.
+        monitor = cast(
+            MonitorConfig,
+            existing.update(db=db, data=data)
+            if existing
+            else MonitorConfig.create(db=db, data=data),
+        )
+        # MonitorConfig.stewards is declared with classic
+        # `relationship(FidesUser, secondary=...)`, no `Mapped[...]`
+        # annotation (that model is Ethyca-authored and out of scope for
+        # this wave), so the sqlalchemy mypy plugin infers a scalar
+        # FidesUser rather than the list a secondary-table relationship
+        # actually holds — hence the ignore below.
+        monitor.stewards = stewards  # type: ignore[assignment]
+        db.commit()
+    except (KeyOrNameAlreadyExists, KeyValidationError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status_codes.HTTP_409_CONFLICT,
+            detail=f"Monitor {request.key or request.name} conflicts with a "
+            "concurrent write; reload and try again.",
+        ) from exc
     return MonitorConfigResponse.model_validate(monitor)
 
 
@@ -265,21 +362,51 @@ def _list_databases(connection: ConnectionConfig) -> list[str]:
     monitor exists) — factored out so the connector/inspect/except block
     exists exactly once rather than twice with the same 502 contract.
     """
-    connector = get_connector(connection)
+    # I7 fix: get_connector() moved INSIDE the try. The docstring above
+    # promises both routes share "the same 502 contract" for the target's
+    # failures, but get_connector() raises NotImplementedError for an
+    # unsupported connection_type and AttributeError on a null
+    # connection_type — sitting above the try, those escaped as a 500
+    # attributed to us instead of the 502-attributed-to-the-target contract
+    # this function exists to draw.
+    engine = None
     try:
+        connector = get_connector(connection)
         engine = connector.create_client()
         with engine.connect() as sql_connection:
             names = sqlalchemy.inspect(sql_connection).get_schema_names()
     except Exception as error:  # noqa: BLE001 — the target's failure, not ours
-        # An unreachable or misconfigured target is the target's problem. 502
-        # says so; a 500 would read as a bug in PrivacyCare.
+        # I6 fix: the detail used to interpolate {error} — the raw target
+        # exception — into a 502 that PRIVACYCARE_DISCOVERY_READ (Viewer and
+        # Data Steward, not just an admin) can see. create_client() sets
+        # hide_parameters = not CONFIG.dev_mode, so in dev mode SQLAlchemy's
+        # error strings carry bound parameters, and an ArgumentError on a
+        # malformed URI renders the URI itself — built from `secrets`,
+        # containing the password. The connection KEY is enough for a
+        # consultant to act on; the underlying exception is logged
+        # server-side only, never returned to the caller.
+        logger.warning(
+            "Could not read databases from connection {}: {}", connection.key, error
+        )
         raise HTTPException(
             status_code=status_codes.HTTP_502_BAD_GATEWAY,
-            detail=(
-                f"Could not read databases from connection {connection.key}: {error}"
-            ),
+            detail=f"Could not read databases from connection {connection.key}",
         ) from error
-    return sorted(names)
+    finally:
+        # I4 fix: create_client() builds a NEW Engine every call (not the
+        # cached `client` property) and this function never disposed of it —
+        # `with engine.connect()` only returns the pooled connection to that
+        # engine's pool, which then stays open until GC. The wizard calls
+        # the POST route on mount and per page, so opening it repeatedly
+        # accumulated open server-side connections against whatever the
+        # connection points at.
+        if engine is not None:
+            engine.dispose()
+    # M12: information_schema is Postgres/MySQL system catalog metadata, not
+    # a real scope unit — nothing should ever be scanned there. Filtered out
+    # here so neither databases route offers it and the picker never renders
+    # it as a choice.
+    return sorted(name for name in names if name != "information_schema")
 
 
 @privacycare_monitors_router.get(

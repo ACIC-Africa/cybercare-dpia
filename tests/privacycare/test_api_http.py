@@ -142,3 +142,71 @@ def test_get_declaration_ground_rejects_an_unauthenticated_caller(client):
         f"{route} did not reject an unauthenticated caller "
         f"(got {response.status_code})"
     )
+
+
+# M10 (final review): every route test in test_api_monitors.py calls the
+# handler directly with a SimpleNamespace `client`, so verify_oauth_client
+# itself — the actual scope check — is never exercised anywhere in this
+# package for a genuinely authenticated-but-under-scoped caller. This is the
+# one exception: a real ClientDetail row, holding ONLY
+# privacycare_discovery:read, driven through the real ASGI app, must be
+# refused with 403 by the write route.
+#
+# verify_oauth_client resolves the token's client_id against the DATABASE
+# ROW the live app's own request-scoped session reads — not anything this
+# test's local session could roll back — so the row is created with a real
+# commit and explicitly deleted afterward instead.
+def test_put_discovery_monitor_rejects_a_read_only_scope(client):
+    import json
+    from datetime import datetime
+
+    import sqlalchemy
+    from sqlalchemy.orm import Session
+
+    from fides.api.cryptography.schemas.jwt import (
+        JWE_ISSUED_AT,
+        JWE_PAYLOAD_CLIENT_ID,
+        JWE_PAYLOAD_SCOPES,
+    )
+    from fides.api.models.client import ClientDetail
+    from fides.api.oauth.jwt import generate_jwe
+    from fides.api.privacycare.api.router import PRIVACYCARE_MONITORS_PREFIX
+    from fides.common.scope_registry import PRIVACYCARE_DISCOVERY_READ
+    from fides.config import CONFIG
+
+    db_url = "postgresql://postgres:fides@127.0.0.1:5442/fides"
+    engine = sqlalchemy.create_engine(db_url)
+    session = Session(engine)
+    read_only_client = ClientDetail(
+        hashed_secret="not-a-real-secret-M10-test",
+        salt="not-a-real-salt-M10-test",
+        scopes=[PRIVACYCARE_DISCOVERY_READ],
+    )
+    session.add(read_only_client)
+    session.commit()
+    client_id = read_only_client.id
+    try:
+        payload = {
+            JWE_PAYLOAD_SCOPES: [PRIVACYCARE_DISCOVERY_READ],
+            JWE_PAYLOAD_CLIENT_ID: client_id,
+            JWE_ISSUED_AT: datetime.now().isoformat(),
+        }
+        jwe = generate_jwe(json.dumps(payload), CONFIG.security.app_encryption_key)
+        response = client.put(
+            PRIVACYCARE_MONITORS_PREFIX,
+            json={
+                "name": "should-not-be-created",
+                "connection_config_key": "does-not-matter",
+            },
+            headers={"Authorization": f"Bearer {jwe}"},
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN, (
+            f"{PRIVACYCARE_MONITORS_PREFIX} PUT did not reject a "
+            f"read-only-scoped caller (got {response.status_code} "
+            f"{response.text!r})"
+        )
+    finally:
+        session.query(ClientDetail).filter(ClientDetail.id == client_id).delete()
+        session.commit()
+        session.close()
+        engine.dispose()
