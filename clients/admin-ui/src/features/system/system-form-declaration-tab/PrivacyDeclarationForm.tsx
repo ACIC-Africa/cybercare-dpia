@@ -7,7 +7,7 @@
  */
 
 import { Button, Card, Flex, Form, Input, Select, Spin, Switch } from "fidesui";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import { useAppSelector } from "~/app/hooks";
 import {
@@ -15,6 +15,8 @@ import {
   useCustomFields,
 } from "~/features/common/custom-fields";
 import { LegacyResourceTypes } from "~/features/common/custom-fields/types";
+// PrivacyCare (spec 2026-09-13 D-KT-5)
+import { useSetDeclarationGroundMutation } from "~/features/privacycare/processing-grounds.slice";
 import { selectLockedForGVL } from "~/features/system/dictionary-form/dict-suggestion.slice";
 import {
   DataCategoriesFormItem,
@@ -131,6 +133,18 @@ export const PrivacyDeclarationForm = ({
   const { specialCategoryLegalBasisOptions } =
     useSpecialCategoryLegalBasisOptions();
 
+  // PrivacyCare (spec 2026-09-13 D-KT-5): several Kenyan grounds share the
+  // same fides_legal_basis class, so the Select's bound form value (the
+  // class, kept as `value` per D-KT-4 so the system PUT still writes the
+  // enum) cannot by itself tell us which specific ground was picked.
+  // `onSelect` gives us the full option (antd's `(value, option) =>`
+  // signature) without disturbing the Form.Item's own onChange wiring, so
+  // we track the chosen option's groundId separately here.
+  const [selectedGroundId, setSelectedGroundId] = useState<
+    string | undefined
+  >(undefined);
+  const [setDeclarationGround] = useSetDeclarationGroundMutation();
+
   const { customFieldValues, upsertCustomFields, isLoading } = useCustomFields({
     resourceType: LegacyResourceTypes.PRIVACY_DECLARATION,
     resourceFidesKey: privacyDeclarationId,
@@ -167,6 +181,17 @@ export const PrivacyDeclarationForm = ({
           customFieldValues: values.customFieldValues,
           fides_key: matched.id,
         });
+        // PrivacyCare (spec 2026-09-13 D-KT-5): record which Kenyan ground
+        // justified this declaration's legal basis, now that the
+        // declaration id is known from the system save response. Only the
+        // enum-derived fallback options (used while grounds are loading)
+        // have no groundId, so there is nothing to record for those.
+        if (selectedGroundId) {
+          await setDeclarationGround({
+            id: matched.id,
+            processing_ground_id: selectedGroundId,
+          });
+        }
       }
     }
   };
@@ -219,7 +244,23 @@ export const PrivacyDeclarationForm = ({
             <Select
               aria-label="Legal basis for processing"
               data-testid="input-legal_basis_for_processing"
-              options={legalBasisOptions}
+              // PrivacyCare (spec 2026-09-13 D-KT-5): several Kenyan grounds
+              // share the same fides_legal_basis `value` (e.g. multiple
+              // "Legitimate interests" grounds), so keying options on
+              // `value` alone collides — antd would warn about duplicate
+              // keys and the selection could visually collapse onto one
+              // entry. Key on `groundId` (falling back to `value` for the
+              // enum-derived options, which have no groundId) instead,
+              // while leaving `value` itself as the class so the system PUT
+              // still writes the enum.
+              options={legalBasisOptions.map((option) => ({
+                ...option,
+                key: option.groundId ?? option.value,
+              }))}
+              onSelect={(_value, option: (typeof legalBasisOptions)[number]) =>
+                setSelectedGroundId(option.groundId)
+              }
+              onClear={() => setSelectedGroundId(undefined)}
               disabled={lockedForGVL}
               allowClear
             />
