@@ -15,10 +15,30 @@ import_processes.py (itself copied from migrations/env.py) rather than
 imported — see load_taxonomy.py's module docstring for why importing
 env.py isn't safe here.
 
-Secrets come from the environment at run time (FIDES__DATABASE__*, same
-defaults as the other scripts) and are never written into the repo or
-printed — `main()` only ever prints the `target:` line (host/port/database,
-never the password, never the raw URL).
+Secrets come from the environment at run time and are never written into
+the repo or printed — `main()` only ever prints the `target:` line
+(host/port/database, never the password, never the raw URL).
+
+TWO DIFFERENT NETWORK VIEWS, ON PURPOSE (fix round 1, Finding 1). This
+script's OWN session — `_database_url()`, FIDES__DATABASE__* — is how THIS
+PROCESS, running on the host, reaches fides-db to write the seed row. That
+is the host's view: fides-db is published to 127.0.0.1:5442.
+`connection.secrets`, by contrast, is how the LIVE `fides` API CONTAINER
+will later reach the same datastore when it serves get_monitor_databases
+(and, eventually, monitor execution) — and inside that container,
+127.0.0.1 is the container itself, not fides-db; only the Docker-internal
+hostname (`fides-db`, port 5432 — the same values `.fides/fides.toml`'s own
+[database] section uses) is reachable. Conflating the two — seeding
+`secrets` with the script's own host-side FIDES__DATABASE__* values — was
+the exact bug fix round 1 found: unit tests (which run on the host, same
+network view as the script) never caught it; only the rendered check,
+driving the actual container, did. So `secrets`' host/port get their OWN
+env vars, PRIVACYCARE_SCRATCH_DB_HOST / PRIVACYCARE_SCRATCH_DB_PORT,
+defaulting to the container view (fides-db:5432) — deliberately NOT
+FIDES__DATABASE__SERVER/PORT, which mean the other, host-side thing.
+Username/password/dbname are unaffected: same Postgres instance, same
+credentials, regardless of which network path reaches it — those still
+come from FIDES__DATABASE__USER/PASSWORD/DB, same as everywhere else.
 
 `seed_connection(db)` never commits — the caller's session boundary decides,
 matching load_taxonomy.py and import_processes.py. It is idempotent on the
@@ -118,9 +138,20 @@ def seed_connection(db: Session) -> None:
     # non-Optional, which is what lets `connection.secrets = ...` below
     # satisfy mypy without an assert.
     connection = db.query(ConnectionConfig).filter(ConnectionConfig.key == KEY).one()
+    # host/port describe how the LIVE `fides` API CONTAINER reaches
+    # fides-db, NOT how this script (running on the host) reaches it — see
+    # the module docstring's "TWO DIFFERENT NETWORK VIEWS" section. Default
+    # to the Docker-internal address (fides-db:5432, matching
+    # .fides/fides.toml's own [database] section), overridable by their own
+    # dedicated env vars for a deployment where that address differs.
+    # Deliberately NOT FIDES__DATABASE__SERVER/PORT — those name the host's
+    # view (127.0.0.1:5442) and reusing them here reproduces fix round 1's
+    # bug: a discovery monitor bound to this connection would 502 on every
+    # database listing, because 127.0.0.1 inside the container is the
+    # container itself, not fides-db.
     connection.secrets = {
-        "host": os.environ.get("FIDES__DATABASE__SERVER", "127.0.0.1"),
-        "port": int(os.environ.get("FIDES__DATABASE__PORT", "5442")),
+        "host": os.environ.get("PRIVACYCARE_SCRATCH_DB_HOST", "fides-db"),
+        "port": int(os.environ.get("PRIVACYCARE_SCRATCH_DB_PORT", "5432")),
         "username": os.environ.get("FIDES__DATABASE__USER", "postgres"),
         "password": os.environ.get("FIDES__DATABASE__PASSWORD", "fides"),
         "dbname": os.environ.get("FIDES__DATABASE__DB", "fides"),

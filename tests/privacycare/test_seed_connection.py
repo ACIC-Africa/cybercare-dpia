@@ -81,6 +81,61 @@ def test_the_seeded_connection_is_a_postgres_one(db):
     assert row == "postgres"
 
 
+def _delete_existing(db):
+    # The live database already carries the authorised --commit'd row (this
+    # is the ONE intended permanent write, per the brief). seed_connection()
+    # only touches `secrets` on the INSERT path — a row that already exists
+    # short-circuits before secrets are set — so a secrets-behaviour test
+    # needs a clean slate to actually exercise that path. Deleting here is
+    # safe: it happens inside the same `db` fixture's transaction, which
+    # test teardown rolls back, so the live row is untouched once the test
+    # ends (verified: `db` fixture patches commit to a no-op and always
+    # rolls back).
+    db.execute(sqlalchemy.text("DELETE FROM connectionconfig WHERE key = :k"), {"k": KEY})
+    db.flush()
+
+
+def test_the_seeded_secrets_describe_the_container_view_not_the_host_view(db):
+    # Fix round 1, Finding 1: secrets.host/port are how the LIVE `fides` API
+    # CONTAINER reaches fides-db (Docker-internal: fides-db:5432), NOT how
+    # this script itself — running on the host, via _database_url() and
+    # FIDES__DATABASE__SERVER/PORT — reaches it (127.0.0.1:5442). Reading
+    # `secrets` back needs the ORM (it's an encrypted column; raw SQL would
+    # return ciphertext), same as production code reads it.
+    from fides.api.models.connectionconfig import ConnectionConfig
+
+    _delete_existing(db)
+    cli = _load_cli()
+    cli.seed_connection(db)
+    connection = (
+        db.query(ConnectionConfig).filter(ConnectionConfig.key == KEY).one()
+    )
+    assert connection.secrets["host"] == "fides-db"
+    assert connection.secrets["port"] == 5432
+    # Pin the failure mode fix round 1 actually hit: the host-side view must
+    # never creep back in as the default.
+    assert connection.secrets["host"] != "127.0.0.1"
+    assert connection.secrets["port"] != 5442
+
+
+def test_the_seeded_secrets_host_and_port_are_overridable(db, monkeypatch):
+    # The dedicated env vars are for a deployment where the container-view
+    # address differs from the fides-db:5432 default — deliberately separate
+    # from FIDES__DATABASE__SERVER/PORT, which mean the host's view.
+    monkeypatch.setenv("PRIVACYCARE_SCRATCH_DB_HOST", "some-other-host")
+    monkeypatch.setenv("PRIVACYCARE_SCRATCH_DB_PORT", "6543")
+    from fides.api.models.connectionconfig import ConnectionConfig
+
+    _delete_existing(db)
+    cli = _load_cli()
+    cli.seed_connection(db)
+    connection = (
+        db.query(ConnectionConfig).filter(ConnectionConfig.key == KEY).one()
+    )
+    assert connection.secrets["host"] == "some-other-host"
+    assert connection.secrets["port"] == 6543
+
+
 def _count() -> int:
     engine = sqlalchemy.create_engine(DB_URL)
     with Session(engine) as session:

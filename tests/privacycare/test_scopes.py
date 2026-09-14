@@ -102,6 +102,29 @@ def test_action_center_route_does_not_require_plus():
     assert "requiresPlus:" not in block
 
 
+def _integrations_route_block(source: str) -> str:
+    # Isolate just the "Integrations" route object — from its title to the
+    # next route's title ("Notifications") — same isolation technique as
+    # _action_center_route_block, for the same reason: a requiresPlus
+    # elsewhere in the file must not produce a false pass here.
+    start = source.index('title: "Integrations"')
+    end = source.index('title: "Notifications"', start)
+    return source[start:end]
+
+
+def test_integrations_route_does_not_require_plus():
+    # Ruling P12 (Task 4 fix round 1): the Integrations page is the ONE
+    # screen that consumes the plus/discovery-monitor routes
+    # (features/integrations/configure-monitor/) — a discovery monitor
+    # cannot be created, read, edited or deleted in the shipped UI while
+    # this route stays Plus-gated, on the same precedent Ruling P4 already
+    # established for "Action center". Matches the property-assignment form
+    # ("requiresPlus:"), not the bare word, so the rationale comment above
+    # the route can't itself trip the assertion.
+    block = _integrations_route_block(_nav_config_source())
+    assert "requiresPlus:" not in block
+
+
 def test_every_ethyca_edit_carries_its_marker():
     # Spec §6: the discipline that replaced "never edit an Ethyca file" is that
     # every edit is recorded and greppable.

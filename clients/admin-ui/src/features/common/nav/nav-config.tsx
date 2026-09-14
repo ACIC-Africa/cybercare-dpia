@@ -241,7 +241,16 @@ export const NAV_CONFIG: NavConfigGroup[] = [
       {
         title: "Integrations",
         path: routes.INTEGRATION_MANAGEMENT_ROUTE,
-        requiresPlus: true,
+        // PrivacyCare (spec 2026-09-14 D-DM-1), Ruling P12: our build has no
+        // /api/v1/plus/health, so hasPlus is always false (Ruling P4, Task
+        // 1's "Action center" fix, same reasoning). This is the ONE screen
+        // that consumes the plus/discovery-monitor routes (features/
+        // integrations/configure-monitor/) — a discovery monitor cannot be
+        // created, read, edited or deleted in the shipped UI while this
+        // route stays Plus-gated, no matter how correct the backend is.
+        // requiresPlus removed on the same precedent as "Action center";
+        // the scopes below are Ethyca's own CONNECTION_* scopes and are
+        // untouched.
         keywords: ["connectors", "connections"],
         scopes: [
           ScopeRegistryEnum.CONNECTION_AUTHORIZE,
