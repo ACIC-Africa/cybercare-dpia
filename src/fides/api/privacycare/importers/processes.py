@@ -18,8 +18,17 @@
 # may be added here (no migration in this task), so the match is a plain
 # `SELECT ... WHERE external_ref = :ref AND deleted_at IS NULL FOR UPDATE`
 # rather than an `ON CONFLICT`. If more than one live row already shares a
-# ref — a state only a prior data anomaly could produce, since this module
-# always matches before it inserts — we refuse to guess which one to update.
+# ref, we refuse to guess which one to update. This is NOT only "a prior
+# data anomaly": `SELECT ... FOR UPDATE` takes no lock when it matches
+# nothing (there is no row yet to lock), so two runs of this importer
+# started concurrently against a fresh database can both miss the match,
+# both insert, and both commit — no anomaly required, just bad timing. A
+# duplicate ref can also come from api/processes.py's create_business_process
+# route (POST), which calls the same _create_process() this module reuses
+# with whatever external_ref the caller supplies, no uniqueness check of its
+# own. Either way the remedy is the same and is named in the raised error:
+# an operator deletes or re-refs one of the duplicate rows so the next run
+# has exactly one to match.
 #
 # This module never creates a privacycare_process_declaration row (D-IMP-4):
 # the register describes processes, not which privacy declarations they
@@ -58,11 +67,39 @@ _SELECT_MATCHING_SQL = sqlalchemy.text(
     "FOR UPDATE"
 )
 
-_UPDATE_PROCESS_SQL = sqlalchemy.text(
+# D-IMP-2 also means "never touch a field the source does not carry" (F2):
+# the register is read with `.get()`, so a `description` or `business_cycle`
+# key that is simply ABSENT from a row must not become a NULL written over
+# whatever is already stored. `name` and `is_critical` are always present —
+# a blank name is rejected by _validate(), and is_critical is derived from
+# `applicable` whether or not that key exists — so only these two columns
+# ever need to be left out of the SET list. Four fixed statements (rather
+# than building SQL text at runtime) cover the four presence combinations.
+_UPDATE_ALL_SQL = sqlalchemy.text(
     "UPDATE privacycare_business_process "
     "SET name = :name, description = :description, "
     "    business_cycle = :business_cycle, is_critical = :is_critical, "
     "    updated_at = now() "
+    "WHERE id = :id"
+)
+
+_UPDATE_NO_DESCRIPTION_SQL = sqlalchemy.text(
+    "UPDATE privacycare_business_process "
+    "SET name = :name, business_cycle = :business_cycle, "
+    "    is_critical = :is_critical, updated_at = now() "
+    "WHERE id = :id"
+)
+
+_UPDATE_NO_BUSINESS_CYCLE_SQL = sqlalchemy.text(
+    "UPDATE privacycare_business_process "
+    "SET name = :name, description = :description, is_critical = :is_critical, "
+    "    updated_at = now() "
+    "WHERE id = :id"
+)
+
+_UPDATE_NO_DESCRIPTION_NO_BUSINESS_CYCLE_SQL = sqlalchemy.text(
+    "UPDATE privacycare_business_process "
+    "SET name = :name, is_critical = :is_critical, updated_at = now() "
     "WHERE id = :id"
 )
 
@@ -99,9 +136,16 @@ def import_processes(db: Session, register: dict) -> ImportSummary:
     whether the writes are kept, exactly like load_kenyan_taxonomy. Matches
     existing rows on `external_ref = str(process["number"]).strip()`;
     unmatched processes are inserted via api/processes.py's _create_process.
-    A matched row whose stored name/description/business_cycle/is_critical
-    already equal the register's values is left alone and counted
-    `unchanged`; any difference is written and counted `updated`.
+    A matched row whose stored name/is_critical, plus description and
+    business_cycle when the register row carries those keys, already equal
+    the register's values is left alone and counted `unchanged`; any
+    difference among the fields the register actually carries is written
+    and counted `updated`. A `description` or `business_cycle` key that is
+    ABSENT from a register row is never written — the existing column is
+    left exactly as it was, and its value plays no part in the
+    updated/unchanged comparison (F2; see the SQL constants above). A key
+    that IS present with an explicit empty or None value still writes: the
+    source carried it, even if what it carried was blank.
 
     `is_critical` is `process["applicable"] == "1"` on both insert and
     update. A blank applicability (missing, None, or whitespace-only) is
@@ -111,9 +155,15 @@ def import_processes(db: Session, register: dict) -> ImportSummary:
 
     `without_data_mapping` counts processes whose name is not in
     `register["processes_with_data_mapping_detail"]` (a list of process
-    names, not numbers). `cycles` is a count of processes per
-    `business_cycle` value as given — a blank cycle keys as `""`, never a
-    made-up label.
+    names, not numbers) — this is the register's gap, not a live count, and
+    a re-run months later still reports the workbook's original number.
+    `cycles` is the distribution of THOSE SAME without-mapping processes
+    only, one count per `business_cycle` value as given (a blank cycle keys
+    as `""`, never a made-up label) — a process that already has a mapping
+    contributes to neither `without_data_mapping` nor `cycles` (F1: this
+    used to count every process regardless of mapping status, which misdescribed
+    the register whenever any process had a data-mapping detail already
+    recorded).
     """
     processes = register.get("processes", [])
     with_mapping = set(register.get("processes_with_data_mapping_detail", []))
@@ -130,7 +180,9 @@ def import_processes(db: Session, register: dict) -> ImportSummary:
     for process in processes:
         ref = _external_ref(process)
         name = process["name"]
+        description_present = "description" in process
         description = process.get("description")
+        business_cycle_present = "business_cycle" in process
         business_cycle = process.get("business_cycle")
         applicable = process.get("applicable")
 
@@ -138,18 +190,21 @@ def import_processes(db: Session, register: dict) -> ImportSummary:
             blank_applicability += 1
         is_critical = applicable == "1"
 
-        cycle_key = business_cycle or ""
-        cycles[cycle_key] = cycles.get(cycle_key, 0) + 1
-
+        # F1: cycles is the distribution of the WITHOUT-mapping subset only,
+        # so it must be gated by the same test as without_data_mapping
+        # itself, not incremented for every process regardless of mapping.
         if name not in with_mapping:
             without_data_mapping += 1
+            cycle_key = business_cycle or ""
+            cycles[cycle_key] = cycles.get(cycle_key, 0) + 1
 
         rows = db.execute(_SELECT_MATCHING_SQL, {"ref": ref}).mappings().all()
         if len(rows) > 1:
             raise ValueError(
                 f"external_ref {ref!r} matches {len(rows)} live "
                 "privacycare_business_process rows; cannot upsert without "
-                "guessing which one to update"
+                "guessing which one to update — an operator must delete or "
+                "re-ref one of the duplicate rows before the next run"
             )
 
         if not rows:
@@ -167,25 +222,40 @@ def import_processes(db: Session, register: dict) -> ImportSummary:
             continue
 
         row = rows[0]
-        if (row["name"], row["description"], row["business_cycle"], row["is_critical"]) == (
-            name,
-            description,
-            business_cycle,
-            is_critical,
-        ):
+
+        # F2: only compare (and only ever write) the columns the register
+        # row actually carries a key for, besides name/is_critical which are
+        # always present. An absent description/business_cycle key must not
+        # count a row as `updated`, because it is never written.
+        new_values: dict[str, object] = {"name": name, "is_critical": is_critical}
+        old_values: dict[str, object] = {"name": row["name"], "is_critical": row["is_critical"]}
+        if description_present:
+            new_values["description"] = description
+            old_values["description"] = row["description"]
+        if business_cycle_present:
+            new_values["business_cycle"] = business_cycle
+            old_values["business_cycle"] = row["business_cycle"]
+
+        if new_values == old_values:
             unchanged += 1
+            continue
+
+        params: dict[str, object] = {"id": row["id"], "name": name, "is_critical": is_critical}
+        if description_present and business_cycle_present:
+            update_sql = _UPDATE_ALL_SQL
+            params["description"] = description
+            params["business_cycle"] = business_cycle
+        elif description_present:
+            update_sql = _UPDATE_NO_BUSINESS_CYCLE_SQL
+            params["description"] = description
+        elif business_cycle_present:
+            update_sql = _UPDATE_NO_DESCRIPTION_SQL
+            params["business_cycle"] = business_cycle
         else:
-            db.execute(
-                _UPDATE_PROCESS_SQL,
-                {
-                    "id": row["id"],
-                    "name": name,
-                    "description": description,
-                    "business_cycle": business_cycle,
-                    "is_critical": is_critical,
-                },
-            )
-            updated += 1
+            update_sql = _UPDATE_NO_DESCRIPTION_NO_BUSINESS_CYCLE_SQL
+
+        db.execute(update_sql, params)
+        updated += 1
 
     return ImportSummary(
         created=created,

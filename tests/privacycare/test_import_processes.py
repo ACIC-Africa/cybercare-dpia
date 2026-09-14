@@ -148,6 +148,96 @@ def test_re_running_with_no_changes_reports_unchanged(db):
     assert (summary.created, summary.updated, summary.unchanged) == (0, 0, 1)
 
 
+def test_a_register_row_missing_the_description_key_does_not_clear_it(db):
+    # F2/D-IMP-2: "update name/description/cycle when present, and never
+    # touch a field the source does not carry." The register is read with
+    # `.get()`, so an ABSENT `description` key used to become None and the
+    # UPDATE wrote NULL over whatever was stored. First run carries a
+    # description; second run's row has no `description` key at all (not
+    # even `None`) — the stored description must survive untouched, and
+    # since nothing else differs the row must count as `unchanged`, not
+    # `updated` (a column never written cannot make a row count as updated).
+    ref = _ref(1)
+    first_register = _register(
+        [
+            {
+                "number": ref,
+                "name": "Customer Account Management",
+                "description": "Manage customer profiles.",
+                "business_cycle": "Customer Service",
+                "applicable": "1",
+            }
+        ]
+    )
+    import_processes(db, first_register)
+
+    second_register = _register(
+        [
+            {
+                "number": ref,
+                "name": "Customer Account Management",
+                # No "description" key at all.
+                "business_cycle": "Customer Service",
+                "applicable": "1",
+            }
+        ]
+    )
+    summary = import_processes(db, second_register)
+
+    assert (summary.created, summary.updated, summary.unchanged) == (0, 0, 1)
+    stored_description = db.execute(
+        sqlalchemy.text(
+            "SELECT description FROM privacycare_business_process WHERE external_ref = :ref"
+        ),
+        {"ref": ref},
+    ).scalar()
+    assert stored_description == "Manage customer profiles.", (
+        "an absent description key must not clear the stored description"
+    )
+
+
+def test_a_register_row_with_an_explicit_none_description_does_clear_it(db):
+    # Contrast case for F2: a key that IS present, even with an explicit
+    # None/blank value, still writes — the source carried it, so this is not
+    # the "absent key" case above. Confirms the presence check is `"description"
+    # in process`, not `process.get("description") is not None`.
+    ref = _ref(1)
+    first_register = _register(
+        [
+            {
+                "number": ref,
+                "name": "Customer Account Management",
+                "description": "Manage customer profiles.",
+                "business_cycle": "Customer Service",
+                "applicable": "1",
+            }
+        ]
+    )
+    import_processes(db, first_register)
+
+    second_register = _register(
+        [
+            {
+                "number": ref,
+                "name": "Customer Account Management",
+                "description": None,
+                "business_cycle": "Customer Service",
+                "applicable": "1",
+            }
+        ]
+    )
+    summary = import_processes(db, second_register)
+
+    assert (summary.created, summary.updated, summary.unchanged) == (0, 1, 0)
+    stored_description = db.execute(
+        sqlalchemy.text(
+            "SELECT description FROM privacycare_business_process WHERE external_ref = :ref"
+        ),
+        {"ref": ref},
+    ).scalar()
+    assert stored_description is None
+
+
 def test_blank_applicability_is_counted_not_guessed(db):
     # D-IMP-3: blank means "the customer has not said", not "no". It imports
     # as not-critical because the column is NOT NULL, and the count is
@@ -183,7 +273,19 @@ def test_no_declaration_links_are_invented(db):
     ref = _ref(1)
     register = _register([{"number": ref, "name": "A", "business_cycle": "Finance & Accounting"}])
 
-    import_processes(db, register)
+    summary = import_processes(db, register)
+
+    # F3: without this, links == 0 passes vacuously whether the importer
+    # created the process (and correctly made no link) or created nothing at
+    # all — pin down that the row actually exists.
+    assert summary.created == 1
+    process_id = db.execute(
+        sqlalchemy.text(
+            "SELECT id FROM privacycare_business_process WHERE external_ref = :ref"
+        ),
+        {"ref": ref},
+    ).scalar()
+    assert process_id is not None, "the process row was never created"
 
     links = db.execute(
         sqlalchemy.text(
@@ -199,7 +301,9 @@ def test_no_declaration_links_are_invented(db):
 
 def test_the_summary_reports_the_size_of_the_remaining_work(db):
     # D-IMP-5: the point of this import is as much showing what is left as
-    # loading the rows.
+    # loading the rows. F1 ruling: `cycles` is the distribution of the
+    # WITHOUT-mapping processes only, not of every process in the register —
+    # P1 is mapped, so Finance & Accounting counts 4, not 5.
     refs = [_ref(i) for i in range(1, 6)]
     register = _register(
         [
@@ -212,7 +316,35 @@ def test_the_summary_reports_the_size_of_the_remaining_work(db):
     summary = import_processes(db, register)
 
     assert summary.without_data_mapping == 4
-    assert summary.cycles == {"Finance & Accounting": 5}
+    assert summary.cycles == {"Finance & Accounting": 4}
+
+
+def test_cycles_counts_only_unmapped_processes_even_when_the_mapped_one_is_in_the_bigger_cycle(
+    db,
+):
+    # F1 pin-down: two cycles, and the ONE mapped process sits in the LARGER
+    # cycle. The old (wrong) code printed the full per-cycle distribution —
+    # Cycle Service: 4, Cycle Finance: 2 — regardless of mapping. Under the
+    # ruling, the mapped process is invisible to `cycles`: Cycle Service
+    # drops to 3 and Cycle Finance stays at 2, because neither of Finance's
+    # two processes has a mapping.
+    refs = [_ref(i) for i in range(1, 7)]
+    register = _register(
+        [
+            {"number": refs[0], "name": "S1", "business_cycle": "Cycle Service"},
+            {"number": refs[1], "name": "S2", "business_cycle": "Cycle Service"},
+            {"number": refs[2], "name": "S3", "business_cycle": "Cycle Service"},
+            {"number": refs[3], "name": "S4-mapped", "business_cycle": "Cycle Service"},
+            {"number": refs[4], "name": "F1", "business_cycle": "Cycle Finance"},
+            {"number": refs[5], "name": "F2", "business_cycle": "Cycle Finance"},
+        ],
+        with_mapping=["S4-mapped"],
+    )
+
+    summary = import_processes(db, register)
+
+    assert summary.without_data_mapping == 5
+    assert summary.cycles == {"Cycle Service": 3, "Cycle Finance": 2}
 
 
 def test_a_process_with_no_name_is_rejected_not_skipped(db):
@@ -261,7 +393,10 @@ def test_multiple_live_rows_sharing_external_ref_raises(db):
     # There is no unique index on external_ref and none may be added (no
     # migration in this task). If more than one live row already shares the
     # ref the importer is trying to match, it must not guess which one to
-    # update.
+    # update. This state is not necessarily "a prior data anomaly" (F4) —
+    # concurrent runs or a row made through the create_business_process API
+    # route can produce it too — so the message must name the remedy
+    # (delete or re-ref one of the duplicates) rather than imply blame.
     ref = _ref(1)
     register = _register([{"number": ref, "name": "A", "business_cycle": "Finance"}])
     import_processes(db, register)
@@ -274,8 +409,13 @@ def test_multiple_live_rows_sharing_external_ref_raises(db):
         {"id": f"bp_{uuid.uuid4().hex[:12]}", "ref": ref},
     )
 
-    with pytest.raises(ValueError, match=ref):
+    with pytest.raises(ValueError, match=ref) as exc_info:
         import_processes(db, register)
+    message = str(exc_info.value)
+    assert "delete" in message and "re-ref" in message, (
+        "the error must name the remedy (delete or re-ref a duplicate row), "
+        f"got: {message!r}"
+    )
 
 
 REAL_REGISTER_PATH = pathlib.Path(
@@ -306,8 +446,22 @@ def test_importing_the_real_oil_marketer_register(db):
     assert summary.created == 86 or summary.unchanged == 86
     assert summary.without_data_mapping == 85
     assert summary.blank_applicability == 85
+
+    # F1 ruling: `cycles` is the distribution of the 85 WITHOUT-mapping
+    # processes only. The register's one mapped process ("Customer Account
+    # Management") is itself a Customer Service process, so that cycle is
+    # the only one whose count changes from the pre-F1 (whole-register)
+    # numbers: Customer Service drops from 7 to 6. No cycle vanishes — every
+    # one of the 17 business cycles in the file still has at least one
+    # unmapped process, so `len(summary.cycles)` stays 17, not fewer. These
+    # numbers (17 cycles, Customer Service 6, Finance & Accounting 11) were
+    # computed directly from REAL_REGISTER_PATH's contents, not guessed —
+    # Finance & Accounting has no mapped process in it, so its count is
+    # unchanged at 11.
     assert len(summary.cycles) == 17
     assert summary.cycles["Finance & Accounting"] == 11
+    assert summary.cycles["Customer Service"] == 6
+    assert sum(summary.cycles.values()) == 85
 
 
 # --- Task 2: the CLI --------------------------------------------------------
@@ -326,6 +480,23 @@ def _load_cli_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_target_description_never_includes_the_password():
+    # F5/D-IMP-6, unit-level: the real test DB's password ("fides") happens
+    # to equal its database name, which makes a substring-based "no password
+    # in output" assertion against the real DB unreliable. Call
+    # _target_description() directly with a synthetic URL whose password is
+    # unambiguous and distinct from every other component, so this proves
+    # redaction unconditionally.
+    cli = _load_cli_module()
+    url = "postgresql://someuser:Sup3rSecretPW9@dbhost.internal:6543/somedb"
+
+    target = cli._target_description(url)
+
+    assert target == "someuser@dbhost.internal:6543/somedb"
+    assert "Sup3rSecretPW9" not in target
+    assert ":" not in target.split("@")[0], "no credential separator before '@'"
 
 
 def test_cli_missing_path_exits_nonzero_naming_the_path():
@@ -412,11 +583,31 @@ def test_cli_dry_run_writes_nothing_and_reports_the_full_summary(tmp_path, db):
         check=True,
     )
     out = result.stdout
+    # F5/D-IMP-6: the target line must name where the run would write,
+    # before anything else — and it must never leak the password. The test
+    # DB's default password ("fides") happens to equal its database name, so
+    # this asserts the specific credential SHAPE is absent (no "user:pass@"
+    # and no raw "postgresql://" URL) rather than asserting the substring
+    # "fides" is absent, which would be a false requirement here.
+    assert "target: postgres@127.0.0.1:5442/fides" in out
+    assert "postgres:fides@" not in out, "the password must never be printed"
+    assert "postgresql://" not in out, "the raw connection URL must never be printed"
+    assert out.index("target:") < out.index("created:"), (
+        "the target must be printed before the summary, so a wrong-database "
+        "run is visible even if it fails before the summary prints"
+    )
     assert "created: 2" in out
     assert "updated: 0" in out
     assert "unchanged: 0" in out
-    assert "without_data_mapping: 2" in out
+    # F1: the label is "_in_register" — this is the register FILE's gap, not
+    # a live count — and the cycle block carries a heading naming it as the
+    # without-mapping distribution.
+    assert "without_data_mapping_in_register: 2" in out
+    assert "without_data_mapping: 2" not in out, (
+        "the old, ambiguous label must not still be printed"
+    )
     assert "blank_applicability: 0" in out
+    assert "by business cycle" in out
     assert "cycle  Finance & Accounting: 2" in out
     assert "DRY RUN" in out
     assert "COMMITTED" not in out
