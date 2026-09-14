@@ -8,6 +8,11 @@ import typing
 
 from fastapi_pagination import Page
 
+from fides.api.privacycare.api.grounds import (
+    DeclarationGroundResponse,
+    ProcessingGroundListResponse,
+    ProcessingGroundResponse,
+)
 from fides.api.privacycare.api.schemas import (
     AnswerUpdate,
     AssessmentEvidenceResponse,
@@ -55,6 +60,14 @@ FEATURE_TS_PATH = (
     / "clients/admin-ui/src/features/privacy-assessments/types.ts"
 )
 
+# The Kenyan processing-grounds surface (D-KT-5) hand-authors its types in
+# the RTK-Query slice that consumes them, not in a feature types.ts. Same
+# discipline, second file: read the shipped contract, don't restate it.
+GROUNDS_TS_PATH = (
+    pathlib.Path(__file__).parents[2]
+    / "clients/admin-ui/src/features/privacycare/processing-grounds.slice.ts"
+)
+
 
 def _ts_field_specs(name: str) -> dict[str, bool]:
     # Map field name -> True if the TS field is optional (carries a `?`
@@ -71,7 +84,9 @@ def _ts_fields(name: str) -> set[str]:
     return set(_ts_field_specs(name).keys())
 
 
-def _feature_interface_field_specs(name: str) -> dict[str, bool]:
+def _feature_interface_field_specs(
+    name: str, path: pathlib.Path = FEATURE_TS_PATH
+) -> dict[str, bool]:
     # Same idea as _ts_field_specs, but for an `export interface Name {...}`
     # block in the hand-authored feature types.ts rather than a generated
     # `export type Name = {...};` file. There is no nested `{` inside these
@@ -82,9 +97,9 @@ def _feature_interface_field_specs(name: str) -> dict[str, bool]:
     # brace so this also matches `export interface Name extends Other {`
     # (PrivacyAssessmentDetailResponse) and not just the plain
     # `export interface Name {` form.
-    text = FEATURE_TS_PATH.read_text()
+    text = path.read_text()
     match = re.search(rf"export interface {name}\b[^{{]*\{{(.*?)\n\}}", text, re.S)
-    assert match, f"{name} not found in {FEATURE_TS_PATH}"
+    assert match, f"{name} not found in {path}"
     body = match.group(1)
     return {
         field: bool(optional_marker)
@@ -92,8 +107,10 @@ def _feature_interface_field_specs(name: str) -> dict[str, bool]:
     }
 
 
-def _feature_interface_fields(name: str) -> set[str]:
-    return set(_feature_interface_field_specs(name).keys())
+def _feature_interface_fields(
+    name: str, path: pathlib.Path = FEATURE_TS_PATH
+) -> set[str]:
+    return set(_feature_interface_field_specs(name, path).keys())
 
 
 def _feature_interface_raw_specs(name: str) -> dict[str, str]:
@@ -936,3 +953,59 @@ def test_the_config_feature_types_were_actually_read():
     assert len(_feature_interface_fields("PrivacyAssessmentConfigResponse")) == 11
     assert len(_feature_interface_fields("PrivacyAssessmentConfigUpdate")) == 6
     assert len(_feature_interface_fields("PrivacyAssessmentConfigDefaults")) == 3
+
+
+# --- The Kenyan processing-grounds surface (D-KT-5) ------------------------
+# I5: these three models were allowlisted out of the response_model↔TS parity
+# walk with the reason "no shipped TS counterpart; the hook in Task 6 defines
+# its own type" — while Task 6's hook, in the same branch, already defined
+# all three by hand. An added field would have reached no TypeScript and no
+# test. These are the parity tests that reason promised.
+def test_processing_ground_response_matches_the_shipped_contract():
+    assert set(ProcessingGroundResponse.model_fields) == _feature_interface_fields(
+        "ProcessingGroundResponse", GROUNDS_TS_PATH
+    )
+
+
+def test_processing_ground_list_response_matches_the_shipped_contract():
+    assert set(ProcessingGroundListResponse.model_fields) == _feature_interface_fields(
+        "ProcessingGroundListResponse", GROUNDS_TS_PATH
+    )
+
+
+def test_declaration_ground_response_matches_the_shipped_contract():
+    assert set(DeclarationGroundResponse.model_fields) == _feature_interface_fields(
+        "DeclarationGroundResponse", GROUNDS_TS_PATH
+    )
+
+
+def test_grounds_responses_optionality_matches_the_shipped_contract():
+    # Every field on all three is required on both sides — no `?` in the TS,
+    # no default in the Pydantic. A model that quietly made
+    # fides_legal_basis optional would start returning nulls into a UI typed
+    # to receive a string.
+    for model, name in (
+        (ProcessingGroundResponse, "ProcessingGroundResponse"),
+        (ProcessingGroundListResponse, "ProcessingGroundListResponse"),
+        (DeclarationGroundResponse, "DeclarationGroundResponse"),
+    ):
+        for field, is_optional in _feature_interface_field_specs(
+            name, GROUNDS_TS_PATH
+        ).items():
+            assert model.model_fields[field].is_required() == (not is_optional), (
+                f"{name}.{field}"
+            )
+
+
+def test_the_grounds_slice_was_actually_read():
+    # Same guard as test_the_feature_types_file_was_actually_read: a bad path
+    # or a regex that stopped matching would make the three tests above
+    # compare empty sets and pass while measuring nothing.
+    assert len(_feature_interface_fields("ProcessingGroundResponse", GROUNDS_TS_PATH)) == 3
+    assert (
+        len(_feature_interface_fields("ProcessingGroundListResponse", GROUNDS_TS_PATH))
+        == 2
+    )
+    assert (
+        len(_feature_interface_fields("DeclarationGroundResponse", GROUNDS_TS_PATH)) == 3
+    )

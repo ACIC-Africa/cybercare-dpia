@@ -41,9 +41,22 @@ from fides.api.privacycare.asgi import app
 TS_DIR = (
     pathlib.Path(__file__).parents[2] / "clients/admin-ui/src/types/api/models"
 )
+# Every hand-authored feature file that may hold a counterpart interface, not
+# just one. I5: this was a single path (privacy-assessments/types.ts), so a
+# response model whose TS interface lived anywhere else — e.g. the Kenyan
+# grounds surface, whose types are hand-written in
+# features/privacycare/processing-grounds.slice.ts — was invisible to the
+# check and could only be got past the gate by allowlisting it. The glob
+# keeps a future PrivacyCare slice covered without another edit here.
 FEATURE_TS_PATH = (
     pathlib.Path(__file__).parents[2]
-    / "clients/admin-ui/src/features/privacy-assessments/types.ts"
+    / "clients/admin-ui/src/features/privacy-assessments/types.ts",
+    *sorted(
+        (
+            pathlib.Path(__file__).parents[2]
+            / "clients/admin-ui/src/features/privacycare"
+        ).glob("*.slice.ts")
+    ),
 )
 
 # Composed, not hardcoded: the prefix moved to /api/v1/... once the shipped
@@ -165,25 +178,15 @@ ALLOWLIST: dict[str, dict] = {
             "carries its own parity tests in test_api_schemas.py."
         ),
     },
-    # The Kenyan processing-grounds surface (D-KT-5). Same shape of gap as
-    # the business-process ROPA surface above, but for a different reason:
-    # this route is brand-new (Task 5 of the Kenyan-taxonomy plan) and the
-    # hook that will consume it is Task 6 of the SAME plan, not yet written.
-    # It defines its own type when it lands rather than reusing one of
-    # these; these entries come out once that hook exists and can be
-    # checked against a real TS counterpart.
-    "ProcessingGroundResponse": {
-        "ts_name": None,
-        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
-    },
-    "ProcessingGroundListResponse": {
-        "ts_name": None,
-        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
-    },
-    "DeclarationGroundResponse": {
-        "ts_name": None,
-        "reason": "no shipped TS counterpart; the hook in Task 6 defines its own type",
-    },
+    # The Kenyan processing-grounds surface (D-KT-5) is deliberately NOT
+    # here. Its three response models were allowlisted with the reason "the
+    # hook in Task 6 defines its own type" — Task 6 landed in the same
+    # branch, so the reason was false the day it was written, and with the
+    # single-file FEATURE_TS_PATH above the entries could not have come out
+    # even then. Both halves are fixed: the hand-authored interfaces in
+    # features/privacycare/processing-grounds.slice.ts carry the same names
+    # as the models, this walk now reads that file, and test_api_schemas.py
+    # compares them field by field.
     "bytes": {
         "ts_name": None,
         "reason": (
@@ -272,8 +275,10 @@ def _ts_generated_file_exists(name: str) -> bool:
 
 
 def _feature_interface_exists(name: str) -> bool:
-    text = FEATURE_TS_PATH.read_text()
-    return re.search(rf"export interface {re.escape(name)}\b", text) is not None
+    return any(
+        re.search(rf"export interface {re.escape(name)}\b", path.read_text())
+        for path in FEATURE_TS_PATH
+    )
 
 
 def _expected_ts_name(model: type) -> "str | None":
@@ -332,7 +337,8 @@ def test_every_discovered_model_has_a_ts_counterpart_or_an_allowlist_reason():
         if not (_ts_generated_file_exists(ts_name) or _feature_interface_exists(ts_name)):
             failures.append(
                 f"{model.__name__}: no generated {ts_name}.ts and no "
-                f"`export interface {ts_name}` in {FEATURE_TS_PATH.name} — "
+                f"`export interface {ts_name}` in any of "
+                f"{[path.name for path in FEATURE_TS_PATH]} — "
                 "add the TS counterpart or an ALLOWLIST entry with a reason"
             )
     assert not failures, "\n".join(failures)

@@ -8,21 +8,25 @@
  * store.ts registration is needed because `baseApi` is already registered
  * there and `injectEndpoints` only adds endpoints to it.
  *
- * These response shapes have no TS counterpart generated from the OpenAPI
- * schema (see grounds.py's ALLOWLIST comment on ProcessingGroundResponse):
- * nothing in the shipped admin UI reads this table, so this hook defines
- * its own types rather than importing from `~/types/api`.
+ * These response shapes are not generated from the OpenAPI schema into
+ * `~/types/api` — they are hand-authored here, and the interface names match
+ * the Pydantic response models in grounds.py one-for-one on purpose:
+ * tests/privacycare/test_response_model_ts_parity.py walks every
+ * response_model on this surface and requires a same-named TS counterpart,
+ * and test_api_schemas.py asserts the fields and optionality of each pair.
+ * Add a field to a model in grounds.py without adding it here and those
+ * tests fail — which is the point.
  */
 import { baseApi } from "~/features/common/api.slice";
 
-export interface ProcessingGround {
+export interface ProcessingGroundResponse {
   id: string;
   ground: string;
   fides_legal_basis: string;
 }
 
 export interface ProcessingGroundListResponse {
-  grounds: ProcessingGround[];
+  grounds: ProcessingGroundResponse[];
   unmapped_count: number;
 }
 
