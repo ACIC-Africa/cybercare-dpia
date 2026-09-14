@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 import sqlalchemy
 from fideslang.models import DataCategory, DataSubject
@@ -134,6 +137,65 @@ def test_revert_restores_the_fides_baseline(db):
         "(SELECT name FROM ctl_data_subjects WHERE fides_key='customer')"
     ), {"tag": kenyan.SPECIAL_TAG}).one()
     assert counts == (15, 85, 0, "Customer")
+
+
+def test_cli_dry_run_by_default_writes_nothing(db):
+    # Ruling F1b: this suite must stay green whether run against a fresh DB
+    # or one Task 3 Step 4 already loaded for real, so we cannot assert
+    # is_default=false count == 0 outright (true only pre-load). Instead we
+    # snapshot the two counts the loader could touch, run the dry run, and
+    # assert neither moved — the session has no writes of its own, so a
+    # fresh query after the subprocess exits sees whatever is truly
+    # committed.
+    before = (
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM ctl_data_subjects WHERE is_default = false"
+        )).scalar(),
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_taxonomy_mapping"
+        )).scalar(),
+    )
+    out = subprocess.run(
+        [sys.executable, "scripts/privacycare/load_taxonomy.py"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "DRY RUN" in out and "mapping rows: 111" in out
+    after = (
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM ctl_data_subjects WHERE is_default = false"
+        )).scalar(),
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_taxonomy_mapping"
+        )).scalar(),
+    )
+    assert before == after
+
+
+def test_cli_revert_without_commit_is_dry_run(db):
+    # F10: --commit is the single persistence switch for both directions;
+    # --revert alone must roll back like the plain load dry run does.
+    before = (
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM ctl_data_subjects WHERE is_default = false"
+        )).scalar(),
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_taxonomy_mapping"
+        )).scalar(),
+    )
+    out = subprocess.run(
+        [sys.executable, "scripts/privacycare/load_taxonomy.py", "--revert"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "DRY RUN" in out
+    after = (
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM ctl_data_subjects WHERE is_default = false"
+        )).scalar(),
+        db.execute(sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_taxonomy_mapping"
+        )).scalar(),
+    )
+    assert before == after
 
 
 def test_created_rows_carry_no_version_added(db):
