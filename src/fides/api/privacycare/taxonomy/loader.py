@@ -234,12 +234,20 @@ def load_kenyan_taxonomy(db: Session) -> LoadSummary:
     mapping_rows = len(kenyan.SUBJECTS) + len(kenyan.CATEGORIES)
 
     # Subject.action is never "deferred" (see kenyan.py); only categories
-    # carry a deferred_to owner.
-    deferred: list[tuple[str, str, str]] = [
-        ("data_category", c.term, c.deferred_to)
-        for c in kenyan.CATEGORIES
-        if c.action == "deferred"
-    ]
+    # carry a deferred_to owner. Category.deferred_to is typed Optional[str]
+    # (it's None for every non-deferred row), so a deferred row with no owner
+    # would be a data defect in kenyan.py, not something to pass through as a
+    # silent None — narrow explicitly and raise rather than let mypy (or a
+    # future silent None) paper over it.
+    deferred: list[tuple[str, str, str]] = []
+    for c in kenyan.CATEGORIES:
+        if c.action != "deferred":
+            continue
+        if c.deferred_to is None:
+            raise ValueError(
+                f"category {c.fides_key!r} (term {c.term!r}) is deferred but has no deferred_to owner"
+            )
+        deferred.append(("data_category", c.term, c.deferred_to))
 
     return LoadSummary(
         subjects_reused=subjects_reused,

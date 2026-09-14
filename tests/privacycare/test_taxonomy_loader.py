@@ -1,11 +1,13 @@
 import pytest
 import sqlalchemy
+from fideslang.models import DataCategory, DataSubject
 from sqlalchemy.orm import Session
 
-from fideslang.models import DataCategory, DataSubject
-
 from fides.api.privacycare.taxonomy import kenyan
-from fides.api.privacycare.taxonomy.loader import load_kenyan_taxonomy, revert_kenyan_taxonomy
+from fides.api.privacycare.taxonomy.loader import (
+    load_kenyan_taxonomy,
+    revert_kenyan_taxonomy,
+)
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
