@@ -1,4 +1,4 @@
-"""The six routes that make a discovery monitor configurable.
+"""The seven routes that make a discovery monitor configurable.
 
 NAMESPACE. These routes squat Ethyca's `plus` namespace
 (`/plus/discovery-monitor*`), NOT our own `privacycare/` namespace the way
@@ -7,19 +7,34 @@ same one api/router.py's PRIVACYCARE_PREFIX comment gives for the assessment
 routes: the shipped admin UI's discovery-monitor screen
 (clients/admin-ui/src/features/data-discovery-and-detection/
 discovery-detection.slice.ts — getMonitorsByIntegration, putDiscoveryMonitor,
-getDatabasesByMonitor, deleteDiscoveryMonitor, getMonitorDeletionImpact, and
+getDatabasesByMonitor, getAvailableDatabasesByConnection,
+deleteDiscoveryMonitor, getMonitorDeletionImpact, and
 action-center.slice.ts's getMonitorConfig) calls these exact paths, and the
 UI's path is the requirement (spec D-DM-6). Where the UI does not constrain
 us — the business-process ROPA surface, which the UI has no screen for at
 all — we take our own namespace instead; where it does, as here, we match it.
 
-SCOPE. Only the six routes the UI's discovery-monitor screen actually calls
-to configure a monitor: list, create/edit (PUT is idempotent per key, so it
-serves both), read one, delete, the pre-delete impact check, and the
-database/schema picker. Nothing here executes a monitor, classifies
-anything, or writes a StagedResource row — that is plan 11's job.
-`get_monitor_databases` reads schema NAMES through `inspect()`; it reads no
-row of data and is not a scan.
+SCOPE. Only the seven routes the UI's discovery-monitor screen actually
+calls to configure a monitor: list, create/edit (PUT is idempotent per key,
+so it serves both), read one, delete, the pre-delete impact check, and TWO
+database/schema pickers. Nothing here executes a monitor, classifies
+anything, or writes a StagedResource row — that is plan 11's job. Both
+`get_monitor_databases` and `get_available_databases` read schema NAMES
+through `inspect()`; neither reads a row of data, and neither is a scan.
+
+TWO DATABASES ENDPOINTS, NOT ONE (Task 4 fix round 2). The original spec's
+enumeration regex ran `discovery-detection.slice.ts`'s two distinct
+`databases` query definitions together and only one survived into the
+brief: `getDatabasesByMonitor` -> `GET /{monitor_config_id}/databases`
+(`get_monitor_databases` below), used once a monitor row already exists.
+The UI's create-monitor wizard, by contrast, must list a connection's
+databases BEFORE any monitor exists to save the picker's selections into —
+it calls `getAvailableDatabasesByConnection` -> `POST /databases` with a
+monitor-shaped body (`{name, connection_config_key, classify_params}`),
+which `get_available_databases` below serves. The two routes share the same
+underlying listing logic (`_list_databases`) and differ only in how they
+resolve which `ConnectionConfig` to read: by way of an existing monitor's
+`connection_config`, or directly by the key the request body names.
 
 `{monitor_config_id}` IN THE UI'S URLS IS THE MONITOR'S `key`, not its row
 id — action-center.slice.ts's `getMonitorConfig` passes exactly what
@@ -239,6 +254,34 @@ def get_monitor_deletion_impact(
     )
 
 
+def _list_databases(connection: ConnectionConfig) -> list[str]:
+    """What `connection` exposes, so a consultant can scope a monitor.
+
+    D-DM-4: a live read against the target through the same `inspect()` call
+    sql_connector.py already makes. It lists scope units by name and reads no
+    row of data — it is not a scan, and it writes nothing. Shared by
+    `get_monitor_databases` (an existing monitor's connection) and
+    `get_available_databases` (a connection named directly, before any
+    monitor exists) — factored out so the connector/inspect/except block
+    exists exactly once rather than twice with the same 502 contract.
+    """
+    connector = get_connector(connection)
+    try:
+        engine = connector.create_client()
+        with engine.connect() as sql_connection:
+            names = sqlalchemy.inspect(sql_connection).get_schema_names()
+    except Exception as error:  # noqa: BLE001 — the target's failure, not ours
+        # An unreachable or misconfigured target is the target's problem. 502
+        # says so; a 500 would read as a bug in PrivacyCare.
+        raise HTTPException(
+            status_code=status_codes.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Could not read databases from connection {connection.key}: {error}"
+            ),
+        ) from error
+    return sorted(names)
+
+
 @privacycare_monitors_router.get(
     "/{monitor_config_id}/databases",
     dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_READ])],
@@ -250,26 +293,49 @@ def get_monitor_databases(
     db: Session = Depends(get_db),
     client: ClientDetail = Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_READ]),
 ) -> Page[str]:
-    """What this connection exposes, so a consultant can scope the monitor.
-
-    D-DM-4: a live read against the target through the same `inspect()` call
-    sql_connector.py already makes. It lists scope units by name and reads no
-    row of data — it is not a scan, and it writes nothing.
-    """
+    """What an EXISTING monitor's connection exposes. See `_list_databases`."""
     monitor = _monitor_or_404(db, monitor_config_id)
-    connector = get_connector(monitor.connection_config)
-    try:
-        engine = connector.create_client()
-        with engine.connect() as connection:
-            names = sqlalchemy.inspect(connection).get_schema_names()
-    except Exception as error:  # noqa: BLE001 — the target's failure, not ours
-        # An unreachable or misconfigured target is the target's problem. 502
-        # says so; a 500 would read as a bug in PrivacyCare.
+    return paginate(_list_databases(monitor.connection_config), params)
+
+
+@privacycare_monitors_router.post(
+    "/databases",
+    dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_READ])],
+    response_model=Page[str],
+)
+def get_available_databases(
+    request: EditableMonitorConfig,
+    params: Params = Depends(),
+    db: Session = Depends(get_db),
+    client: ClientDetail = Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_READ]),
+) -> Page[str]:
+    """What a connection exposes, named directly — for the create-monitor
+    wizard's database picker, which must list a connection's databases
+    BEFORE any monitor row exists to attach them to (Task 4 fix round 2,
+    Finding 1).
+
+    The request body is EditableMonitorConfig because that is the exact
+    shape `getAvailableDatabasesByConnection` sends
+    (discovery-detection.slice.ts: `{name: "new-monitor",
+    connection_config_key, classify_params: {}}`) — it LOOKS like a create
+    request, and it is NOT one: only `connection_config_key` is read.
+    `name` and `classify_params` arrive and are ignored. This route is
+    `GET`-scoped (PRIVACYCARE_DISCOVERY_READ, not _UPDATE) and writes
+    nothing — no `MonitorConfig` row is created, read, or touched by this
+    call, POST verb notwithstanding; the verb is POST only because the UI
+    sends a body (a GET with a JSON body is non-standard) and FastAPI
+    doesn't route based on intent.
+    """
+    connection = (
+        db.query(ConnectionConfig)
+        .filter(ConnectionConfig.key == request.connection_config_key)
+        .first()
+    )
+    if connection is None:
+        # Same 400 contract as put_monitor: a missing connection names the
+        # key rather than surfacing as an unrelated 500.
         raise HTTPException(
-            status_code=status_codes.HTTP_502_BAD_GATEWAY,
-            detail=(
-                "Could not read databases from connection "
-                f"{monitor.connection_config.key}: {error}"
-            ),
-        ) from error
-    return paginate(sorted(names), params)
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail=f"No connection configuration with key {request.connection_config_key}",
+        )
+    return paginate(_list_databases(connection), params)

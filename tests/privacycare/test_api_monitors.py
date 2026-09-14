@@ -1,4 +1,4 @@
-"""The six routes that make a discovery monitor configurable.
+"""The seven routes that make a discovery monitor configurable.
 
 Nothing here executes a monitor or writes a StagedResource row — that is plan
 11. These tests prove a monitor can be created, read back, edited and deleted,
@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare.api.monitor_schemas import EditableMonitorConfig
 from fides.api.privacycare.api.monitors import (
     delete_monitor,
+    get_available_databases,
     get_monitor,
     get_monitor_databases,
     get_monitor_deletion_impact,
@@ -272,3 +273,86 @@ def test_a_monitor_naming_a_missing_connection_is_rejected(db):
         )
     assert caught.value.status_code == 400
     assert "no_such_connection" in caught.value.detail
+
+
+def test_available_databases_lists_real_names_before_any_monitor_exists(
+    db, connection_key
+):
+    # Task 4 fix round 2, Finding 1: the create-monitor wizard's database
+    # picker calls this route BEFORE a monitor exists — no put_monitor()
+    # call anywhere in this test, unlike test_the_databases_route_lists_
+    # what_the_connection_reports above. The request is the exact shape
+    # getAvailableDatabasesByConnection sends (discovery-detection.slice.ts):
+    # a monitor-shaped body carrying only connection_config_key that
+    # matters.
+    request = EditableMonitorConfig(
+        name="new-monitor",
+        connection_config_key=connection_key,
+        classify_params={},
+    )
+
+    page = get_available_databases(
+        request, params=Params(page=1, size=50), db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    # Same connection, same connector, same inspect() call as the by-monitor
+    # route — "public" is the one schema every Postgres carries.
+    assert "public" in page.items
+    assert {"items", "total", "page", "size", "pages"} <= set(page.model_dump())
+
+
+def test_available_databases_creates_no_monitor_row(db, connection_key):
+    # The request body LOOKS like a create (name/connection_config_key/
+    # classify_params — EditableMonitorConfig's shape) and is NOT one; this
+    # is the exact failure mode a shared helper or a copy-pasted route body
+    # could reintroduce silently.
+    before = db.execute(sqlalchemy.text("SELECT count(*) FROM monitorconfig")).scalar()
+
+    get_available_databases(
+        EditableMonitorConfig(
+            name="new-monitor", connection_config_key=connection_key, classify_params={}
+        ),
+        params=Params(page=1, size=50), db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    after = db.execute(sqlalchemy.text("SELECT count(*) FROM monitorconfig")).scalar()
+    assert after == before, "get_available_databases wrote a MonitorConfig row"
+
+
+def test_available_databases_rejects_a_missing_connection(db):
+    # Same 400 contract as put_monitor's equivalent check — a missing
+    # connection names the key rather than surfacing as an unrelated 500.
+    with pytest.raises(HTTPException) as caught:
+        get_available_databases(
+            EditableMonitorConfig(
+                name="new-monitor",
+                connection_config_key="no_such_connection",
+                classify_params={},
+            ),
+            params=Params(page=1, size=50), db=db,
+            client=_fake_client("carol@example.com"),
+        )
+    assert caught.value.status_code == 400
+    assert "no_such_connection" in caught.value.detail
+
+
+def test_available_databases_returns_502_when_the_connection_is_unreachable(
+    db, unreachable_connection_key
+):
+    # Same 502 contract as get_monitor_databases' equivalent test — an
+    # unreachable/misconfigured target is the TARGET's problem, not a
+    # PrivacyCare bug.
+    with pytest.raises(HTTPException) as caught:
+        get_available_databases(
+            EditableMonitorConfig(
+                name="new-monitor",
+                connection_config_key=unreachable_connection_key,
+                classify_params={},
+            ),
+            params=Params(page=1, size=50), db=db,
+            client=_fake_client("carol@example.com"),
+        )
+    assert caught.value.status_code == 502
+    assert unreachable_connection_key in caught.value.detail
