@@ -170,13 +170,20 @@ def test_execution_response_requires_monitor_config_key():
     assert MonitorExecutionResponse(id="me_1", monitor_config_key="k").monitor_config_key == "k"
 
 
-# The six real field/optionality parity tests the response_model_ts_parity
-# gate's `test_every_ts_counterpart_has_a_referencing_parity_test` requires
-# for every model its walk of the six monitor routes' response_models
-# reaches (see test_response_model_ts_parity.py's own module docstring).
-# Field-NAME parity is already covered above by hand-enumerated sets; these
-# additionally check OPTIONALITY against the generated .ts files directly,
-# so a field that flips required<->optional upstream fails here too.
+# The six real field-parity tests the response_model_ts_parity gate's
+# `test_every_ts_counterpart_has_a_referencing_parity_test` requires for
+# every model its walk of the six monitor routes' response_models reaches
+# (see test_response_model_ts_parity.py's own module docstring). Field-NAME
+# parity is already covered above by hand-enumerated sets; these additionally
+# check field-name parity against the generated .ts files directly (so a
+# renamed/removed/added field fails here too). Fix round 1 finding: an
+# earlier version of this comment claimed these also checked OPTIONALITY —
+# they did not, since they call `_ts_fields()` (names only), never
+# `_ts_field_specs()` (names + `?`). The dedicated
+# `*_optionality_matches_the_shipped_contract` tests below this block are
+# what actually cover that axis, mirroring test_api_schemas.py's own
+# `test_assessment_response_optionality_matches_the_shipped_contract` /
+# `test_template_response_optionality_matches_the_shipped_contract` pattern.
 
 
 def test_status_response_matches_the_shipped_contract():
@@ -212,3 +219,48 @@ def test_deletion_impact_matches_the_shipped_contract():
 
 def test_linked_dataset_info_matches_the_shipped_contract():
     assert set(LinkedDatasetInfo.model_fields) == _ts_fields("LinkedDatasetInfo")
+
+
+# Fix round 1, Finding 1: the six tests above check field NAMES only. These
+# check field OPTIONALITY separately, per field, against the same generated
+# .ts files — the axis the parity gate's own docstring names as the actual
+# failure mode ("a technically-correct response in the wrong envelope
+# renders an empty screen and reports no error anywhere"). Without these, a
+# field flipping required<->optional against the shipped contract would pass
+# every test in this module.
+
+
+def test_status_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("MonitorStatusResponse").items():
+        pydantic_required = MonitorStatusResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_config_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("MonitorConfig").items():
+        pydantic_required = MonitorConfigResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_steward_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("MonitorStewardUserResponse").items():
+        pydantic_required = MonitorStewardUserResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_execution_response_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("MonitorExecution").items():
+        pydantic_required = MonitorExecutionResponse.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_deletion_impact_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("MonitorDeletionImpact").items():
+        pydantic_required = MonitorDeletionImpact.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field
+
+
+def test_linked_dataset_info_optionality_matches_the_shipped_contract():
+    for field, is_optional in _ts_field_specs("LinkedDatasetInfo").items():
+        pydantic_required = LinkedDatasetInfo.model_fields[field].is_required()
+        assert pydantic_required == (not is_optional), field

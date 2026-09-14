@@ -82,9 +82,47 @@ def connection_key(db):
     from fides.api.models.connectionconfig import ConnectionConfig
 
     connection = db.query(ConnectionConfig).filter(ConnectionConfig.key == key).first()
+    # Fix round 1, Finding 4: these are throwaway local-only Postgres
+    # credentials for the docker-compose `fides-db` container this whole
+    # test file already talks to via DB_URL above (see privacycare.ports.env)
+    # — not a real credential, and not something that could leak anything
+    # if read out of context.
     connection.secrets = {
         "host": "127.0.0.1",
         "port": 5442,
+        "username": "postgres",
+        "password": "fides",
+        "dbname": "fides",
+    }
+    db.flush()
+    return key
+
+
+@pytest.fixture
+def unreachable_connection_key(db):
+    """A ConnectionConfig whose secrets point at nothing listening.
+
+    Fix round 1, Finding 2: covers get_monitor_databases' 502 path, which
+    nothing in the original 8 tests exercised. Port 1 on localhost fails
+    with ECONNREFUSED in well under a millisecond (verified directly against
+    connector.create_client() before wiring this into a test), so this adds
+    no meaningful time to the suite and needs no mock/network stub.
+    """
+    key = f"t10_conn_unreachable_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO connectionconfig (id, key, name, connection_type, "
+            " access, disabled) "
+            "VALUES (:id, :key, :name, 'postgres', 'write', false)"
+        ),
+        {"id": f"conn_{uuid.uuid4().hex[:12]}", "key": key, "name": key},
+    )
+    from fides.api.models.connectionconfig import ConnectionConfig
+
+    connection = db.query(ConnectionConfig).filter(ConnectionConfig.key == key).first()
+    connection.secrets = {
+        "host": "127.0.0.1",
+        "port": 1,
         "username": "postgres",
         "password": "fides",
         "dbname": "fides",
@@ -200,6 +238,28 @@ def test_the_databases_route_lists_what_the_connection_reports(db, connection_ke
     # reports rather than a name borrowed from another datasource's vocabulary.
     assert "public" in page.items
     assert {"items", "total", "page", "size", "pages"} <= set(page.model_dump())
+
+
+def test_the_databases_route_returns_502_when_the_connection_is_unreachable(
+    db, unreachable_connection_key
+):
+    # Fix round 1, Finding 2: the third of the three error contracts the spec
+    # names (missing connection -> 400, unknown monitor -> 404, unreachable
+    # target -> 502) had no test. An unreachable/misconfigured target is the
+    # TARGET's problem, not a PrivacyCare bug, so this must be a 502 naming
+    # the connection — not a 500, and not a silent empty page.
+    created = put_monitor(
+        _editable(unreachable_connection_key), db=db, client=_fake_client("carol@example.com")
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        get_monitor_databases(
+            created.key, params=Params(page=1, size=50), db=db,
+            client=_fake_client("carol@example.com"),
+        )
+
+    assert caught.value.status_code == 502
+    assert unreachable_connection_key in caught.value.detail
 
 
 def test_a_monitor_naming_a_missing_connection_is_rejected(db):

@@ -186,7 +186,18 @@ def delete_monitor(
 ) -> DeleteMonitorResponse:
     """Delete a monitor. The UI reads only `{ count }` from the response —
     deleteDiscoveryMonitor types its RTK Query mutation as
-    `build.mutation<{ count: number }, ...>`, not against a named type."""
+    `build.mutation<{ count: number }, ...>`, not against a named type.
+
+    Fix round 1, Finding 3: the UI also sends a `delete_staged_resources`
+    query param (discovery-detection.slice.ts's deleteDiscoveryMonitor,
+    default `true`), which this route deliberately neither declares nor
+    reads. Harmless today — no StagedResource row can exist yet (that's
+    plan 11) — but the moment plan 11's scanning lands, deleting a monitor
+    with live StagedResource rows will need to honour this flag (cascade the
+    delete vs. orphan them), and get_monitor_deletion_impact's
+    `staged_resource_count` will need to stay the number this flag is
+    warning the user about.
+    """
     monitor = _monitor_or_404(db, monitor_config_id)
     db.delete(monitor)
     db.commit()
