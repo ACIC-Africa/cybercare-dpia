@@ -74,9 +74,32 @@ def test_the_navigation_is_gated_on_our_scope_not_ethycas():
     # The spike's Q5 finding: nav-config.tsx gates the Data Discovery nav items
     # themselves, so without this re-gating the feature is invisible rather
     # than merely empty — no amount of correct backend work would show it.
+    # Matches the actual `scopes: [...]` array entry, not a bare identifier, so
+    # this fails if the gate reverts while the name survives only in a comment.
     source = _nav_config_source()
-    assert "PRIVACYCARE_DISCOVERY_READ" in source
+    assert "scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ]" in source
     assert "DISCOVERY_MONITOR_READ" not in source
+
+
+def _action_center_route_block(source: str) -> str:
+    # Isolate just the "Action center" route object — from its title to the
+    # next route's title — so a requiresPlus elsewhere in the file (e.g. on
+    # "Access control", which keeps it deliberately) can't produce a false pass.
+    start = source.index('title: "Action center"')
+    end = source.index('title: "Access control"', start)
+    return source[start:end]
+
+
+def test_action_center_route_does_not_require_plus():
+    # Ruling P4: our build has no /api/v1/plus/health, so hasPlus is false.
+    # navAllGroupReqsPlus hides the whole "Detection & Discovery" group when
+    # every route in it carries requiresPlus. Action center needs only its own
+    # scope to be reachable, so requiresPlus must not return to this route.
+    # Matches the property-assignment form ("requiresPlus:"), not the bare
+    # word, so the rationale comment above the route (which says the word
+    # "requiresPlus" in prose) can't itself trip the assertion.
+    block = _action_center_route_block(_nav_config_source())
+    assert "requiresPlus:" not in block
 
 
 def test_every_ethyca_edit_carries_its_marker():

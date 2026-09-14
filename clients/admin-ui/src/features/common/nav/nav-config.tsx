@@ -75,14 +75,21 @@ export const NAV_CONFIG: NavConfigGroup[] = [
         title: "Action center",
         path: routes.ACTION_CENTER_ROUTE,
         // PrivacyCare (spec 2026-09-14 D-DM-1): our scope, not Ethyca's.
+        // requiresPlus deliberately omitted (ruling P4): our build has no
+        // /api/v1/plus/health, so hasPlus is false; navAllGroupReqsPlus hides
+        // the whole "Detection & Discovery" group when every route in it
+        // requires Plus. This route needs only its own scope, so it stays
+        // un-gated here to keep the group — and this route — visible.
         scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ],
-        requiresPlus: true,
         tabs: ACTION_CENTER_TAB_ITEMS,
       },
       {
         title: "Access control",
         path: routes.ACCESS_CONTROL_ROUTE,
         // PrivacyCare (spec 2026-09-14 D-DM-1): our scope, not Ethyca's.
+        // requiresPlus kept here (ruling P4): this route is additionally
+        // behind requiresFlag "alphaPurposeBasedAccessControl" and belongs to
+        // a monitor family the spike put out of scope, so it stays hidden.
         scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ],
         requiresFlag: "alphaPurposeBasedAccessControl",
         requiresPlus: true,
