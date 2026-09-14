@@ -242,3 +242,50 @@ def test_reading_an_unrecorded_declaration_ground_is_a_404(db):
         get_declaration_ground(decl, db=db, client=_fake_client("carol@example.com"))
 
     assert exc_info.value.status_code == 404
+
+
+def test_a_ground_for_a_deleted_declaration_reads_404(db):
+    # I2: privacycare_declaration_ground carries no FK to privacydeclaration
+    # (models.py says so deliberately), and Fides DELETEs a declaration whose
+    # logical id `data_use:name` no longer matches on a system save
+    # (db/system.py) — so a ground row CAN outlive the declaration it names.
+    # The read path joins privacydeclaration precisely so that stranded row
+    # reads as "no ground recorded" rather than as a live answer about a
+    # declaration that no longer exists.
+    load_kenyan_taxonomy(db)
+    system = _seed_system(db, f"sys_{uuid4().hex[:8]}")
+    decl = _seed_declaration(
+        db, system, "marketing", legal_basis_for_processing="Legitimate interests"
+    )
+    kyc = _ground_id(db, "KYC Requirements")
+    set_declaration_ground(
+        decl,
+        SetGroundRequest(processing_ground_id=kyc),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    # Read back once while the declaration still exists, so the 404 below is
+    # provably the join biting and not a row that was never written.
+    assert (
+        get_declaration_ground(
+            decl, db=db, client=_fake_client("carol@example.com")
+        ).processing_ground_id
+        == kyc
+    )
+
+    db.execute(
+        sqlalchemy.text("DELETE FROM privacydeclaration WHERE id = :id"), {"id": decl}
+    )
+    orphan = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_declaration_ground "
+            "WHERE privacy_declaration_id = :id"
+        ),
+        {"id": decl},
+    ).scalar()
+    assert orphan == 1, "the ground row outlives the declaration — that is the hazard"
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_declaration_ground(decl, db=db, client=_fake_client("carol@example.com"))
+
+    assert exc_info.value.status_code == 404

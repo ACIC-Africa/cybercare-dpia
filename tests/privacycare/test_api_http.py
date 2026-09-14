@@ -114,3 +114,31 @@ def test_processing_grounds_route_is_routed_not_missing(client):
         f"{PRIVACYCARE_GROUNDS_PREFIX}/processing-grounds did not reject an "
         f"unauthenticated caller (got {response.status_code})"
     )
+
+
+def test_put_declaration_ground_rejects_an_unauthenticated_caller(client):
+    # M1: the PUT is the only WRITE on this surface, and it is the one route
+    # whose authorisation is not plain verify_oauth_client (I7: it resolves
+    # the declaration's system so Fides' own system managers pass). Nothing
+    # else proves the new dependency still refuses an anonymous caller —
+    # test_api_grounds.py calls the route function directly and never goes
+    # through Security at all.
+    from fides.api.privacycare.api.router import PRIVACYCARE_GROUNDS_PREFIX
+
+    route = f"{PRIVACYCARE_GROUNDS_PREFIX}/declarations/does-not-matter/ground"
+    response = client.put(route, json={"processing_ground_id": "does-not-matter"})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"{route} did not reject an unauthenticated caller "
+        f"(got {response.status_code})"
+    )
+
+
+def test_get_declaration_ground_rejects_an_unauthenticated_caller(client):
+    from fides.api.privacycare.api.router import PRIVACYCARE_GROUNDS_PREFIX
+
+    route = f"{PRIVACYCARE_GROUNDS_PREFIX}/declarations/does-not-matter/ground"
+    response = client.get(route)
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED, (
+        f"{route} did not reject an unauthenticated caller "
+        f"(got {response.status_code})"
+    )

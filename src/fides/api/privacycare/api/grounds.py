@@ -16,6 +16,13 @@ ruling and the form's tick disagreeing about what actually justifies the
 processing. set_declaration_ground is the single place that agreement is
 checked, so nothing downstream (the graph projection, an export, a DPIA
 context source) can ever see one recorded without the other.
+
+Authorisation (I7): recording a ground is a write about a system's
+processing, so it is authorised exactly as Fides authorises a write to that
+system — global SYSTEM_UPDATE (role or scope) OR system-manager rights on
+the system the declaration belongs to, through Fides' own
+has_system_permissions. Reading stays plain SYSTEM_READ, as everywhere else
+on this surface.
 """
 import uuid
 from typing import List, Optional
@@ -23,28 +30,45 @@ from typing import List, Optional
 import sqlalchemy
 from fastapi import Depends, HTTPException, Security
 from fastapi import status as status_codes
+from fastapi.security import SecurityScopes
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
-from fides.api.oauth.utils import verify_oauth_client
+from fides.api.models.sql_models import System  # type: ignore[attr-defined]
+from fides.api.oauth.system_manager_oauth_util import (
+    SystemAuthContainer,
+    has_system_permissions,
+)
+from fides.api.oauth.utils import (
+    PermissionCheckerCallback,
+    _resolve_depends,
+    extract_token_and_load_client,
+    get_permission_checker,
+    oauth2_scheme,
+    verify_oauth_client,
+)
 from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_grounds_router
 from fides.common.scope_registry import SYSTEM_READ, SYSTEM_UPDATE
 
 
 class ProcessingGroundResponse(BaseModel):
-    # No TS counterpart: nothing in the shipped admin UI reads this table —
-    # Task 6's hook defines its own type. Recorded in
-    # test_response_model_ts_parity.py's ALLOWLIST with that reason.
+    # TS counterpart: `export interface ProcessingGroundResponse` in
+    # clients/admin-ui/src/features/privacycare/processing-grounds.slice.ts.
+    # Not allowlisted: test_response_model_ts_parity.py requires the
+    # same-named interface to exist and test_api_schemas.py compares the
+    # fields and their optionality, so adding a field here without adding it
+    # there fails the suite.
     id: str
     ground: str
     fides_legal_basis: str
 
 
 class ProcessingGroundListResponse(BaseModel):
-    # Same allowlist reason as ProcessingGroundResponse.
+    # Same TS counterpart file as ProcessingGroundResponse above.
     grounds: List[ProcessingGroundResponse]
     # D-KT-4: how many of the 23 loaded grounds still have no class — a
     # count the consultant screen needs so "why isn't ground X offered" has
@@ -53,12 +77,13 @@ class ProcessingGroundListResponse(BaseModel):
 
 
 class SetGroundRequest(BaseModel):
-    # Same allowlist reason as ProcessingGroundResponse.
+    # A request body, not a response_model, so the parity walk never reaches
+    # it; the slice's SetDeclarationGroundRequest is its TS counterpart.
     processing_ground_id: str
 
 
 class DeclarationGroundResponse(BaseModel):
-    # Same allowlist reason as ProcessingGroundResponse.
+    # Same TS counterpart file as ProcessingGroundResponse above.
     privacy_declaration_id: str
     processing_ground_id: str
     fides_legal_basis: str
@@ -92,10 +117,20 @@ _UPSERT_DECLARATION_GROUND_SQL = sqlalchemy.text(
 )
 
 _SELECT_DECLARATION_GROUND_SQL = sqlalchemy.text(
+    # The join to privacydeclaration is load-bearing, not decoration.
+    # privacycare_declaration_ground deliberately carries no FK to
+    # privacydeclaration (models.py), because Fides matches declarations on
+    # the logical id `data_use:name` (db/system.py) and DELETEs every row
+    # that no longer matches — an ordinary edit to a declaration's data_use
+    # re-creates it under a new id and strands the ground row behind it.
+    # Without this join such a row still reads back 200, so the screen would
+    # show a ground for a declaration that no longer exists. With it, a
+    # stranded row reads 404: "no ground recorded", which is the truth.
     "SELECT dg.privacy_declaration_id, dg.processing_ground_id, "
     "       pg.fides_legal_basis "
     "FROM privacycare_declaration_ground dg "
     "JOIN privacycare_processing_ground pg ON pg.id = dg.processing_ground_id "
+    "JOIN privacydeclaration pd ON pd.id = dg.privacy_declaration_id "
     "WHERE dg.privacy_declaration_id = :declaration_id"
 )
 
@@ -184,9 +219,82 @@ def list_processing_grounds(
     return _list_mapped_grounds(db)
 
 
+_SELECT_DECLARATION_SYSTEM_KEY_SQL = sqlalchemy.text(
+    "SELECT s.fides_key FROM privacydeclaration pd "
+    "JOIN ctl_systems s ON s.id = pd.system_id "
+    "WHERE pd.id = :declaration_id"
+)
+
+
+def _system_for_declaration(
+    declaration_id: str, db: Session = Depends(get_db)
+) -> SystemAuthContainer:
+    """The system this declaration belongs to, in the container Fides' own
+    system-manager authorisation expects.
+
+    Fides grants SYSTEM_UPDATE two ways — globally (a role or scope), or per
+    system, to a system manager — and its own PUT /system resolves the
+    second through _get_system_from_request_body. Our route has no system in
+    its body: it is addressed by declaration id, so the system is resolved
+    here instead. A declaration nobody can find yields system=None, which
+    _has_scope_as_system_manager reads as "not a manager of it" — so an
+    unknown id is a 403 for a caller who only has system-manager rights, and
+    a 404 (from _record_declaration_ground) for one with global
+    SYSTEM_UPDATE, which is the same order Fides' own endpoints answer in."""
+    fides_key = db.execute(
+        _SELECT_DECLARATION_SYSTEM_KEY_SQL, {"declaration_id": declaration_id}
+    ).scalar()
+    system = (
+        db.query(System).filter(System.fides_key == fides_key).first()
+        if fides_key is not None
+        else None
+    )
+    return SystemAuthContainer(original_data=declaration_id, system=system)
+
+
+async def verify_oauth_client_for_declaration_system(
+    security_scopes: SecurityScopes,
+    authorization: str = Security(oauth2_scheme),
+    db: Session = Depends(get_db),
+    system_auth_data: SystemAuthContainer = Depends(_system_for_declaration),
+    permission_checker: PermissionCheckerCallback = Depends(get_permission_checker),
+) -> ClientDetail:
+    """I7: authorise this PUT the way Fides authorises its own system writes.
+
+    Plain verify_oauth_client honours only global SYSTEM_UPDATE, which made
+    this route stricter than the Ethyca endpoint it shadows: a consultant who
+    is a *system manager* of her systems — the natural PrivacyCare persona —
+    could save the declaration through Fides' own PUT /system and then be
+    403'd recording which Kenyan ground justified it, on every save.
+    has_system_permissions is Fides' own helper and applies both tests
+    (model-level scopes OR system-manager scopes on THIS system); reusing it
+    rather than restating its rules means a change upstream reaches this
+    route too.
+
+    It returns the container's original_data rather than the client, and the
+    handler needs the client for recorded_by (D-KT-5: who recorded it), so
+    the token is read a second time here. That is one more decode plus a
+    client lookup on the same session — the price of not re-implementing the
+    authorisation rules beside them."""
+    # Resolve Depends if called directly (not via FastAPI DI) — the same line
+    # Fides' own verify_oauth_client carries, for the same reason.
+    permission_checker = _resolve_depends(permission_checker, get_permission_checker)
+    has_system_permissions(
+        system_auth_data=system_auth_data,
+        authorization=authorization,
+        security_scopes=security_scopes,
+        db=db,
+        permission_checker=permission_checker,
+    )
+    _, client = extract_token_and_load_client(authorization, db)
+    return client
+
+
 @privacycare_grounds_router.put(
     "/declarations/{declaration_id}/ground",
-    dependencies=[Security(verify_oauth_client, scopes=[SYSTEM_UPDATE])],
+    dependencies=[
+        Security(verify_oauth_client_for_declaration_system, scopes=[SYSTEM_UPDATE])
+    ],
     response_model=DeclarationGroundResponse,
 )
 def set_declaration_ground(
@@ -194,10 +302,10 @@ def set_declaration_ground(
     request: SetGroundRequest,
     *,
     db: Session = Depends(get_db),
-    client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_UPDATE]),
+    client: ClientDetail = Security(
+        verify_oauth_client_for_declaration_system, scopes=[SYSTEM_UPDATE]
+    ),
 ) -> DeclarationGroundResponse:
-    from loguru import logger
-
     recorded_by = _created_by_from_client(client)
     try:
         result = _record_declaration_ground(
