@@ -416,6 +416,15 @@ export enum ScopeRegistryEnum {
    * DISCOVERY_MONITOR_UPDATE
    */
   DISCOVERY_MONITOR_UPDATE = "discovery_monitor:update",
+  // PrivacyCare (spec 2026-09-14 D-DM-1): our scope, not Ethyca's.
+  /**
+   * PRIVACYCARE_DISCOVERY_READ
+   */
+  PRIVACYCARE_DISCOVERY_READ = "privacycare_discovery:read",
+  /**
+   * PRIVACYCARE_DISCOVERY_UPDATE
+   */
+  PRIVACYCARE_DISCOVERY_UPDATE = "privacycare_discovery:update",
   /**
    * ENCRYPTION_EXEC
    */

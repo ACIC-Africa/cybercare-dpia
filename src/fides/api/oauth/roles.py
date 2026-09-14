@@ -39,6 +39,7 @@ from fides.common.scope_registry import (
     PRIVACY_REQUEST_REVIEW,
     PRIVACY_REQUEST_UPLOAD_DATA,
     PRIVACY_REQUEST_VIEW_DATA,
+    PRIVACYCARE_DISCOVERY_READ,
     RULE_READ,
     SAAS_CONFIG_READ,
     SCOPE_READ,
@@ -124,6 +125,11 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     PRIVACY_EXPERIENCE_READ,
     PRIVACY_NOTICE_READ,
     PRIVACY_REQUEST_NOTIFICATIONS_READ,
+    # PrivacyCare (spec 2026-09-14 D-DM-1): a Viewer may see monitors and
+    # their findings (D-DM-2); configuring one — aiming a scanner at a live
+    # database — stays with Owner and Contributor, which derive from the
+    # full registry.
+    PRIVACYCARE_DISCOVERY_READ,
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,

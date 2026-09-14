@@ -66,6 +66,11 @@ SEND = "send"
 STORAGE = "storage"
 SYSTEM = "system"
 SYSTEM_INTEGRATION_LINK = "system_integration_link"
+# PrivacyCare (spec 2026-09-14 D-DM-1): discovery is our capability, not a
+# borrowed Ethyca one — plan 13 classifies into the customer's Kenyan taxonomy,
+# which upstream has no concept of. Naming the scope for us also means a future
+# upstream take cannot grant authority over our routes by string match.
+PRIVACYCARE_DISCOVERY = "privacycare_discovery"
 SYSTEM_MANAGER = "system_manager"
 TAXONOMY = "taxonomy"
 TEST = "test"
@@ -240,6 +245,10 @@ SYSTEM_READ = f"{SYSTEM}:{READ}"
 SYSTEM_UPDATE = f"{SYSTEM}:{UPDATE}"
 SYSTEM_DELETE = f"{SYSTEM}:{DELETE}"
 
+# PrivacyCare (spec 2026-09-14 D-DM-1)
+PRIVACYCARE_DISCOVERY_READ = f"{PRIVACYCARE_DISCOVERY}:{READ}"
+PRIVACYCARE_DISCOVERY_UPDATE = f"{PRIVACYCARE_DISCOVERY}:{UPDATE}"
+
 
 SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE = (
     f"{SYSTEM_INTEGRATION_LINK}:{CREATE_OR_UPDATE}"
@@ -383,6 +392,9 @@ SCOPE_DOCS = {
     SYSTEM_READ: "Read systems",
     SYSTEM_DELETE: "Delete systems",
     SYSTEM_UPDATE: "Update systems",
+    # PrivacyCare (spec 2026-09-14 D-DM-1)
+    PRIVACYCARE_DISCOVERY_READ: "View discovery monitors and their results",
+    PRIVACYCARE_DISCOVERY_UPDATE: "Create, edit and delete discovery monitors",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",
     SYSTEM_INTEGRATION_LINK_DELETE: "Delete system-integration links",
     SYSTEM_INTEGRATION_LINK_READ: "Read system-integration links",

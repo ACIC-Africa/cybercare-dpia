@@ -74,14 +74,16 @@ export const NAV_CONFIG: NavConfigGroup[] = [
       {
         title: "Action center",
         path: routes.ACTION_CENTER_ROUTE,
-        scopes: [ScopeRegistryEnum.DISCOVERY_MONITOR_READ],
+        // PrivacyCare (spec 2026-09-14 D-DM-1): our scope, not Ethyca's.
+        scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ],
         requiresPlus: true,
         tabs: ACTION_CENTER_TAB_ITEMS,
       },
       {
         title: "Access control",
         path: routes.ACCESS_CONTROL_ROUTE,
-        scopes: [ScopeRegistryEnum.DISCOVERY_MONITOR_READ],
+        // PrivacyCare (spec 2026-09-14 D-DM-1): our scope, not Ethyca's.
+        scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ],
         requiresFlag: "alphaPurposeBasedAccessControl",
         requiresPlus: true,
       },
