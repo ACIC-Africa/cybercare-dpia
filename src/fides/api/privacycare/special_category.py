@@ -82,12 +82,16 @@ def derive_special_category(db: Session, declaration_id: str) -> SpecialCategory
 
     declared = row["processes_special_category_data"]
 
-    triggering_keys = sorted(
+    # DISTINCT + ORDER BY p.declared_key in the query above already makes
+    # this list distinct and sorted (M4: a Python sorted() here sorted the
+    # same list a second time). The ordering guarantee lives in the SQL, and
+    # SpecialCategoryView.triggering_keys documents it.
+    triggering_keys = [
         r["declared_key"]
         for r in db.execute(
             _TRIGGERING_KEYS_SQL, {"declaration_id": declaration_id, "tag": SPECIAL_TAG}
         ).mappings().all()
-    )
+    ]
 
     return SpecialCategoryView(
         declared=declared,
