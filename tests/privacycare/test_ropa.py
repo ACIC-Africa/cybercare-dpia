@@ -6,7 +6,11 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.models import BusinessProcess, ProcessDeclaration
-from fides.api.privacycare.ropa import ropa_for_process
+from fides.api.privacycare.ropa import (
+    NATURAL_PERSON_ROLE_NOT_RECORDED,
+    ropa_for_process,
+)
+from fides.api.privacycare.taxonomy.loader import load_kenyan_taxonomy
 
 
 @pytest.fixture
@@ -180,6 +184,74 @@ def test_a_mix_of_real_and_missing_links_does_not_interfere(db):
     assert len(entry.declarations) == 1
     assert entry.declarations[0].id == "decl_ropa_mixed"
     assert entry.missing_declarations == ["decl_ropa_mixed_missing"]
+
+
+def test_ropa_entry_carries_special_category_and_natural_person_role(db):
+    # Task 4: the ROPA read must show the SAME derived answer as
+    # context.py's build_context, plus a per-data-subject role — recorded
+    # for a subject the Kenyan taxonomy loaded (employee), and the literal
+    # not-yet-recorded placeholder for one it never saw.
+    load_kenyan_taxonomy(db)
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO ctl_systems (id, fides_key, name)
+            VALUES (:id, :fides_key, :name)
+            """
+        ),
+        {
+            "id": "sys_ropa_special",
+            "fides_key": "sys_ropa_special_key",
+            "name": "Clinic Records",
+        },
+    )
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO privacydeclaration (
+                id, data_use, data_categories, data_subjects,
+                legal_basis_for_processing, retention_period, system_id,
+                processes_special_category_data
+            )
+            VALUES (
+                :id, :data_use, :data_categories, :data_subjects,
+                :legal_basis_for_processing, :retention_period, :system_id,
+                :processes_special_category_data
+            )
+            """
+        ),
+        {
+            "id": "decl_ropa_special",
+            "data_use": "essential.service.operations",
+            "data_categories": ["user.health_and_medical.hiv_status"],
+            "data_subjects": ["employee", "sys_ropa_special_unmapped_subject"],
+            "legal_basis_for_processing": "Consent",
+            "retention_period": "7 years",
+            "system_id": "sys_ropa_special",
+            "processes_special_category_data": False,
+        },
+    )
+    proc = BusinessProcess(name="Clinic Records Process")
+    db.add(proc)
+    db.flush()
+    db.add(
+        ProcessDeclaration(
+            business_process_id=proc.id,
+            privacy_declaration_id="decl_ropa_special",
+        )
+    )
+    db.flush()
+
+    entry = ropa_for_process(db, proc.id)
+
+    assert len(entry.declarations) == 1
+    decl = entry.declarations[0]
+    assert decl.special_category_derived is True
+    assert decl.special_category_triggering_keys == [
+        "user.health_and_medical.hiv_status"
+    ]
+    assert decl.special_category_mismatch is True
+    assert decl.natural_person_roles == ["employee", NATURAL_PERSON_ROLE_NOT_RECORDED]
 
 
 def test_declaration_order_is_stable_across_calls(db):

@@ -64,6 +64,7 @@ def _seed_declaration(
     name=None,
     categories=None,
     processes_special_category_data=False,
+    legal_basis_for_processing: str = "Consent",
 ) -> str:
     decl_id = f"decl_{uuid.uuid4().hex[:8]}"
     db.execute(
@@ -74,8 +75,8 @@ def _seed_declaration(
             " flexible_legal_basis_for_processing, legal_basis_for_processing, "
             " retention_period) "
             "VALUES (:id, :name, :data_use, :categories, :system_id, '{}', "
-            " :processes_special_category_data, false, true, 'Consent', "
-            " '7 years')"
+            " :processes_special_category_data, false, true, "
+            " :legal_basis_for_processing, '7 years')"
         ),
         {
             "id": decl_id,
@@ -84,6 +85,7 @@ def _seed_declaration(
             "categories": categories or ["user.contact.email"],
             "system_id": system_id,
             "processes_special_category_data": processes_special_category_data,
+            "legal_basis_for_processing": legal_basis_for_processing,
         },
     )
     return decl_id
@@ -224,6 +226,34 @@ def test_build_context_carries_the_declaration_and_its_data_use(db):
     ]
     assert context["data_use"]["name"] == "Advertising"
     assert context["data_use"]["description"] == "Promoting goods."
+
+
+def test_build_context_carries_the_derived_special_category_answer(db):
+    # Task 4: the declarant ticked "no", the HIV-status category is tagged
+    # dpa2019:special_category — that disagreement must surface on the
+    # context dict as a mismatch, not just inside special_category.py.
+    from fides.api.privacycare.taxonomy.loader import load_kenyan_taxonomy
+
+    load_kenyan_taxonomy(db)
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key, name="Clinic Records")
+    _seed_declaration(
+        db,
+        sid,
+        "marketing.advertising",
+        categories=["user.health_and_medical.hiv_status"],
+        processes_special_category_data=False,
+    )
+    db.flush()
+
+    target = next(t for t in select_targets(db, [key], high_risk_only=False))
+    context = build_context(db, target)
+
+    assert context["privacy_declaration"]["special_category_derived"] is True
+    assert context["privacy_declaration"]["special_category_triggering_keys"] == [
+        "user.health_and_medical.hiv_status"
+    ]
+    assert context["privacy_declaration"]["special_category_mismatch"] is True
 
 
 def test_build_context_tolerates_an_unregistered_data_use(db):

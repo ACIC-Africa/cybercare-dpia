@@ -12,6 +12,11 @@ from dataclasses import dataclass
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+from fides.api.privacycare.special_category import (
+    SpecialCategoryView,
+    derive_special_category,
+)
+
 # fides_sources addresses nine roots; build_context supplies four (system,
 # privacy_declaration, data_use, data_category). The five below are
 # deliberately unsupported in phase 1 — they name Fides subsystems
@@ -181,6 +186,23 @@ def build_context(db: Session, target: GenerationTarget) -> dict:
     declaration = db.execute(
         _DECLARATION_DETAIL_SQL, {"declaration_id": target.declaration_id}
     ).mappings().first()
+    # One extra query per declaration — derive_special_category re-reads the
+    # declaration row `declaration` above just fetched, but keeping the
+    # derivation in its own module (rather than inlining the ancestor-prefix
+    # SQL here) is worth that cost; see special_category.py for why the join
+    # must walk ancestor prefixes, not just the declared key.
+    #
+    # Only called when `declaration` actually resolved: build_context's own
+    # contract tolerates a target.declaration_id with no matching row (a
+    # caller building context off an assessment whose declaration_id is
+    # itself None or stale) by falling back to `{}` above — the derivation
+    # must fall back the same way here rather than raising through a path
+    # that was deliberately built to degrade gracefully.
+    special_category = (
+        derive_special_category(db, target.declaration_id)
+        if declaration is not None
+        else SpecialCategoryView(declared=None, derived=False, triggering_keys=[], mismatch=False)
+    )
     data_use = db.execute(
         _DATA_USE_DETAIL_SQL, {"fides_key": target.data_use}
     ).mappings().first()
@@ -214,6 +236,9 @@ def build_context(db: Session, target: GenerationTarget) -> dict:
         "privacy_declaration": {
             "id": target.declaration_id,
             **{k: _jsonable(v) for k, v in dict(declaration or {}).items()},
+            "special_category_derived": special_category.derived,
+            "special_category_triggering_keys": list(special_category.triggering_keys),
+            "special_category_mismatch": special_category.mismatch,
         },
         "data_use": {
             "fides_key": target.data_use,
