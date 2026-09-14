@@ -17,7 +17,7 @@ import {
   Switch,
   useMessage,
 } from "fidesui";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 
 import { useAppSelector } from "~/app/hooks";
 import {
@@ -27,7 +27,10 @@ import {
 import { LegacyResourceTypes } from "~/features/common/custom-fields/types";
 import { getErrorMessage } from "~/features/common/helpers";
 // PrivacyCare (spec 2026-09-13 D-KT-5)
-import { useSetDeclarationGroundMutation } from "~/features/privacycare/processing-grounds.slice";
+import {
+  useGetDeclarationGroundQuery,
+  useSetDeclarationGroundMutation,
+} from "~/features/privacycare/processing-grounds.slice";
 import { selectLockedForGVL } from "~/features/system/dictionary-form/dict-suggestion.slice";
 import {
   DataCategoriesFormItem,
@@ -42,6 +45,7 @@ import {
   Dataset,
   DataSubject,
   DataUse,
+  LegalBasisForProcessingEnum,
   PrivacyDeclarationResponse,
 } from "~/types/api";
 import { RTKErrorResult } from "~/types/errors/api";
@@ -51,8 +55,20 @@ import useSpecialCategoryLegalBasisOptions from "./useSpecialCategoryLegalBasisO
 
 const LEGITIMATE_INTERESTS = "Legitimate interests";
 
-export type FormValues = Omit<PrivacyDeclarationResponse, "cookies"> & {
+export type FormValues = Omit<
+  PrivacyDeclarationResponse,
+  "cookies" | "legal_basis_for_processing"
+> & {
   customFieldValues: CustomFieldValues;
+  /**
+   * PrivacyCare (spec 2026-09-13 D-KT-5): while the form is open this field
+   * holds the SELECTED OPTION's value — a Kenyan processing-ground id for a
+   * ground option, or the Article 6 class itself for a class-only option.
+   * `handleFinish` substitutes the option's class back in before the system
+   * PUT, so what is stored in `privacydeclaration.legal_basis_for_processing`
+   * is always the enum (D-KT-4).
+   */
+  legal_basis_for_processing?: string | null;
 };
 
 const defaultInitialValues: FormValues = {
@@ -78,11 +94,17 @@ const defaultInitialValues: FormValues = {
 
 const transformFormValueToDeclaration = (
   values: FormValues,
+  // PrivacyCare (spec 2026-09-13 D-KT-5): the Article 6 class the selected
+  // option resolves to. D-KT-4: the stored column is always the enum, never
+  // a ground id — the ground itself is recorded separately, in
+  // privacycare_declaration_ground.
+  legalBasis: LegalBasisForProcessingEnum | null | undefined,
 ): PrivacyDeclarationResponse => {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { customFieldValues, ...rest } = values;
   return {
     ...rest,
+    legal_basis_for_processing: legalBasis,
     // fill in an empty string for name: https://github.com/ethyca/fideslang/issues/98
     name: values.name ?? "",
     special_category_legal_basis: values.processes_special_category_data
@@ -145,16 +167,21 @@ export const PrivacyDeclarationForm = ({
   const { specialCategoryLegalBasisOptions } =
     useSpecialCategoryLegalBasisOptions();
 
-  // PrivacyCare (spec 2026-09-13 D-KT-5): several Kenyan grounds share the
-  // same fides_legal_basis class, so the Select's bound form value (the
-  // class, kept as `value` per D-KT-4 so the system PUT still writes the
-  // enum) cannot by itself tell us which specific ground was picked.
-  // `onSelect` gives us the full option (antd's `(value, option) =>`
-  // signature) without disturbing the Form.Item's own onChange wiring, so
-  // we track the chosen option's groundId separately here.
-  const [selectedGroundId, setSelectedGroundId] = useState<
-    string | undefined
-  >(undefined);
+  // PrivacyCare (spec 2026-09-13 D-KT-5): which Kenyan ground this
+  // declaration was recorded against, so an edit opens the dropdown on the
+  // ground the consultant actually chose. 404 (no ground recorded — every
+  // declaration written before this screen existed, and every one Fides
+  // re-created under a new id) leaves `data` undefined and the form falls
+  // back to the stored Article 6 class, which is a class-only option.
+  // `refetchOnMountOrArgChange` because the answer changes underneath the
+  // RTK cache every time a ground is recorded: without it, re-opening the
+  // same declaration inside the cache window would replay the 404 from
+  // before the save.
+  const { data: recordedGround, isFetching: isGroundFetching } =
+    useGetDeclarationGroundQuery(privacyDeclarationId ?? "", {
+      skip: !privacyDeclarationId,
+      refetchOnMountOrArgChange: true,
+    });
   const [setDeclarationGround] = useSetDeclarationGroundMutation();
   // PrivacyCare (spec 2026-09-13 D-KT-5): same toast helper
   // useSystemDataUseCrud's handleResult uses for the system-save error path.
@@ -165,25 +192,77 @@ export const PrivacyDeclarationForm = ({
     resourceFidesKey: privacyDeclarationId,
   });
 
-  const initialValues = useMemo(
-    () =>
-      transformPrivacyDeclarationToFormValues(
-        passedInInitialValues,
-        customFieldValues,
-      ),
-    [passedInInitialValues, customFieldValues],
-  );
+  const initialValues = useMemo(() => {
+    const values = transformPrivacyDeclarationToFormValues(
+      passedInInitialValues,
+      customFieldValues,
+    );
+    // PrivacyCare (spec 2026-09-13 D-KT-5): seed the select from the
+    // RECORDED ground when there is one. The stored column holds the
+    // Article 6 class, which several grounds share — selecting by class
+    // would render the alphabetically-first ground carrying it, i.e. a
+    // ground nobody chose. antd only reads `initialValues` when the Form
+    // mounts, which is why the render below waits for this query to settle.
+    return recordedGround
+      ? {
+          ...values,
+          legal_basis_for_processing: recordedGround.processing_ground_id,
+        }
+      : values;
+  }, [passedInInitialValues, customFieldValues, recordedGround]);
+
+  // PrivacyCare (spec 2026-09-13 D-KT-5): the Article 6 class an option
+  // value resolves to. A ground id resolves to its ground's class; a
+  // class-only option resolves to itself.
+  const legalBasisClassOf = (
+    value: string | null | undefined,
+  ): LegalBasisForProcessingEnum | null | undefined =>
+    (legalBasisOptions.find((option) => option.value === value)?.legalBasis ??
+      value) as LegalBasisForProcessingEnum | null | undefined;
 
   const [form] = Form.useForm<FormValues>();
 
+  // PrivacyCare (spec 2026-09-13 D-KT-5): antd reads `initialValues` once,
+  // when the Form mounts. The recorded ground can arrive after that — RTK
+  // Query hands back a cached answer (or none) on the first render and
+  // resolves the real one a tick later — and an initialValues recomputation
+  // alone would never reach the rendered Select, which is how a re-opened
+  // declaration could still show the ground it was recorded against BEFORE
+  // the last save. Push it into the field instead, and only while the
+  // consultant has not touched the dropdown herself: her in-flight choice
+  // always wins over a late server answer.
+  useEffect(() => {
+    if (!recordedGround) {
+      return;
+    }
+    if (form.isFieldTouched("legal_basis_for_processing")) {
+      return;
+    }
+    form.setFieldValue(
+      "legal_basis_for_processing",
+      recordedGround.processing_ground_id,
+    );
+  }, [recordedGround, form]);
+
   const handleFinish = async (values: FormValues) => {
+    // PrivacyCare (spec 2026-09-13 D-KT-5): the selected option — a Kenyan
+    // ground or a bare Article 6 class. Its `legalBasis` is what the system
+    // PUT writes (D-KT-4: the stored column is always the enum); its
+    // `groundId`, when it has one, is what gets recorded against the
+    // declaration afterwards.
+    const selectedOption = legalBasisOptions.find(
+      (option) => option.value === values.legal_basis_for_processing,
+    );
     // antd Form only tracks fields with a Form.Item; untracked fields
     // (`id`, `egress`, `ingress`) are silently dropped from `values`. Merge
     // them back in from initialValues so updates aren't mistaken for creates.
-    const declaration = transformFormValueToDeclaration({
-      ...initialValues,
-      ...values,
-    });
+    const declaration = transformFormValueToDeclaration(
+      {
+        ...initialValues,
+        ...values,
+      },
+      legalBasisClassOf(values.legal_basis_for_processing),
+    );
     const success = await onSubmit(declaration);
     if (success) {
       const matched = success.find(
@@ -198,8 +277,13 @@ export const PrivacyDeclarationForm = ({
         });
         // PrivacyCare (spec 2026-09-13 D-KT-5): record which Kenyan ground
         // justified this declaration's legal basis, now that the
-        // declaration id is known from the system save response. Only the
-        // enum-derived fallback options (used while grounds are loading)
+        // declaration id is known from the system save response. This fires
+        // on EVERY save with a ground selected, not only when the dropdown
+        // was touched: Fides matches declarations on the logical id
+        // `data_use:name` (db/system.py), so an edit that changes either
+        // one DELETES the old declaration row and CREATES a new one with a
+        // new id — a ground recorded against the old id would be stranded
+        // and the new declaration would carry none. Only class-only options
         // have no groundId, so there is nothing to record for those.
         //
         // The system save above has already succeeded and is NOT rolled
@@ -211,11 +295,11 @@ export const PrivacyDeclarationForm = ({
         // save: message.error with getErrorMessage's extracted detail,
         // falling back to a message that tells the consultant exactly what
         // to do next rather than a generic "something went wrong".
-        if (selectedGroundId) {
+        if (selectedOption?.groundId) {
           try {
             await setDeclarationGround({
               id: matched.id,
-              processing_ground_id: selectedGroundId,
+              processing_ground_id: selectedOption.groundId,
             }).unwrap();
           } catch (error) {
             message.error(
@@ -230,7 +314,11 @@ export const PrivacyDeclarationForm = ({
     }
   };
 
-  if (isEditing && isLoading) {
+  // PrivacyCare (spec 2026-09-13 D-KT-5): `isGroundFetching` joins the
+  // existing custom-fields gate because antd reads `initialValues` once, at
+  // mount — mounting before the recorded ground is known would open the
+  // dropdown on the stored class and never correct itself.
+  if (isEditing && (isLoading || isGroundFetching)) {
     return (
       <Flex justify="center" align="center" className="py-8">
         <Spin />
@@ -278,23 +366,22 @@ export const PrivacyDeclarationForm = ({
             <Select
               aria-label="Legal basis for processing"
               data-testid="input-legal_basis_for_processing"
-              // PrivacyCare (spec 2026-09-13 D-KT-5): several Kenyan grounds
-              // share the same fides_legal_basis `value` (e.g. multiple
-              // "Legitimate interests" grounds), so keying options on
-              // `value` alone collides — antd would warn about duplicate
-              // keys and the selection could visually collapse onto one
-              // entry. Key on `groundId` (falling back to `value` for the
-              // enum-derived options, which have no groundId) instead,
-              // while leaving `value` itself as the class so the system PUT
-              // still writes the enum.
-              options={legalBasisOptions.map((option) => ({
-                ...option,
-                key: option.groundId ?? option.value,
+              // PrivacyCare (spec 2026-09-13 D-KT-5): `value` is the ground
+              // id (class-only options carry the class as their own value),
+              // so every option is distinct and antd resolves the displayed
+              // label to the ground that was actually chosen. The Article 6
+              // class travels beside it on `legalBasis` and is substituted
+              // into the system PUT by handleFinish — it is never the
+              // option's identity, because several grounds share one class.
+              options={legalBasisOptions.map(({ label, value }) => ({
+                label,
+                value,
               }))}
-              onSelect={(_value, option: (typeof legalBasisOptions)[number]) =>
-                setSelectedGroundId(option.groundId)
-              }
-              onClear={() => setSelectedGroundId(undefined)}
+              // PrivacyCare (spec 2026-09-13 D-KT-5): antd filters typed
+              // search text against `value` by default, and `value` is now
+              // an opaque ground id — typing "KYC" would match nothing.
+              // Filter on the label the consultant can actually read.
+              optionFilterProp="label"
               disabled={lockedForGVL}
               allowClear
             />
@@ -307,7 +394,11 @@ export const PrivacyDeclarationForm = ({
             }
           >
             {({ getFieldValue }) =>
-              getFieldValue("legal_basis_for_processing") ===
+              // PrivacyCare (spec 2026-09-13 D-KT-5): resolve through the
+              // option — the field now holds a ground id, and a Kenyan
+              // ground classed "Legitimate interests" needs this field just
+              // as much as the bare class does.
+              legalBasisClassOf(getFieldValue("legal_basis_for_processing")) ===
               LEGITIMATE_INTERESTS ? (
                 <Form.Item
                   name="impact_assessment_location"
