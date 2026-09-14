@@ -43,7 +43,11 @@ class MonitorExecutionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    monitor_config_key: Optional[str] = None
+    # Required in MonitorExecution.ts (`monitor_config_key: string;`, no `?`)
+    # — unlike status/started/completed below, all of which carry `?`. Task 3
+    # controller ruling: previously Optional[str] = None, which would have
+    # silently accepted a row missing this field.
+    monitor_config_key: str
     status: Optional[str] = None
     started: Optional[datetime] = None
     completed: Optional[datetime] = None

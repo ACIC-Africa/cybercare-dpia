@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from fides.api.privacycare.api.router import (
     PRIVACYCARE_CHAT_PREFIX,
     PRIVACYCARE_GROUNDS_PREFIX,
+    PRIVACYCARE_MONITORS_PREFIX,
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
 )
@@ -206,6 +207,76 @@ ALLOWLIST: dict[str, dict] = {
             "not because a test would otherwise fail without it.)"
         ),
     },
+    # The six discovery-monitor routes (plan 10, task 3). Controller ruling
+    # for this task named exactly two required entries (MonitorConfigResponse
+    # and MonitorExecutionResponse, both below) on the premise that "every
+    # other model has a 1:1 TypeScript counterpart". Running this gate with
+    # PRIVACYCARE_MONITORS_PREFIX actually armed (immediately above) showed
+    # three more failures the ruling did not anticipate — Page[MonitorStatusResponse],
+    # Page[str], and DeleteMonitorResponse — each of which is the SAME
+    # pre-existing category this file already allowlists elsewhere, not a new
+    # kind of gap:
+    "MonitorConfigResponse": {
+        "ts_name": "MonitorConfig",
+        "reason": (
+            "MonitorConfig is already a SQLAlchemy model name "
+            "(fides.api.models.detection_discovery.core.MonitorConfig); this "
+            "Pydantic response schema is suffixed *Response to avoid that "
+            "collision, but the TS interface it mirrors is the unsuffixed "
+            "MonitorConfig.ts (see MonitorConfigResponse's own docstring in "
+            "monitor_schemas.py). Same precedent as AssessmentQuestionResponse "
+            "-> AssessmentQuestion above."
+        ),
+    },
+    "MonitorExecutionResponse": {
+        "ts_name": "MonitorExecution",
+        "reason": (
+            "MonitorExecution is already a SQLAlchemy model name "
+            "(fides.api.models.detection_discovery.core.MonitorExecution); "
+            "same *Response-suffix-avoids-a-collision reason as "
+            "MonitorConfigResponse immediately above, mirroring the unsuffixed "
+            "MonitorExecution.ts."
+        ),
+    },
+    "Page[MonitorStatusResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Same generic-pagination-wrapper precedent as Page[TemplateResponse] "
+            "and Page[AssessmentTaskResponse] above: fastapi_pagination.Page[T]'s "
+            "own shape is proven once, not re-asserted per T, even though a "
+            "generated Page_MonitorStatusResponse_.ts also happens to exist (its "
+            "underscored name is not what Page[T]'s own __name__ produces, so it "
+            "would not be found by name anyway). MonitorStatusResponse (T itself) "
+            "is fully recursed into and carries its own parity test in "
+            "test_monitor_schemas.py."
+        ),
+    },
+    "Page[str]": {
+        "ts_name": None,
+        "reason": (
+            "Same generic-pagination-wrapper precedent as Page[MonitorStatusResponse] "
+            "above. The leaf T=str is a bare scalar, not a BaseModel, so "
+            "_discover_models never walks into it separately (same as `bytes` "
+            "below) — there is no second entry to add for it, and no fields to "
+            "drift: get_monitor_databases returns schema/database NAMES, a plain "
+            "list of strings, matching the generated Page_str_.ts each caller "
+            "already gets its shape from."
+        ),
+    },
+    "DeleteMonitorResponse": {
+        "ts_name": None,
+        "reason": (
+            "Same precedent as DeletePrivacyAssessmentResponse above: "
+            "deleteDiscoveryMonitor types its RTK Query mutation as "
+            "build.mutation<{ count: number }, ...> "
+            "(discovery-detection.slice.ts) — an inline anonymous TS type "
+            "literal, not a named interface or a generated model, so there is "
+            "no name for `count: int` to be checked against. Unlike "
+            "DeletePrivacyAssessmentResponse's case, the admin UI DOES read "
+            "the field (`{ count }`, per delete_monitor's own docstring) — it "
+            "simply never gave that shape a name to import."
+        ),
+    },
 }
 
 
@@ -222,11 +293,18 @@ ALLOWLIST: dict[str, dict] = {
 # the whole plan (fix round for the processes router) until someone noticed.
 # Do not let a fourth router repeat it: if `register()` in api/router.py ever
 # gains another `app_setup.ROUTERS.append(...)`, its prefix belongs here too.
+#
+# PRIVACYCARE_MONITORS_PREFIX (plan 10, task 3): exactly that fourth router.
+# Confirmed by running this file BEFORE adding it below: every test here
+# still passed, silently checking nothing about the six new
+# /plus/discovery-monitor* routes' response models — the same
+# passes-while-measuring-nothing failure this comment already warns about.
 PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
     PRIVACYCARE_CHAT_PREFIX,
     PRIVACYCARE_GROUNDS_PREFIX,
+    PRIVACYCARE_MONITORS_PREFIX,
 )
 
 

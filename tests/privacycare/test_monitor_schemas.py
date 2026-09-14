@@ -4,17 +4,43 @@ The admin UI's auto-generated TypeScript types are the specification. Plans
 03/03b established the failure mode: a technically-correct response in the
 wrong envelope renders an empty screen and reports no error anywhere.
 """
+import pathlib
+import re
+
 import pytest
 from pydantic import ValidationError
 
 from fides.api.privacycare.api.monitor_schemas import (
     EditableMonitorConfig,
+    LinkedDatasetInfo,
     MonitorConfigResponse,
     MonitorDeletionImpact,
     MonitorExecutionResponse,
     MonitorStatusResponse,
     MonitorStewardUserResponse,
 )
+
+TS_DIR = pathlib.Path(__file__).parents[2] / "clients/admin-ui/src/types/api/models"
+
+
+def _ts_field_specs(name: str) -> dict[str, bool]:
+    # Map field name -> True if the TS field is optional (carries a `?`
+    # before the colon), False if required. Same approach as
+    # test_api_schemas.py's helper of the same name — duplicated locally
+    # rather than imported, matching that file's own precedent of not
+    # sharing this parsing helper across test modules.
+    text = (TS_DIR / f"{name}.ts").read_text()
+    match = re.search(r"=\s*\{(.*?)\};", text, re.S)
+    assert match, f"{name}: could not parse a TS type body from {name}.ts"
+    body = match.group(1)
+    return {
+        field: bool(optional_marker)
+        for field, optional_marker in re.findall(r"^\s*([a-z_]+)(\??):", body, re.M)
+    }
+
+
+def _ts_fields(name: str) -> set[str]:
+    return set(_ts_field_specs(name).keys())
 
 
 def test_status_response_carries_every_field_the_ui_reads():
@@ -132,3 +158,57 @@ def test_deletion_impact_defaults_to_zero_not_null():
     assert impact.linked_datasets == []
     assert impact.active_task_count == 0
     assert impact.associated_system_count == 0
+
+
+def test_execution_response_requires_monitor_config_key():
+    # Task 3 controller ruling: MonitorExecution.ts declares
+    # `monitor_config_key: string;` with no `?` — required, unlike status/
+    # started/completed, which all carry `?`. Previously typed Optional[str]
+    # = None, which would have silently accepted a row missing this field.
+    with pytest.raises(ValidationError):
+        MonitorExecutionResponse(id="me_1")
+    assert MonitorExecutionResponse(id="me_1", monitor_config_key="k").monitor_config_key == "k"
+
+
+# The six real field/optionality parity tests the response_model_ts_parity
+# gate's `test_every_ts_counterpart_has_a_referencing_parity_test` requires
+# for every model its walk of the six monitor routes' response_models
+# reaches (see test_response_model_ts_parity.py's own module docstring).
+# Field-NAME parity is already covered above by hand-enumerated sets; these
+# additionally check OPTIONALITY against the generated .ts files directly,
+# so a field that flips required<->optional upstream fails here too.
+
+
+def test_status_response_matches_the_shipped_contract():
+    assert set(MonitorStatusResponse.model_fields) == _ts_fields("MonitorStatusResponse")
+
+
+def test_config_response_matches_the_shipped_contract():
+    # MonitorConfigResponse's TS counterpart is MonitorConfig.ts, not a
+    # generated MonitorConfigResponse.ts: MonitorConfig is already a
+    # SQLAlchemy model name (models.detection_discovery.core.MonitorConfig),
+    # so this Pydantic response schema is suffixed *Response to avoid that
+    # collision — same precedent as AssessmentQuestionResponse ->
+    # AssessmentQuestion (test_response_model_ts_parity.py's ALLOWLIST).
+    assert set(MonitorConfigResponse.model_fields) == _ts_fields("MonitorConfig")
+
+
+def test_steward_response_matches_the_shipped_contract():
+    assert set(MonitorStewardUserResponse.model_fields) == _ts_fields(
+        "MonitorStewardUserResponse"
+    )
+
+
+def test_execution_response_matches_the_shipped_contract():
+    # Same *Response-suffix-avoids-a-collision reason as MonitorConfigResponse
+    # above — MonitorExecution is also a SQLAlchemy model name
+    # (models.detection_discovery.core.MonitorExecution).
+    assert set(MonitorExecutionResponse.model_fields) == _ts_fields("MonitorExecution")
+
+
+def test_deletion_impact_matches_the_shipped_contract():
+    assert set(MonitorDeletionImpact.model_fields) == _ts_fields("MonitorDeletionImpact")
+
+
+def test_linked_dataset_info_matches_the_shipped_contract():
+    assert set(LinkedDatasetInfo.model_fields) == _ts_fields("LinkedDatasetInfo")

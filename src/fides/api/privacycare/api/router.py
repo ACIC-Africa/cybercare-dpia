@@ -64,6 +64,21 @@ PRIVACYCARE_GROUNDS_PREFIX = f"{V1_URL_PREFIX}/privacycare"
 
 privacycare_grounds_router = APIRouter(prefix=PRIVACYCARE_GROUNDS_PREFIX, tags=["PrivacyCare"])
 
+# The discovery-monitor configuration surface (plan 10): a FIFTH, separate
+# prefix family, and — unlike privacycare_processes_router/
+# privacycare_chat_router/privacycare_grounds_router — back in Ethyca's
+# `plus` namespace, for the same reason PRIVACYCARE_PREFIX is: the shipped
+# admin UI's discovery-monitor screen (clients/admin-ui/src/features/
+# data-discovery-and-detection/discovery-detection.slice.ts) calls these
+# exact `/plus/discovery-monitor*` paths, and the UI's path is the
+# requirement. See api/monitors.py's module docstring for the fuller
+# version of this argument.
+PRIVACYCARE_MONITORS_PREFIX = f"{V1_URL_PREFIX}/plus/discovery-monitor"
+
+privacycare_monitors_router = APIRouter(
+    prefix=PRIVACYCARE_MONITORS_PREFIX, tags=["PrivacyCare Discovery"]
+)
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -151,8 +166,15 @@ def register() -> None:
     # hazard above — nothing here is registered against privacycare_router.
     importlib.import_module("fides.api.privacycare.api.chat")
 
+    # monitors.py (plan 10, task 3) decorates its OWN router
+    # (privacycare_monitors_router, a distinct prefix), so — same as
+    # grounds.py and chat.py above — it carries none of the
+    # tasks-vs-assessments matching-order hazard either.
+    importlib.import_module("fides.api.privacycare.api.monitors")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
     app_setup.ROUTERS.append(privacycare_grounds_router)
+    app_setup.ROUTERS.append(privacycare_monitors_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
