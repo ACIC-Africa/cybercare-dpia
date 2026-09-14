@@ -1,3 +1,5 @@
+import importlib.util
+import pathlib
 import subprocess
 import sys
 
@@ -253,3 +255,36 @@ def test_created_rows_pass_fideslang_response_validation(db):
         "WHERE 'privacycare:kenyan' = ANY(tags) LIMIT 1"
     )).mappings().one())
     DataCategory(**category_row)
+
+
+def _load_cli_module():
+    # scripts/ has no __init__.py (it's not a package), so load
+    # load_taxonomy.py by path rather than a normal import — this is the
+    # same script the subprocess-based CLI tests above invoke, just loaded
+    # in-process to unit-test its pure _database_url() helper without a DB.
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "privacycare" / "load_taxonomy.py"
+    spec = importlib.util.spec_from_file_location("privacycare_load_taxonomy_cli", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_database_url_honours_privacycare_database_url_override(monkeypatch):
+    # Review finding (Important #1): _database_url() must check
+    # PRIVACYCARE_DATABASE_URL first, same precedence as
+    # src/fides/api/privacycare/migrations/env.py's _database_url(), so
+    # this CLI and migrate.sh/env.py never silently target different
+    # databases. One test, both branches of that precedence.
+    cli = _load_cli_module()
+
+    monkeypatch.setenv("PRIVACYCARE_DATABASE_URL", "postgresql://scratch:scratch@example.invalid:1/scratch")
+    monkeypatch.setenv("FIDES__DATABASE__SERVER", "should-be-ignored")
+    assert cli._database_url() == "postgresql://scratch:scratch@example.invalid:1/scratch"
+
+    monkeypatch.delenv("PRIVACYCARE_DATABASE_URL", raising=False)
+    monkeypatch.setenv("FIDES__DATABASE__USER", "u")
+    monkeypatch.setenv("FIDES__DATABASE__PASSWORD", "p")
+    monkeypatch.setenv("FIDES__DATABASE__SERVER", "h")
+    monkeypatch.setenv("FIDES__DATABASE__PORT", "1")
+    monkeypatch.setenv("FIDES__DATABASE__DB", "d")
+    assert cli._database_url() == "postgresql://u:p@h:1/d"

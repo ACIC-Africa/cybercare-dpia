@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """CLI wrapper around fides.api.privacycare.taxonomy.loader.
 
-Opens one session against the same FIDES__DATABASE__* env vars (and the
-same 127.0.0.1:5442 defaults) as scripts/privacycare/migrate.sh and
-src/fides/api/privacycare/migrations/env.py's _database_url(), so this
-script always agrees with the rest of PrivacyCare's tooling on where "the
-database" is.
+Opens one session against the same database _database_url() in
+src/fides/api/privacycare/migrations/env.py resolves: PRIVACYCARE_DATABASE_URL
+first if set, else the FIDES__DATABASE__* composition (same env vars, same
+127.0.0.1:5442 defaults) also used by scripts/privacycare/migrate.sh — same
+precedence order, so this script and the rest of PrivacyCare's tooling never
+disagree about where "the database" is. Logic is duplicated rather than
+imported from env.py: importing that module runs Alembic migrations as a
+side effect of the import itself (module-level `context.config` access and
+an unconditional `run_migrations_online()`/`run_migrations_offline()` call
+at the bottom of the file, outside any `if __name__ == "__main__"` guard) —
+importing it here would migrate the database as a side effect of parsing
+CLI args.
 
 Dry run is the default in both directions: with no flags it loads (and
 rolls back); with --revert alone it reverts (and rolls back). --commit is
@@ -29,16 +36,19 @@ from fides.api.privacycare.taxonomy.loader import (
 
 
 def _database_url() -> str:
-    # Mirrors scripts/privacycare/migrate.sh and
-    # src/fides/api/privacycare/migrations/env.py's _database_url() exactly:
-    # same env vars, same defaults, so this script and the rest of
-    # PrivacyCare's tooling never disagree about where "the database" is.
-    return "postgresql://{u}:{p}@{h}:{port}/{db}".format(
-        u=os.environ.get("FIDES__DATABASE__USER", "postgres"),
-        p=os.environ.get("FIDES__DATABASE__PASSWORD", "fides"),
-        h=os.environ.get("FIDES__DATABASE__SERVER", "127.0.0.1"),
-        port=os.environ.get("FIDES__DATABASE__PORT", "5442"),
-        db=os.environ.get("FIDES__DATABASE__DB", "fides"),
+    # Copied from src/fides/api/privacycare/migrations/env.py's
+    # _database_url() verbatim (same precedence, same env vars, same
+    # defaults) rather than imported — see the module docstring for why
+    # importing env.py isn't safe here.
+    return os.environ.get(
+        "PRIVACYCARE_DATABASE_URL",
+        "postgresql://{u}:{p}@{h}:{port}/{db}".format(
+            u=os.environ.get("FIDES__DATABASE__USER", "postgres"),
+            p=os.environ.get("FIDES__DATABASE__PASSWORD", "fides"),
+            h=os.environ.get("FIDES__DATABASE__SERVER", "127.0.0.1"),
+            port=os.environ.get("FIDES__DATABASE__PORT", "5442"),
+            db=os.environ.get("FIDES__DATABASE__DB", "fides"),
+        ),
     )
 
 
