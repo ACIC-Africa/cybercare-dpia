@@ -10,8 +10,11 @@
 # this was written). Every count assertion below is therefore scoped to the
 # external_refs the test itself created via _ref(), never a whole-table
 # count.
+import importlib.util
 import json
 import pathlib
+import subprocess
+import sys
 import uuid
 
 import pytest
@@ -285,14 +288,173 @@ def test_importing_the_real_oil_marketer_register(db):
     # The one real-data assertion in this task: the actual customer register
     # imports to the shape a consultant would expect. Read-only against the
     # source file; the fixture's rollback discards everything this writes.
+    #
+    # Same accommodation as test_taxonomy_loader.py's F1b: this suite must
+    # stay green whether run against a fresh DB or the live one Task 2 Step
+    # 5 already loaded for real (that commit persists — the fixture only
+    # rolls back what THIS test writes). Once the live DB carries these 86
+    # external_refs, a second run of this test sees them matched, not
+    # created, so we assert the invariant that holds either way rather than
+    # a fresh-DB-only created count.
     if not REAL_REGISTER_PATH.exists():
         pytest.skip(f"{REAL_REGISTER_PATH} not present")
     register = json.loads(REAL_REGISTER_PATH.read_text())
 
     summary = import_processes(db, register)
 
-    assert summary.created == 86
+    assert summary.created + summary.updated + summary.unchanged == 86
+    assert summary.created == 86 or summary.unchanged == 86
     assert summary.without_data_mapping == 85
     assert summary.blank_applicability == 85
     assert len(summary.cycles) == 17
     assert summary.cycles["Finance & Accounting"] == 11
+
+
+# --- Task 2: the CLI --------------------------------------------------------
+CLI_PATH = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "privacycare" / "import_processes.py"
+
+
+def _load_cli_module():
+    # scripts/ has no __init__.py (it's not a package), so load
+    # import_processes.py by path rather than a normal import — same
+    # approach as test_taxonomy_loader.py's _load_cli_module(), used here to
+    # unit-test the CLI's main() in-process (needed for the --commit test,
+    # which must monkeypatch Session.commit before main() runs).
+    spec = importlib.util.spec_from_file_location(
+        "privacycare_import_processes_cli", CLI_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_cli_missing_path_exits_nonzero_naming_the_path():
+    missing = "/tmp/t08-does-not-exist-register.json"
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH), missing],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+def test_cli_malformed_json_exits_nonzero_naming_the_file(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH), str(bad)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert str(bad) in result.stderr
+
+
+def test_cli_wrong_shape_exits_nonzero_with_a_clear_message(tmp_path):
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text(json.dumps({"processes": {}}))
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH), str(wrong)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert str(wrong) in result.stderr
+    assert "'processes' list" in result.stderr
+
+
+def test_cli_core_value_error_exits_nonzero_with_its_message(tmp_path):
+    # A register that is well-shaped JSON but fails the core's own
+    # validation (blank name) — the CLI must surface import_processes'
+    # ValueError message, not a traceback.
+    bad_register = _register([{"number": _ref(1), "name": "", "business_cycle": "Finance"}])
+    path = tmp_path / "register.json"
+    path.write_text(json.dumps(bad_register))
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH), str(path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "name" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_dry_run_writes_nothing_and_reports_the_full_summary(tmp_path, db):
+    # This is the plan's D-IMP-6 test, moved here: a dry run by default must
+    # not write, and the summary text must name every count plus the cycle
+    # breakdown.
+    ref1, ref2 = _ref(1), _ref(2)
+    register = _register(
+        [
+            {
+                "number": ref1,
+                "name": "A",
+                "business_cycle": "Finance & Accounting",
+                "applicable": "1",
+            },
+            {
+                "number": ref2,
+                "name": "B",
+                "business_cycle": "Finance & Accounting",
+                "applicable": "0",
+            },
+        ]
+    )
+    path = tmp_path / "register.json"
+    path.write_text(json.dumps(register))
+
+    result = subprocess.run(
+        [sys.executable, str(CLI_PATH), str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = result.stdout
+    assert "created: 2" in out
+    assert "updated: 0" in out
+    assert "unchanged: 0" in out
+    assert "without_data_mapping: 2" in out
+    assert "blank_applicability: 0" in out
+    assert "cycle  Finance & Accounting: 2" in out
+    assert "DRY RUN" in out
+    assert "COMMITTED" not in out
+
+    count = db.execute(
+        sqlalchemy.text(
+            "SELECT COUNT(*) FROM privacycare_business_process WHERE external_ref = ANY(:refs)"
+        ),
+        {"refs": [ref1, ref2]},
+    ).scalar()
+    assert count == 0, "a dry run must not write anything"
+
+
+def test_cli_commit_flag_commits(tmp_path, monkeypatch, capsys):
+    # In-process (not subprocess) so Session.commit can be monkeypatched
+    # before main() runs. The patched commit records the call and then
+    # rolls back for real, so this test never actually persists anything —
+    # same technique test_taxonomy_loader.py's CLI tests use for the dry-run
+    # side; here it is the only way to prove --commit calls commit() at all
+    # without letting a test really commit.
+    ref = _ref(1)
+    register = _register([{"number": ref, "name": "A", "business_cycle": "Finance"}])
+    path = tmp_path / "register.json"
+    path.write_text(json.dumps(register))
+
+    cli = _load_cli_module()
+
+    calls = []
+
+    def fake_commit(self):
+        calls.append(True)
+        self.rollback()
+
+    monkeypatch.setattr(Session, "commit", fake_commit)
+
+    rc = cli.main([str(path), "--commit"])
+
+    assert rc == 0
+    assert len(calls) == 1
+    out = capsys.readouterr().out
+    assert "COMMITTED" in out
