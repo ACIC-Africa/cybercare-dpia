@@ -50,15 +50,33 @@ class LoadSummary:
 def _validate_creates() -> None:
     """D-KT-2: fideslang rejects a mismatched parent and a parallel root.
     Prove every row we intend to create is one fideslang would accept BEFORE
-    any database is touched — a ValidationError here aborts the whole load."""
+    any database is touched — a ValidationError here aborts the whole load.
+
+    F9/F11: this gate previously constructed a lookalike row (no
+    version_added, no tags, no active, no organization_fides_key) rather
+    than the row the INSERT actually writes — which is exactly how two
+    defects got past it: the INSERT set version_added='3.1.3' on an
+    is_default=False row (fideslang's has_versioning_if_default rejects
+    that), and it left organization_fides_key NULL when every row
+    fideslang serializes must carry a valid organization_fides_key string
+    (F11 — 'default_organization' is the only row in ctl_organizations and
+    what all 15/85 Fides default rows carry). _validate_creates() never
+    noticed either because it never passed these fields at all. Every
+    field below is copied from the corresponding INSERT's VALUES so the
+    gate validates the row we actually write, not a stand-in for it."""
     for c in kenyan.CATEGORIES:
         if c.action == "create":
+            tags = ["privacycare:kenyan"] + ([kenyan.SPECIAL_TAG] if c.special else [])
             DataCategory(
                 fides_key=c.fides_key,
                 parent_key=c.parent_key,
                 name=c.term,
                 description=c.reason,
                 is_default=False,
+                active=True,
+                tags=tags,
+                version_added=None,
+                organization_fides_key="default_organization",
             )
     for s in kenyan.SUBJECTS:
         if s.action == "create":
@@ -68,6 +86,10 @@ def _validate_creates() -> None:
                 description=s.reason,
                 is_default=False,
                 rights=kenyan.SIX_RIGHTS,
+                active=True,
+                tags=["privacycare:kenyan"],
+                version_added=None,
+                organization_fides_key="default_organization",
             )
 
 
@@ -86,10 +108,20 @@ def _load_subjects(db: Session) -> None:
         elif s.action == "create":
             db.execute(
                 sqlalchemy.text(
+                    # F9: version_added stays NULL here — fideslang's own
+                    # has_versioning_if_default (validation.py) rejects a
+                    # non-default (is_default=false) row that carries any
+                    # version information, so a created row must not set
+                    # one; the column has no NOT NULL constraint.
+                    # F11: organization_fides_key must be 'default_organization'
+                    # — it's the only row in ctl_organizations, and every
+                    # Fides default row carries it; fideslang's response
+                    # model requires it be a non-null string.
                     "INSERT INTO ctl_data_subjects "
-                    "(id, fides_key, name, description, rights, is_default, active, tags, version_added) "
+                    "(id, fides_key, name, description, rights, is_default, active, tags, "
+                    "organization_fides_key) "
                     "VALUES (:id, :key, :term, :reason, CAST(:rights AS json), false, true, "
-                    "ARRAY['privacycare:kenyan'], '3.1.3') "
+                    "ARRAY['privacycare:kenyan'], 'default_organization') "
                     "ON CONFLICT (fides_key) DO NOTHING"
                 ),
                 {
@@ -142,9 +174,15 @@ def _load_categories(db: Session) -> None:
             tags = ["privacycare:kenyan"] + ([kenyan.SPECIAL_TAG] if c.special else [])
             db.execute(
                 sqlalchemy.text(
+                    # F9: version_added stays NULL for created rows — see
+                    # the identical note in _load_subjects above.
+                    # F11: organization_fides_key = 'default_organization' —
+                    # see the identical note in _load_subjects above.
                     "INSERT INTO ctl_data_categories "
-                    "(id, fides_key, name, description, parent_key, is_default, active, tags, version_added) "
-                    "VALUES (:id, :key, :term, :reason, :parent_key, false, true, :tags, '3.1.3') "
+                    "(id, fides_key, name, description, parent_key, is_default, active, tags, "
+                    "organization_fides_key) "
+                    "VALUES (:id, :key, :term, :reason, :parent_key, false, true, :tags, "
+                    "'default_organization') "
                     "ON CONFLICT (fides_key) DO NOTHING"
                 ),
                 {

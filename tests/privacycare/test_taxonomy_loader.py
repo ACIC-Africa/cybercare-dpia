@@ -134,3 +134,60 @@ def test_revert_restores_the_fides_baseline(db):
         "(SELECT name FROM ctl_data_subjects WHERE fides_key='customer')"
     ), {"tag": kenyan.SPECIAL_TAG}).one()
     assert counts == (15, 85, 0, "Customer")
+
+
+def test_created_rows_carry_no_version_added(db):
+    # F9: has_versioning_if_default (fideslang/validation.py) rejects a
+    # non-default row that carries version information. The INSERTs in
+    # loader.py used to write version_added='3.1.3' on every created
+    # (is_default=false) row — this proves that defect stays fixed.
+    load_kenyan_taxonomy(db)
+    subjects = db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_subjects "
+        "WHERE is_default = false AND version_added IS NOT NULL"
+    )).scalar()
+    categories = db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_categories "
+        "WHERE is_default = false AND version_added IS NOT NULL"
+    )).scalar()
+    assert (subjects, categories) == (0, 0)
+
+
+def test_created_rows_carry_default_organization(db):
+    # F11: fideslang's response model requires organization_fides_key to be
+    # a non-null string; the INSERTs used to leave it NULL on every created
+    # row. 'default_organization' is the only row in ctl_organizations and
+    # what every Fides default row carries — pin the row shape here.
+    load_kenyan_taxonomy(db)
+    subjects = db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_subjects "
+        "WHERE is_default = false AND organization_fides_key IS DISTINCT FROM 'default_organization'"
+    )).scalar()
+    categories = db.execute(sqlalchemy.text(
+        "SELECT count(*) FROM ctl_data_categories "
+        "WHERE is_default = false AND organization_fides_key IS DISTINCT FROM 'default_organization'"
+    )).scalar()
+    assert (subjects, categories) == (0, 0)
+
+
+def test_created_rows_pass_fideslang_response_validation(db):
+    # F9: GET /api/v1/data_subject and /api/v1/data_category serialize
+    # every row through fideslang's own DataSubject/DataCategory models —
+    # the same models _validate_creates() uses, but built here straight
+    # from the DB columns fideslang knows about, not from kenyan.py, so
+    # this proves the row we actually wrote (not a lookalike) validates.
+    load_kenyan_taxonomy(db)
+
+    subject_row = dict(db.execute(sqlalchemy.text(
+        "SELECT fides_key, name, description, rights, is_default, active, "
+        "tags, version_added, organization_fides_key FROM ctl_data_subjects "
+        "WHERE fides_key = 'applicant'"
+    )).mappings().one())
+    DataSubject(**subject_row)
+
+    category_row = dict(db.execute(sqlalchemy.text(
+        "SELECT fides_key, name, description, parent_key, is_default, active, "
+        "tags, version_added, organization_fides_key FROM ctl_data_categories "
+        "WHERE 'privacycare:kenyan' = ANY(tags) LIMIT 1"
+    )).mappings().one())
+    DataCategory(**category_row)
