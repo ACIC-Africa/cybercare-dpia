@@ -20,19 +20,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fides.api.models.detection_discovery.core import MonitorFrequency
 
 
-class MonitorClassifyParamsResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True, extra="allow")
-
-
 class MonitorStewardUserResponse(BaseModel):
+    """Mirrors MonitorStewardUserResponse.ts.
+
+    `username` is required there (no `?`) — unlike `email_address`,
+    `first_name`, `last_name`, all of which carry `?` and are genuinely
+    optional.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    username: Optional[str] = None
+    username: str
     email_address: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
 
 
 class MonitorExecutionResponse(BaseModel):
+    """Mirrors MonitorExecution.ts."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: str
@@ -40,6 +47,8 @@ class MonitorExecutionResponse(BaseModel):
     status: Optional[str] = None
     started: Optional[datetime] = None
     completed: Optional[datetime] = None
+    classification_instances: List[str] = Field(default_factory=list)
+    messages: List[str] = Field(default_factory=list)
 
 
 class MonitorStatusResponse(BaseModel):
@@ -69,17 +78,47 @@ class MonitorStatusResponse(BaseModel):
     execution_records: Optional[List[MonitorExecutionResponse]] = None
 
 
-class MonitorConfigResponse(MonitorStatusResponse):
-    """The PUT and GET-one response.
+class MonitorConfigResponse(BaseModel):
+    """The PUT and GET-one response — mirrors MonitorConfig.ts.
 
-    MonitorConfig.ts and MonitorStatusResponse.ts carry the same fields; they
-    are distinct types in the UI, so they are distinct here, and the parity gate
-    checks each against its own TypeScript counterpart.
+    MonitorConfig.ts and MonitorStatusResponse.ts are distinct generated
+    types, not one extending the other: MonitorConfig.ts has exactly 13
+    fields and, unlike MonitorStatusResponse.ts, no `execution_records` at
+    all — it omits the execution history. Subclassing MonitorStatusResponse
+    would silently inherit that field; this is a sibling model instead, with
+    its own copy of the 13 shared fields, so the parity gate can check each
+    against its own TypeScript counterpart without either dragging in a
+    field the other doesn't have.
     """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str
+    key: Optional[str] = None
+    connection_config_key: str
+    classify_params: Optional[Dict[str, Any]] = None
+    datasource_params: Optional[Dict[str, Any]] = None
+    databases: List[str] = Field(default_factory=list)
+    execution_start_date: Optional[datetime] = None
+    execution_frequency: Optional[MonitorFrequency] = None
+    excluded_databases: List[str] = Field(default_factory=list)
+    enabled: Optional[bool] = None
+    shared_config_id: Optional[str] = None
+    stewards: List[MonitorStewardUserResponse] = Field(default_factory=list)
+    last_monitored: Optional[datetime] = None
 
 
 class EditableMonitorConfig(BaseModel):
-    """The PUT request body — mirrors EditableMonitorConfig.ts."""
+    """The PUT request body — mirrors EditableMonitorConfig.ts.
+
+    `stewards` here is `Array<string>` (steward user IDs to set), NOT
+    `Array<MonitorStewardUserResponse>` — EditableMonitorConfig.ts and
+    MonitorStatusResponse.ts type the same field name differently: the
+    request takes IDs, the response returns hydrated user objects. Without
+    both fields, a PUT that sets stewardship or the inherit-from-system flag
+    would validate, return 200, and silently drop that data — Pydantic's
+    default extra="ignore" would not even complain.
+    """
 
     name: str
     key: Optional[str] = None
@@ -92,6 +131,8 @@ class EditableMonitorConfig(BaseModel):
     execution_frequency: Optional[MonitorFrequency] = None
     enabled: Optional[bool] = None
     shared_config_id: Optional[str] = None
+    stewards: List[str] = Field(default_factory=list)
+    inherit_system_stewards: Optional[bool] = None
 
     @field_validator("key")
     @classmethod
