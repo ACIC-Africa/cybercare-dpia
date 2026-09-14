@@ -16,15 +16,15 @@
 # exist, since PrivacyCare's own tables reference Fides data by id (see
 # src/fides/api/privacycare/ropa.py) without owning it.
 #
-# Why separate rather than folded into Fides' own migration step:
-# PrivacyCare keeps its own chain so it can never tangle with or
-# autogenerate a drop of a Fides table (the "never edit Ethyca files" rule
-# was retired 2026-09-13 — see
+# Why separate rather than folded into Fides' own migration step: PrivacyCare
+# keeps its own chain so it can never tangle with or autogenerate a drop of a
+# Fides table (the "never edit Ethyca files" rule was retired 2026-09-13 — see
 # docs/superpowers/specs/2026-09-13-privacycare-kenyan-taxonomy-design.md;
-# separation here is about safety, not permission). This script is the
-# operational seam that makes that possible: run it as its own step,
-# right after Fides' migrations, in whatever deploy/entrypoint sequence
-# stands up the app.
+# separation here is about safety, not permission) (see
+# src/fides/api/privacycare/models.py's module docstring). This script is the
+# operational seam that makes that possible: run it as its own step, right
+# after Fides' migrations, in whatever deploy/entrypoint sequence stands up
+# the app.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
