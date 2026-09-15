@@ -10,7 +10,8 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.models.privacy_request import ProvidedIdentity
+from fides.api.models.masking_secret import MaskingSecret
+from fides.api.models.privacy_request import PrivacyRequest, ProvidedIdentity
 from fides.api.privacycare.dsr.delegation import (
     DELEGATING_RIGHTS,
     delegate,
@@ -169,3 +170,131 @@ def test_ensuring_policies_twice_is_idempotent(db):
         sqlalchemy.text("SELECT count(*) FROM policy WHERE key LIKE 'privacycare_kenya_%'")
     ).scalar()
     assert count == len(DELEGATING_RIGHTS)
+
+
+# --- Minor finding (final review): the actual D-DSR-7 claim is "two
+# deadline numbers on two screens agree" — the tests above only ever
+# checked policy.execution_timeframe (the CONFIGURED clock), never the
+# per-request due_date Fides actually stamps onto the created
+# privacyrequest (the clock a reviewer looking at THAT screen would see).
+
+
+def test_the_delegated_privacyrequests_due_date_matches_the_registers_deadline(db):
+    ensure_kenyan_policies(db)
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+
+    fides_id = delegate(db, request_id=request_id)
+
+    row = get_request(db, request_id)
+    due_date = db.execute(
+        sqlalchemy.text("SELECT due_date FROM privacyrequest WHERE id = :id"),
+        {"id": fides_id},
+    ).scalar()
+    assert due_date == row["deadline_at"], (
+        "privacyrequest.due_date and privacycare_dsr_request.deadline_at "
+        "disagree — the actual D-DSR-7 claim"
+    )
+
+
+# --- I2 (final review, D-DSR-7). The timeline table is deliberately
+# editable without a deploy; the moment it changes, an already-provisioned
+# Fides policy keeps its old execution_timeframe until ensure_kenyan_
+# policies() is re-run. delegate() must refuse rather than silently create
+# a request whose due_date would be computed against a clock the register
+# no longer agrees with.
+#
+# The pre-existing "two deadlines agree" test above calls
+# ensure_kenyan_policies() one line above its own assertion — it can only
+# ever prove the writer works, never that anything downstream notices when
+# the two numbers have since drifted apart. This test edits the timeline
+# row AFTER provisioning, which the writer above never does.
+
+
+def test_delegate_refuses_when_the_policy_and_timeline_have_drifted(db):
+    ensure_kenyan_policies(db)
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+
+    # Simulate Carol answering an open question with a new number (or an
+    # operator hand-editing the policy in Ethyca's admin UI has the
+    # identical effect) — the policy was provisioned at 7 days and has not
+    # been re-synced.
+    db.execute(
+        sqlalchemy.text(
+            'UPDATE privacycare_dsr_timeline SET days = 3 WHERE "right" = \'access\''
+        )
+    )
+
+    with pytest.raises(ValueError) as caught:
+        delegate(db, request_id=request_id)
+
+    # Both numbers, named, per the spec: an operator must be able to tell
+    # which side is stale without opening two other screens.
+    assert "7" in str(caught.value)
+    assert "3" in str(caught.value)
+    # And nothing was created on the stale clock.
+    assert get_request(db, request_id)["fides_privacy_request_id"] is None
+
+
+def test_delegate_does_not_refuse_an_already_delegated_request_on_later_drift(db):
+    # The drift check must gate CREATING a new request on a stale clock, not
+    # every call — a request already delegated on whatever clock was live at
+    # the time must keep returning its existing id, not start failing
+    # because the timeline moved on afterward.
+    ensure_kenyan_policies(db)
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+    first = delegate(db, request_id=request_id)
+
+    db.execute(
+        sqlalchemy.text(
+            'UPDATE privacycare_dsr_timeline SET days = 3 WHERE "right" = \'access\''
+        )
+    )
+
+    second = delegate(db, request_id=request_id)
+    assert second == first
+
+
+# --- I1 (partial, per ruling). Masking secrets ARE persisted; queueing,
+# cache_data, error-notification dispatch and duplicate detection are
+# deliberately NOT — see delegate()'s own docstring for the full reasoning.
+# Without persisted secrets, an erasure request would log "Secret type ...
+# expected but was not present" once it is eventually approved and run.
+
+
+def test_delegating_an_erasure_request_persists_masking_secrets(db):
+    ensure_kenyan_policies(db)
+    request_id = record_request(db, right="erasure", subject_identifier=_subject())
+
+    fides_id = delegate(db, request_id=request_id)
+
+    secrets = (
+        db.query(MaskingSecret).filter_by(privacy_request_id=fides_id).all()
+    )
+    assert secrets, (
+        "no masking secrets were persisted for the delegated erasure "
+        "request — the eventual run would log 'Secret type ... expected "
+        "but was not present'"
+    )
+
+
+# --- I5 (narrowed, per ruling). delegate() must not hand back a STORED
+# fides_privacy_request_id whose privacyrequest row has since vanished
+# (e.g. deleted directly against Ethyca's own tables) as though it were
+# still live — it must create a fresh one instead.
+
+
+def test_delegate_creates_a_fresh_request_when_the_stored_one_has_vanished(db):
+    ensure_kenyan_policies(db)
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+    first = delegate(db, request_id=request_id)
+
+    db.execute(
+        sqlalchemy.text("DELETE FROM privacyrequest WHERE id = :id"), {"id": first}
+    )
+
+    second = delegate(db, request_id=request_id)
+
+    assert second is not None
+    assert second != first, "a vanished id must not be returned as though live"
+    assert PrivacyRequest.get_by(db, field="id", value=second) is not None
+    assert get_request(db, request_id)["fides_privacy_request_id"] == second

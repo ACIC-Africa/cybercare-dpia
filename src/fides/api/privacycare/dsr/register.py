@@ -37,9 +37,9 @@ _BUSINESS_PROCESS_OWNER_SQL = sqlalchemy.text(
 _INSERT_REQUEST_SQL = sqlalchemy.text(
     "INSERT INTO privacycare_dsr_request "
     '(id, "right", subject_identifier, received_at, deadline_at, owner_email, '
-    'owner_source) '
+    'owner_source, business_process_id) '
     "VALUES (:id, :right, :subject_identifier, :received_at, :deadline_at, "
-    ":owner_email, :owner_source)"
+    ":owner_email, :owner_source, :business_process_id)"
 )
 
 _DECIDE_SQL = sqlalchemy.text(
@@ -55,7 +55,7 @@ _NOTIFY_SQL = sqlalchemy.text(
 
 _REQUEST_COLUMNS = (
     'id, "right", subject_identifier, received_at, deadline_at, owner_email, '
-    "owner_source, "
+    "owner_source, business_process_id, "
     "status, outcome, outcome_grounds, decided_by, decided_at, subject_notified_at, "
     "fides_privacy_request_id, created_at, updated_at"
 )
@@ -96,6 +96,7 @@ def record_request(
     subject_identifier: str,
     owner_email: Optional[str] = None,
     business_process_id: Optional[str] = None,
+    received_at: Optional[datetime] = None,
 ) -> str:
     """Looks the timeline up once, computes and STORES the deadline, resolves
     the owner, inserts, and returns the new id. Never commits.
@@ -106,6 +107,15 @@ def record_request(
     database, not a policy choice). Conflating them would silently accept
     requests against a broken deployment. So when it comes back None we check
     the row's *presence* directly before trusting that as "unclocked".
+
+    I4 (final review). `received_at` defaults to now, but a caller may pass
+    the date the obligation actually arrived — paper/email intake is the
+    Kenyan reality, and a request entered three days after it was received
+    must not silently grant the controller three extra days by starting the
+    clock at data-entry time instead. Rejecting a future date is the
+    caller's job (api/dsr.py's route), not this core function's — this
+    layer trusts what it is given and simply stops defaulting once
+    something is.
     """
     days = timeline_days(db, right)
     if days is None:
@@ -116,7 +126,8 @@ def record_request(
                 "run seed_timelines() before recording requests"
             )
 
-    received_at = datetime.now(timezone.utc)
+    if received_at is None:
+        received_at = datetime.now(timezone.utc)
     deadline_at = deadline_for(received_at, days)
     resolution = resolve_owner(
         db, explicit=owner_email, business_process_id=business_process_id
@@ -140,6 +151,13 @@ def record_request(
             # "explicit" for a business_process- or configured_dpo-derived
             # owner, which is a false claim, not merely an imprecise one).
             "owner_source": resolution.source,
+            # Persisted, not merely consulted-and-discarded (final review
+            # minor finding): resolve_owner already reads this to resolve
+            # the owner when owner_source="business_process", but the row
+            # itself used to drop which process that was — half of an
+            # auditable claim. NULL whenever no business_process_id was
+            # given, regardless of which owner_source was resolved.
+            "business_process_id": business_process_id,
         },
     )
     return request_id

@@ -4,6 +4,7 @@ The clock is the product. A deadline displayed confidently and wrongly is worse
 than no deadline, because a DPO will trust it — so the timeline values are
 asserted against the converted corpus, not against a number someone typed twice.
 """
+import os
 import pathlib
 import re
 from datetime import datetime, timedelta, timezone
@@ -20,8 +21,18 @@ from fides.api.privacycare.dsr.timelines import (
 )
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
+# Final review minor finding: this used to be a hardcoded absolute path into
+# a SIBLING repo (LightHouse), not this one — every checkout of
+# cybercare-dpia that doesn't happen to sit next to a LightHouse checkout at
+# exactly this path failed every test in this file. Overridable by an
+# environment variable, defaulting to the path that happened to be true on
+# the machine this was written on, so CI or a different checkout layout can
+# point it at wherever their copy of the converted brief actually lives.
 BRIEF = pathlib.Path(
-    "/home/shikoli/Cybota/LightHouse/docs/DataPrivacyManenos/converted/01_brief_for_dpia.md"
+    os.environ.get(
+        "PRIVACYCARE_DSR_BRIEF_PATH",
+        "/home/shikoli/Cybota/LightHouse/docs/DataPrivacyManenos/converted/01_brief_for_dpia.md",
+    )
 )
 
 

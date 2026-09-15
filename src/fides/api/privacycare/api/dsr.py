@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
+from fides.api.models.privacy_request import PrivacyRequest
 from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.dsr_schemas import (
     DsrDecisionRequest,
@@ -53,13 +54,26 @@ from fides.api.privacycare.dsr.register import (
 )
 from fides.common.scope_registry import PRIVACYCARE_DSR_READ, PRIVACYCARE_DSR_UPDATE
 
+# Sentinel for fides_privacy_request_status (I5): never a real
+# PrivacyRequestStatus value, so a caller can tell "we looked, and there is
+# nothing there any more" apart from an ordinary in-progress status.
+_VANISHED = "vanished"
+
 
 def _days_left(deadline_at: Optional[datetime]) -> Optional[int]:
     """None when the right is unclocked (objection, OQ-PRIVACY-02) — never
-    0, which would misread as "due today" rather than "no deadline exists
-    at all". Rounded UP (ceil), not truncated: a deadline six hours from now
-    is still meaningfully "1 day left" to the person reading this, not "0
-    days left" the way naive `timedelta.days` truncation would report it.
+    0 for either "due today" or "just breached"; those are different facts
+    and must read differently.
+
+    A deadline still in the future is rounded UP (ceil): six hours from now
+    is still meaningfully "1 day left", not "0 days left" the way naive
+    `timedelta.days` truncation would report it. A deadline already passed
+    is rounded DOWN (floor) instead, so it always comes back negative —
+    `ceil` alone would round anything between "just now" and "23h59m ago"
+    UP to 0, which misreads as "due today" exactly the confusion this
+    function's docstring exists to avoid (Fides' own PrivacyRequest.
+    days_left does whole-date subtraction for the same reason and goes
+    negative once due_date has passed).
     """
     if deadline_at is None:
         return None
@@ -68,11 +82,33 @@ def _days_left(deadline_at: Optional[datetime]) -> Optional[int]:
         if deadline_at.tzinfo is not None
         else deadline_at.replace(tzinfo=timezone.utc)
     )
-    remaining = aware_deadline - datetime.now(timezone.utc)
-    return math.ceil(remaining.total_seconds() / 86400)
+    remaining_days = (
+        aware_deadline - datetime.now(timezone.utc)
+    ).total_seconds() / 86400
+    if remaining_days >= 0:
+        return math.ceil(remaining_days)
+    return math.floor(remaining_days)
 
 
-def _response_from_row(row: dict) -> DsrRequestResponse:
+def _fides_privacy_request_status(
+    db: Session, fides_privacy_request_id: Optional[str]
+) -> Optional[str]:
+    """I5 (narrowed, per ruling): read the delegated request's CURRENT
+    status live, rather than mirroring/storing it. None when the right
+    never delegated at all (id is None). `_VANISHED` — never a real status
+    string — when an id IS stored but no `privacyrequest` row answers to it
+    any more, so the caller never mistakes a dead id for a live one."""
+    if fides_privacy_request_id is None:
+        return None
+    privacy_request = PrivacyRequest.get_by(
+        db, field="id", value=fides_privacy_request_id
+    )
+    if privacy_request is None:
+        return _VANISHED
+    return privacy_request.status.value
+
+
+def _response_from_row(row: dict, db: Session) -> DsrRequestResponse:
     return DsrRequestResponse(
         id=row["id"],
         right=row["right"],
@@ -84,6 +120,7 @@ def _response_from_row(row: dict) -> DsrRequestResponse:
         # DsrRequestResponse's own docstring for why a read-time guess was
         # a defect (fix round 1 on task 4) rather than a simplification.
         owner_source=row["owner_source"],
+        business_process_id=row["business_process_id"],
         status=row["status"],
         outcome=row["outcome"],
         outcome_grounds=row["outcome_grounds"],
@@ -91,6 +128,9 @@ def _response_from_row(row: dict) -> DsrRequestResponse:
         decided_at=row["decided_at"],
         subject_notified_at=row["subject_notified_at"],
         fides_privacy_request_id=row["fides_privacy_request_id"],
+        fides_privacy_request_status=_fides_privacy_request_status(
+            db, row["fides_privacy_request_id"]
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         days_left=_days_left(row["deadline_at"]),
@@ -119,10 +159,35 @@ def create_dsr_request(
 
     record_request rejects an unrecognised right (or an unseeded database);
     delegate rejects a delegating right whose Fides policy was never
-    provisioned (ensure_kenyan_policies not yet run). Both raise ValueError,
-    both map to the same 400 here, carrying the core's own message — the
-    core decided what's wrong, this route only reports it.
+    provisioned (ensure_kenyan_policies not yet run) or whose provisioned
+    policy has drifted from the current Kenyan clock (D-DSR-7, I2). Both
+    raise ValueError, both map to the same 400 here, carrying the core's
+    own message — the core decided what's wrong, this route only reports
+    it. Either failure rolls back record_request's own insert: a register
+    row must never exist for a right that failed to delegate.
+
+    I4: `received_at` is validated here, not in the core — a future date
+    would grant the controller more time than the statute allows, so it is
+    rejected with 400 before record_request ever sees it. Naive datetimes
+    (no tzinfo) are treated as UTC for the comparison, matching how they
+    are stored.
     """
+    if request.received_at is not None:
+        aware_received_at = (
+            request.received_at
+            if request.received_at.tzinfo is not None
+            else request.received_at.replace(tzinfo=timezone.utc)
+        )
+        if aware_received_at > datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=status_codes.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"received_at ({request.received_at.isoformat()}) is in "
+                    "the future — a DSR cannot have been received before it "
+                    "was reported"
+                ),
+            )
+
     created_by = _created_by_from_client(client)
     try:
         request_id = record_request(
@@ -131,6 +196,7 @@ def create_dsr_request(
             subject_identifier=request.subject_identifier,
             owner_email=request.owner_email,
             business_process_id=request.business_process_id,
+            received_at=request.received_at,
         )
         delegate(db, request_id=request_id)
     except ValueError as exc:
@@ -145,7 +211,7 @@ def create_dsr_request(
         request.right,
         created_by,
     )
-    return _response_from_row(get_request(db, request_id))
+    return _response_from_row(get_request(db, request_id), db)
 
 
 @privacycare_dsr_router.get(
@@ -167,7 +233,7 @@ def list_dsr_requests(
     the whole register. See register.list_requests for the ordering
     (oldest first)."""
     rows = list_requests(db, right=right, status=status)
-    return paginate([_response_from_row(row) for row in rows], params)
+    return paginate([_response_from_row(row, db) for row in rows], params)
 
 
 @privacycare_dsr_router.get(
@@ -189,7 +255,7 @@ def get_dsr_request(
         raise HTTPException(
             status_code=status_codes.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
-    return _response_from_row(row)
+    return _response_from_row(row, db)
 
 
 @privacycare_dsr_router.post(
@@ -253,7 +319,7 @@ def record_dsr_decision(
         request.outcome,
         decided_by,
     )
-    return _response_from_row(get_request(db, request_id))
+    return _response_from_row(get_request(db, request_id), db)
 
 
 @privacycare_dsr_router.post(
@@ -279,6 +345,14 @@ def record_dsr_notification(
     against overwriting an existing subject_notified_at, so this route
     checks for one first and answers 409 Conflict rather than silently
     replacing a recorded notification date with a new one.
+
+    I6 (final review, guard only): record_notification also had no guard
+    against recording a notification before any decision existed at all.
+    subject_notified_at means "when the subject was told the outcome" — a
+    notification with no outcome is a false regulatory record, not merely
+    a premature one, so this route requires status == "closed" first and
+    answers 409 Conflict otherwise. An amend/correction route for fixing a
+    wrong value is deliberately out of scope for this wave.
     """
     try:
         row = get_request(db, request_id)
@@ -286,6 +360,15 @@ def record_dsr_notification(
         raise HTTPException(
             status_code=status_codes.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
+    if row["status"] != "closed":
+        raise HTTPException(
+            status_code=status_codes.HTTP_409_CONFLICT,
+            detail=(
+                f"request {request_id} has not been decided yet (status "
+                f"{row['status']!r}); refusing to record a notification "
+                "with no decision behind it"
+            ),
+        )
     if row["subject_notified_at"] is not None:
         raise HTTPException(
             status_code=status_codes.HTTP_409_CONFLICT,
@@ -310,4 +393,4 @@ def record_dsr_notification(
         request_id,
         notified_by,
     )
-    return _response_from_row(get_request(db, request_id))
+    return _response_from_row(get_request(db, request_id), db)

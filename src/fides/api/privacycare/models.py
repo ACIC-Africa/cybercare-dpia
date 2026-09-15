@@ -234,6 +234,19 @@ dsr_request_table = Table(
     # it cannot satisfy. There are zero live rows to backfill as of this
     # migration.
     Column("owner_source", String(32)),
+    # Final review wave (minor finding): resolve_owner already reads this to
+    # resolve owner_source="business_process", but the row used to drop
+    # WHICH process that was, leaving half of an auditable claim unrecorded.
+    # Nullable, no FK cascade (SET NULL): a deleted business process must
+    # not delete or block deleting a regulatory record — the record
+    # survives with the link cleared. See migration
+    # c9a1e5b7d3f2_dsr_business_process_id.
+    Column(
+        "business_process_id",
+        String(255),
+        ForeignKey("privacycare_business_process.id", ondelete="SET NULL"),
+        index=True,
+    ),
     Column("status", String(32), nullable=False, server_default="open"),
     Column("outcome", String(32)),
     Column("outcome_grounds", Text),

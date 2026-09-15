@@ -5,7 +5,7 @@ of truth (spec D-DSR-1). Two of the six rights move no data and so have no Fides
 side at all; the register is the whole record for them.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy
@@ -254,3 +254,67 @@ def test_an_unassigned_owner_source_is_stored_on_the_row(db, monkeypatch):
     row = get_request(db, request_id)
     assert row["owner_email"] is None
     assert row["owner_source"] == "unassigned"
+
+
+# --- Minor finding (final review): business_process_id was read by
+# resolve_owner to derive owner_source="business_process" and then
+# discarded — the row recorded THAT the owner came from a process without
+# being able to say WHICH one, half of an auditable claim.
+
+
+def test_the_business_process_id_itself_is_persisted_on_the_row(db):
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, owner_email) "
+            "VALUES (:id, :name, :email)"
+        ),
+        {"id": process_id, "name": "Fuel card applications", "email": "ops@customer.co.ke"},
+    )
+
+    request_id = record_request(
+        db,
+        right="restriction",
+        subject_identifier=_subject(),
+        business_process_id=process_id,
+    )
+
+    row = get_request(db, request_id)
+    assert row["business_process_id"] == process_id
+
+
+def test_no_business_process_id_is_recorded_as_null(db):
+    request_id = record_request(
+        db, right="restriction", subject_identifier=_subject(), owner_email="dpo@customer.co.ke"
+    )
+    row = get_request(db, request_id)
+    assert row["business_process_id"] is None
+
+
+# --- I4 (final review). received_at defaults to now, but the Kenyan reality
+# is paper/email intake: the statutory clock must start on the date the
+# obligation actually arrived, not the date someone typed it into the
+# register. Rejecting a future date is the HTTP route's job (test_api_dsr.py);
+# this proves the core honours a legitimate past date rather than silently
+# overriding it with "now".
+
+
+def test_a_past_received_at_is_honoured_and_moves_the_deadline_back(db):
+    received = datetime.now(timezone.utc) - timedelta(days=3)
+
+    request_id = record_request(
+        db, right="access", subject_identifier=_subject(), received_at=received
+    )
+
+    row = get_request(db, request_id)
+    assert row["received_at"] == received
+    assert row["deadline_at"] == received + timedelta(days=7)
+
+
+def test_an_omitted_received_at_still_defaults_to_now(db):
+    before = datetime.now(timezone.utc)
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+    after = datetime.now(timezone.utc)
+
+    row = get_request(db, request_id)
+    assert before <= row["received_at"] <= after

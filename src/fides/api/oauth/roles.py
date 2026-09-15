@@ -40,7 +40,6 @@ from fides.common.scope_registry import (
     PRIVACY_REQUEST_UPLOAD_DATA,
     PRIVACY_REQUEST_VIEW_DATA,
     PRIVACYCARE_DISCOVERY_READ,
-    PRIVACYCARE_DSR_READ,
     RULE_READ,
     SAAS_CONFIG_READ,
     SCOPE_READ,
@@ -131,13 +130,19 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # database — stays with Owner and Contributor, which derive from the
     # full registry.
     PRIVACYCARE_DISCOVERY_READ,
-    # PrivacyCare (spec 2026-09-13 D-DSR-1): same split as
-    # PRIVACYCARE_DISCOVERY_READ above — a Viewer may see the DSR register,
-    # recording a decision or a notification against it is a controller act
-    # and stays with Owner and Contributor, which derive
-    # PRIVACYCARE_DSR_UPDATE from the full registry rather than listing it
-    # here.
-    PRIVACYCARE_DSR_READ,
+    # PrivacyCare (spec 2026-09-15 D-DSR-1, I3 final review): PRIVACYCARE_
+    # DSR_READ is intentionally NOT here, unlike PRIVACYCARE_DISCOVERY_READ
+    # above. Three lines above this block upstream itself omits
+    # USER_PERMISSION_READ and PRIVACY_REQUEST_READ from Viewer for the
+    # same reason: a privacy request carries data-subject identities. The
+    # DSR register carries the same kind of sensitive content — a stored
+    # subject_identifier, and a free-text outcome_grounds that is often the
+    # DPO's own reasoning for refusing a Kenyan data subject's request — so
+    # the same logic applies to it, not to the discovery-monitor precedent
+    # this scope was originally modelled on (a monitor carries no subject
+    # identities at all). PENDING A PRODUCT RULING: Owner and Contributor
+    # still get PRIVACYCARE_DSR_READ (and PRIVACYCARE_DSR_UPDATE) by
+    # registry derivation below — this omission narrows only Viewer.
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,

@@ -140,8 +140,67 @@ def delegate(db: Session, *, request_id: str) -> Optional[str]:
 
     Order matters: the non-delegating check runs before anything touches
     `privacyrequest` (restriction/objection must never produce a row there,
-    not even transiently), and the idempotency check runs before creating a
-    new one (delegating twice must return the same id, not a second row).
+    not even transiently); the idempotency check runs before the D-DSR-7
+    drift check and before creating a new one (delegating twice must return
+    the same id, not a second row, and must not be blocked by a clock that
+    has since moved — the request was already delegated on whatever clock
+    was live at the time).
+
+    I5 (final review): a *stored* fides_privacy_request_id whose
+    `privacyrequest` row has since vanished (deleted directly against
+    Ethyca's own tables, out from under the register) is not "existing" for
+    idempotency purposes — returning it would hand back a dead id as though
+    it were live. That case falls through to create a fresh one, the same
+    as a row that was never delegated at all.
+
+    I2 (final review, D-DSR-7). The timeline table is deliberately editable
+    without a deploy (see timelines.py's own docstring), so the moment an
+    SME answers an open question with a new number, new register rows get
+    the new clock while any already-provisioned Fides policy keeps the old
+    one until ensure_kenyan_policies() is re-run — and a hand-edit of the
+    policy in Ethyca's admin UI has the identical effect. Before creating a
+    request on a policy, this checks the policy's persisted
+    execution_timeframe against the *current* timeline_days(db, right) and
+    refuses rather than silently delegating onto a stale clock. The message
+    names both numbers so an operator can tell at a glance which side is
+    wrong and that re-running ensure_kenyan_policies() is the fix.
+
+    I1 (partial, per ruling). This function creates the PrivacyRequest and
+    persists its identity and masking secrets, but deliberately skips most
+    of Fides' own post-create contract for a privacy request (see
+    drp_endpoints.py's create_drp_privacy_request, lines ~112-135, for the
+    reference shape this is compared against):
+
+      - `cache_data` (writes the identity/encryption keys Fides' own
+        execution pipeline reads out of Redis) — skipped because nothing
+        here queues the request for execution (see below), so there is
+        nothing yet for that cache to serve.
+      - error-notification dispatch (`check_and_dispatch_error_notifications`)
+        — skipped for the same reason: it exists to flush a backlog of
+        already-failed requests' error emails, and nothing here has run the
+        pipeline that could produce one.
+      - `queue_privacy_request` — DELIBERATELY NOT CALLED, and this is not
+        an oversight. Queueing executes a DSR against the customer's
+        connected systems; this register exists precisely so a human
+        decides and records an outcome (see register.record_decision)
+        before that happens. Auto-queuing on create would remove the
+        approval step a regulatory tool of this kind must have. The
+        created PrivacyRequest sits in Fides' own pending-approval state
+        until a person (outside this module, via Fides' normal review
+        flow) approves it for execution.
+      - duplicate detection (`check_for_duplicates`,
+        fides.api.service.privacy_request.duplication_detection) — skipped
+        because it exists to de-duplicate *unqueued* submissions competing
+        for the same execution slot; with nothing queued here, there is
+        nothing yet to de-duplicate against.
+
+    masking secrets ARE persisted (`policy.generate_masking_secrets()` +
+    `privacy_request.persist_masking_secrets`), unlike the four skips
+    above: without them an erasure request, when it eventually IS queued
+    and runs, logs "Secret type ... expected but was not present" — the
+    Kenyan erasure rule copies the shipped hmac masking strategy
+    (ensure_kenyan_policies), which needs them, and they cost nothing to
+    generate now versus at approval time.
     """
     row = get_request(db, request_id)
     policy_key = kenyan_policy_key(row["right"])
@@ -149,13 +208,24 @@ def delegate(db: Session, *, request_id: str) -> Optional[str]:
         return None
 
     existing = row["fides_privacy_request_id"]
-    if existing:
+    if existing and PrivacyRequest.get_by(db, field="id", value=existing) is not None:
         return existing
 
     policy = Policy.get_by(db, field="key", value=policy_key)
     if policy is None:
         raise ValueError(
             f"no Fides policy {policy_key!r} — call ensure_kenyan_policies() "
+            "before delegating"
+        )
+
+    current_days = timeline_days(db, row["right"])
+    if policy.execution_timeframe != current_days:
+        raise ValueError(
+            f"D-DSR-7 drift: Fides policy {policy_key!r} still carries "
+            f"execution_timeframe={policy.execution_timeframe!r}, but the "
+            f"Kenyan timeline for {row['right']!r} is now "
+            f"{current_days!r} days — refusing to delegate on a stale "
+            "clock; re-run ensure_kenyan_policies() to sync the policy "
             "before delegating"
         )
 
@@ -177,6 +247,11 @@ def delegate(db: Session, *, request_id: str) -> Optional[str]:
     privacy_request.persist_identity(
         db=db, identity=Identity(external_id=row["subject_identifier"])
     )
+
+    # See the module-level docstring above: masking secrets are the one
+    # piece of Fides' post-create contract this function does replicate.
+    if masking_secrets := policy.generate_masking_secrets():
+        privacy_request.persist_masking_secrets(masking_secrets)
 
     db.execute(
         _SET_FIDES_REQUEST_ID_SQL,

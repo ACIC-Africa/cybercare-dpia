@@ -477,3 +477,62 @@ def test_allowlist_entries_all_carry_a_reason():
     for name, entry in ALLOWLIST.items():
         assert entry.get("reason"), f"{name}: allowlist entry has no reason"
         assert "ts_name" in entry, f"{name}: allowlist entry has no ts_name key"
+
+
+# --- Minor finding (final review): nothing exercised the DSR routes'
+# declared scopes. Every DSR route is called directly as a plain function
+# with a SimpleNamespace client in test_api_dsr.py, so FastAPI's own
+# Security(...) dependency resolution never runs there — swapping
+# PRIVACYCARE_DSR_UPDATE for _READ on the create route (or vice versa on a
+# read route) would pass that whole file. This module already walks
+# app.routes for the response-model checks above, so the same walk proves
+# each DSR route actually declares the scope it is supposed to.
+
+
+def test_every_dsr_route_requires_its_declared_scope():
+    from fides.api.oauth.utils import verify_oauth_client
+    from fides.common.scope_registry import (
+        PRIVACYCARE_DSR_READ,
+        PRIVACYCARE_DSR_UPDATE,
+    )
+
+    # GET reads the register; every other verb here (POST create/decision/
+    # notification) is a controller act and must require UPDATE.
+    expected_scope_by_method = {
+        "GET": PRIVACYCARE_DSR_READ,
+        "POST": PRIVACYCARE_DSR_UPDATE,
+    }
+
+    routes = [
+        r for r in app.routes if getattr(r, "path", "").startswith(PRIVACYCARE_DSR_PREFIX)
+    ]
+    assert routes, "no DSR routes found — registration itself is broken"
+
+    checked = 0
+    for route in routes:
+        methods = getattr(route, "methods", None) or set()
+        for method in methods - {"HEAD", "OPTIONS"}:
+            expected_scope = expected_scope_by_method[method]
+            deps = getattr(route, "dependencies", [])
+            oauth_deps = [
+                d for d in deps if getattr(d, "dependency", None) is verify_oauth_client
+            ]
+            assert oauth_deps, (
+                f"{route.path} [{method}] has no verify_oauth_client "
+                "dependency — unauthenticated"
+            )
+            assert any(
+                expected_scope in getattr(d, "scopes", []) for d in oauth_deps
+            ), (
+                f"{route.path} [{method}] does not require {expected_scope!r}"
+            )
+            checked += 1
+
+    # Guard: five logical routes (create, list, get-one, decision,
+    # notification), one HTTP method apiece — but fides.api.util.api_router.
+    # APIRouter registers BOTH a trailing-slash and a no-trailing-slash
+    # variant of every path as separate route objects, so app.routes holds
+    # two entries per logical route: 5 * 2 = 10. If this drops far below 10
+    # the assertions above would have passed vacuously over an empty (or
+    # halved) walk.
+    assert checked == 10, f"expected 10 DSR route/method pairs, checked {checked}"

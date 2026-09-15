@@ -6,6 +6,7 @@ risk colliding with a real Plus endpoint later. Same reasoning api/processes.py
 records for the business-process routes.
 """
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from fides.api.oauth.roles import ROLES_TO_SCOPES_MAPPING, VIEWER
 from fides.api.privacycare.api.dsr import (
+    _days_left,
     create_dsr_request,
     get_dsr_request,
     list_dsr_requests,
@@ -28,6 +30,7 @@ from fides.api.privacycare.api.dsr_schemas import (
 )
 from fides.api.privacycare.dsr.delegation import ensure_kenyan_policies
 from fides.api.privacycare.dsr.register import get_request as _core_get_request
+from fides.api.privacycare.dsr.register import list_requests as _core_list_requests
 from fides.api.privacycare.dsr.timelines import seed_timelines
 from fides.common.scope_registry import PRIVACYCARE_DSR_READ, PRIVACYCARE_DSR_UPDATE
 from tests.privacycare.test_api_assessments import _fake_client
@@ -148,10 +151,19 @@ def test_the_list_filters_by_right_and_returns_the_page_envelope(db):
     assert all(item.right == "access" for item in page.items)
 
 
-def test_viewer_reads_but_cannot_record(db):
-    # Same split as privacycare_discovery: recording an obligation's outcome is
-    # a controller act, not a reading act.
-    assert PRIVACYCARE_DSR_READ in ROLES_TO_SCOPES_MAPPING[VIEWER]
+def test_viewer_has_neither_dsr_scope(db):
+    # I3 (final review, 2026-09-15): this used to assert Viewer had
+    # PRIVACYCARE_DSR_READ (mirroring privacycare_discovery's split) and
+    # only lacked PRIVACYCARE_DSR_UPDATE. That precedent doesn't hold here:
+    # the register carries subject_identifier and free-text
+    # outcome_grounds (a DPO's own reasoning for refusing a data subject),
+    # the same kind of sensitive content upstream already excludes from
+    # Viewer for PRIVACY_REQUEST_READ (see roles.py's own comment, three
+    # lines above viewer_scopes' definition) — a discovery monitor, by
+    # contrast, carries no subject identities at all. PENDING A PRODUCT
+    # RULING (roles.py): Viewer gets neither DSR scope for now; Owner and
+    # Contributor are unaffected (registry derivation, not this list).
+    assert PRIVACYCARE_DSR_READ not in ROLES_TO_SCOPES_MAPPING[VIEWER]
     assert PRIVACYCARE_DSR_UPDATE not in ROLES_TO_SCOPES_MAPPING[VIEWER]
 
 
@@ -279,3 +291,134 @@ def test_owner_source_round_trips_through_the_api_for_all_four_sources(db, monke
         unassigned.owner_source
         == _core_get_request(db, unassigned.id)["owner_source"]
     )
+
+
+# --- I4 (final review). received_at is optional on DsrRequestCreate,
+# defaults to now, and a future value is rejected — paper/email intake is
+# the Kenyan reality, and a request recorded days after it arrived must not
+# silently grant the controller extra time by starting the clock at
+# data-entry time instead.
+
+
+def test_a_past_received_at_is_honoured_by_the_route(db):
+    received = datetime.now(timezone.utc) - timedelta(days=2)
+
+    created = _create(db, "access", received_at=received)
+
+    assert created.received_at == received
+    assert created.deadline_at == received + timedelta(days=7)
+
+
+def test_a_future_received_at_is_rejected_with_400(db):
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    with pytest.raises(HTTPException) as caught:
+        create_dsr_request(
+            DsrRequestCreate(
+                right="access", subject_identifier=_subject(), received_at=future
+            ),
+            db=db,
+            client=_fake_client("carol@serianu.com"),
+        )
+    assert caught.value.status_code == 400
+    assert "future" in caught.value.detail.lower()
+
+
+# --- I5 (narrowed, per ruling). The response must answer "where is this
+# obligation" on one screen: a nullable fides_privacy_request_status field,
+# read live, and an explicit "vanished" report when the stored id no longer
+# resolves rather than presenting a dead id as though it were live.
+
+
+def test_the_response_reports_the_delegated_requests_live_status(db):
+    created = _create(db, "access")
+    assert created.fides_privacy_request_id is not None
+    assert created.fides_privacy_request_status == "pending"
+
+
+def test_a_non_delegating_right_reports_no_status(db):
+    created = _create(db, "restriction")
+    assert created.fides_privacy_request_id is None
+    assert created.fides_privacy_request_status is None
+
+
+def test_a_vanished_delegated_request_is_reported_explicitly(db):
+    created = _create(db, "access")
+    db.execute(
+        sqlalchemy.text("DELETE FROM privacyrequest WHERE id = :id"),
+        {"id": created.fides_privacy_request_id},
+    )
+
+    reread = get_dsr_request(created.id, db=db, client=_fake_client("carol@serianu.com"))
+
+    assert reread.fides_privacy_request_id == created.fides_privacy_request_id
+    assert reread.fides_privacy_request_status == "vanished"
+
+
+# --- I6 (final review, guard only). subject_notified_at means "when the
+# subject was told the outcome" — recording it before any decision exists
+# is a false regulatory record, not merely a premature one.
+
+
+def test_notifying_a_request_that_has_not_been_decided_is_409(db):
+    created = _create(db, "restriction")
+
+    with pytest.raises(HTTPException) as caught:
+        record_dsr_notification(
+            created.id, DsrNotificationRequest(), db=db, client=_fake_client("carol@serianu.com")
+        )
+
+    assert caught.value.status_code == 409
+    assert "not been decided" in caught.value.detail.lower()
+    reread = get_dsr_request(created.id, db=db, client=_fake_client("carol@serianu.com"))
+    assert reread.subject_notified_at is None
+
+
+# --- Minor finding (final review): no test drove the one branch left in
+# create_dsr_request that can fail AFTER record_request has already
+# written a row (delegate() raising). The reviewer notes this branch
+# currently governs ALL delegating-right traffic in the live deployment and
+# had zero coverage. Simulated with a D-DSR-7 drift (same mechanism as
+# test_dsr_delegation.py's own drift test) rather than deleting any
+# FK-referenced row, so nothing about this test depends on a schema detail
+# elsewhere.
+
+
+def test_record_succeeds_delegate_fails_the_register_insert_is_rolled_back(db):
+    db.execute(
+        sqlalchemy.text(
+            'UPDATE privacycare_dsr_timeline SET days = 3 WHERE "right" = \'erasure\''
+        )
+    )
+    subject = _subject()
+
+    with pytest.raises(HTTPException) as caught:
+        create_dsr_request(
+            DsrRequestCreate(right="erasure", subject_identifier=subject),
+            db=db,
+            client=_fake_client("carol@serianu.com"),
+        )
+
+    assert caught.value.status_code == 400
+    remaining = [r for r in _core_list_requests(db) if r["subject_identifier"] == subject]
+    assert remaining == [], "the register insert must not survive a failed delegate()"
+
+
+# --- Minor finding (final review): _days_left used math.ceil unconditionally,
+# so a deadline breached by less than 24 hours reported 0 — read by the UI
+# as "due today" rather than "already overdue". The alerting plan will
+# threshold on this value, so a passed deadline must come back negative.
+
+
+def test_days_left_is_negative_once_the_deadline_has_passed():
+    just_passed = datetime.now(timezone.utc) - timedelta(hours=1)
+    assert _days_left(just_passed) < 0
+
+
+def test_days_left_is_still_due_today_or_positive_before_the_deadline():
+    six_hours_out = datetime.now(timezone.utc) + timedelta(hours=6)
+    assert _days_left(six_hours_out) >= 1
+
+
+def test_days_left_is_none_when_unclocked():
+    assert _days_left(None) is None

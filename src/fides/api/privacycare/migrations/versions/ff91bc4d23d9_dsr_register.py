@@ -8,9 +8,12 @@ Creates privacycare_dsr_timeline and privacycare_dsr_request — both new
 PrivacyCare-owned tables in PrivacyCare's own Alembic chain. Touches no
 Ethyca table: no ALTER, no FK, and no reference lands on ctl_systems,
 privacydeclaration, privacyrequest, or policy. privacycare_dsr_request.
-fides_privacy_request_id is a bare, unindexed-by-FK string column for the
-same reason process_declaration_table.privacy_declaration_id carries no
-FK — that row's lifecycle belongs to upstream Fides.
+fides_privacy_request_id carries NO FOREIGN KEY (it IS indexed, by
+ix_privacycare_dsr_request_fides_privacy_request_id below, for lookup
+speed) — same reason process_declaration_table.privacy_declaration_id
+carries no FK: that row's lifecycle belongs to upstream Fides, and a
+migration in PrivacyCare's own chain may not constrain against a table it
+does not own.
 """
 import sqlalchemy as sa
 from alembic import op
