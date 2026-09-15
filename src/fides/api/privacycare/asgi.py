@@ -40,4 +40,21 @@ register()
 # guarantee and stopped being true once more test files were added).
 from fides.api.main import app  # noqa: E402  (import order is the point)
 
+# Registering plan 15's daily DSR deadline alert job (dsr/alert_job.py)
+# happens down here, AFTER `app` exists, for the same reason `register()`
+# had to run BEFORE `app` exists above: this is `app.add_event_handler`,
+# which needs the object it is a method on. There is no earlier point in
+# this file where `app` is available to call it on — trying to hoist this
+# above the `fides.api.main` import would be a plain NameError, not the
+# silent, only-discovered-in-the-field failure the routes above are
+# protected against. Kept in this file rather than inside
+# `initiate_scheduled_dsr_alerts` itself so the *whole* startup sequence —
+# routes first, then this — reads in one place, matching the app-import
+# ordering this file already exists to protect.
+from fides.api.privacycare.dsr.alert_job import (  # noqa: E402
+    initiate_scheduled_dsr_alerts,
+)
+
+app.add_event_handler("startup", initiate_scheduled_dsr_alerts)
+
 __all__ = ["app"]

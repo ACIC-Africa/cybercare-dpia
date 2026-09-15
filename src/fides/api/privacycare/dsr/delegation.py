@@ -13,7 +13,7 @@
 # uniqueness) that a hand-written INSERT would silently skip. The one piece
 # of raw SQL here is the UPDATE back onto our own privacycare_dsr_request
 # table, which is ours to write to directly.
-from typing import Optional
+from typing import Iterable, Optional
 
 import sqlalchemy
 from sqlalchemy.orm import Session
@@ -258,3 +258,51 @@ def delegate(db: Session, *, request_id: str) -> Optional[str]:
         {"fides_id": privacy_request.id, "id": request_id},
     )
     return privacy_request.id
+
+
+# --- Plan 15, Ruling P1 (batched delegated-status read). Written ONCE here
+# because two call sites need the identical technique: the deadline alert
+# job (plan 15 Task 3, dsr/alert_job.py) must not decide "discharged" by
+# loading one whole PrivacyRequest per register row, and the DSR list
+# endpoint (plan 15 Task 4, api/dsr.py, residual R2) has the same N+1 today
+# via `_fides_privacy_request_status` called per row. Two independent
+# implementations of the same `id, status` batch query would be duplication
+# of a logic block — this module already owns the seam to Fides'
+# `PrivacyRequest` (see the module docstring above), so the query lives
+# here rather than in register.py (which never imports Fides' ORM) or
+# alert_job.py (which would then have to duplicate it for Task 4).
+
+
+def fides_request_statuses(
+    db: Session, fides_privacy_request_ids: Iterable[str]
+) -> dict[str, str]:
+    """One query for however many delegated ids the caller is holding, not
+    one per row. `PrivacyRequest` carries multi-megabyte columns
+    (`_filtered_final_upload`, `access_result_urls`) — the exact reason
+    Fides ships `query_without_large_columns` for its own list views — so a
+    caller that resolved each id with a full-entity `PrivacyRequest.get_by`
+    in a loop would be an OOM waiting for volume. This selects only
+    `id, status`.
+
+    Returns id -> status string, one entry per id that still resolves to a
+    live `privacyrequest` row. An id absent from the returned mapping has
+    VANISHED — its row no longer exists — and every caller must treat that
+    as a data-integrity problem, never as "no status" and never as
+    "not delegated" (which is a different fact: an id that was never
+    stored at all, never passed in here to begin with).
+
+    Ids are deduplicated and falsy ones (None, "") dropped before the query
+    runs; an empty result short-circuits without touching the database at
+    all — an `IN ()` clause is wasted work at best and invalid SQL on some
+    drivers at worst.
+    """
+    ids = {fides_id for fides_id in fides_privacy_request_ids if fides_id}
+    if not ids:
+        return {}
+
+    rows = (
+        db.query(PrivacyRequest.id, PrivacyRequest.status)
+        .filter(PrivacyRequest.id.in_(ids))
+        .all()
+    )
+    return {row.id: row.status.value for row in rows}
