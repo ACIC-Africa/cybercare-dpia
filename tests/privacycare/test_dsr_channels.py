@@ -4,6 +4,7 @@ Meta credentials exist (spec D-AL-1).
 No test here performs real network I/O: TeamsWebhookChannel takes an injectable
 transport precisely so the suite can prove its behaviour without a webhook.
 """
+import traceback
 from datetime import datetime, timezone
 
 import pytest
@@ -58,10 +59,14 @@ def test_a_non_2xx_response_raises_so_the_alert_is_not_recorded_as_sent():
 
 
 def test_a_transport_failure_propagates():
+    # It must still raise -- the caller only records the alert as sent on a
+    # normal return -- but not as the original OSError: see the leak test
+    # below for why the transport exception is caught and replaced rather
+    # than let through unchanged.
     def fake_post(url, **kwargs):
         raise OSError("connection refused")
 
-    with pytest.raises(OSError):
+    with pytest.raises(RuntimeError):
         TeamsWebhookChannel(WEBHOOK, post=fake_post).send(_alert())
 
 
@@ -74,6 +79,34 @@ def test_the_webhook_url_never_appears_in_an_error_message():
     with pytest.raises(RuntimeError) as caught:
         TeamsWebhookChannel(WEBHOOK, post=fake_post).send(_alert())
     assert "super-secret-token" not in str(caught.value)
+
+
+def test_the_webhook_url_never_appears_in_a_transport_exception_message():
+    # requests/urllib3 characteristically embed the request URL -- webhook
+    # token included -- in a connection error's own message (e.g.
+    # "HTTPSConnectionPool(...): Max retries exceeded with url:
+    # /webhookb2/<guid>/IncomingWebhook/<token>/..."). Simulate that shape
+    # directly: the fake transport's exception message itself carries the
+    # fixture token, and send() must not let it escape verbatim.
+    def fake_post(url, **kwargs):
+        raise ConnectionError(f"Max retries exceeded with url: {url}")
+
+    with pytest.raises(RuntimeError) as caught:
+        TeamsWebhookChannel(WEBHOOK, post=fake_post).send(_alert())
+    assert "super-secret-token" not in str(caught.value)
+    assert "super-secret-token" not in repr(caught.value)
+    # `__cause__` is what a chained `raise ... from <exc>` would surface in
+    # a rendered traceback; `from None` (the fix) keeps it unset so the
+    # original ConnectionError's message never rides along into whatever
+    # renders this exception (logger.exception, an error tracker, a bare
+    # traceback.format_exception).
+    assert caught.value.__cause__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__
+        )
+    )
+    assert "super-secret-token" not in rendered
 
 
 def test_the_null_channel_sends_nothing_and_the_logging_channel_records():

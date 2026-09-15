@@ -1,9 +1,13 @@
 # Delivery only: who gets told an alert is due, and how the message leaves
-# the process. Nothing here decides *whether* an alert is due (dsr/alerts.py
-# owns that) and nothing here talks to the database (the caller in the
-# scheduler task owns the ledger write, and only after send() returns
-# normally — see the module docstring in dsr/alerts.py on why a swallowed
-# failure would silently mute the channel forever).
+# the process. Whether an alert is due at all is decided elsewhere (see
+# dsr/alerts.py, which this module does not import); this module owns no
+# database access. Context worth knowing even though this file never touches
+# it: the caller (the scheduler task in plan 15's Task 3) is expected to
+# record the ledger row only after send() returns normally, because a
+# swallowed failure here would let that ledger's unique constraint suppress
+# every future retry — which is exactly why send() must raise rather than
+# absorb a failure, including a transport failure (see TeamsWebhookChannel
+# below).
 #
 # Teams first; WhatsApp drops in later against the same AlertChannel
 # protocol once Meta credentials exist (spec D-AL-1). We do not reach for
@@ -36,7 +40,12 @@ class Alert:
     """What a human needs to act, and nothing a channel would need to look
     up itself. `recipient` is the already-resolved destination (an email,
     a Teams user, whatever the future WhatsApp number is) — resolving who
-    that is is not this module's job, only delivering to them is."""
+    that is is not this module's job, only delivering to them is.
+    `TeamsWebhookChannel` does not read it: a Teams incoming webhook is
+    scoped to a channel, not addressed to a person, so there is nothing for
+    it to do with a recipient. It stays on the dataclass because
+    `LoggingChannel` reports it and a future user-addressable channel
+    (WhatsApp) will need it."""
 
     dsr_request_id: str
     right: str
@@ -51,10 +60,10 @@ class AlertChannel(Protocol):
     name: str
 
     def send(self, alert: Alert) -> None:
-        """Raises on any failure to deliver. The caller (the scheduler task
-        in plan 15's Task 3) records the ledger row only when this returns
-        normally — see dsr/alerts.py's D-AL-7 note on why a swallowed
-        failure would suppress every future retry."""
+        """Raises on any failure to deliver — including a transport failure,
+        not only a rejected request — so that a caller which only records
+        the alert as sent on normal return never mistakes "could not even
+        reach the endpoint" for delivery."""
         ...
 
 
@@ -115,10 +124,16 @@ class TeamsWebhookChannel:
     reaching the network.
 
     The webhook URL is a bearer credential: anyone holding it can post into
-    the customer's Teams channel. It is captured in a closure over `send`
-    and deliberately never interpolated into a log line or an exception
-    message — only the response's status code is, which identifies nothing
-    about the destination.
+    the customer's Teams channel, so it must never reach a log line or an
+    exception message. The non-2xx path only ever interpolates the response
+    status code. The transport-failure path needs its own guard: `requests`
+    characteristically embeds the request URL — webhook token included — in
+    the string form of a connection error (`HTTPSConnectionPool(...):
+    Max retries exceeded with url: /webhookb2/<guid>/IncomingWebhook/<token>/
+    ...`), so `send` catches the raw transport exception and re-raises
+    carrying only its type name, never its message and never itself as
+    `__cause__` (chaining would put the leaking text straight back into the
+    traceback).
     """
 
     name = _TEAMS
@@ -133,12 +148,20 @@ class TeamsWebhookChannel:
         self._post = post or requests.post
 
     def send(self, alert: Alert) -> None:
-        # A transport exception (timeout, DNS failure, refused connection)
-        # is allowed to propagate as-is rather than being caught and
-        # rewrapped: it comes from `requests`, not from us, and it never
-        # carries the URL — only the caller's own logging decides what, if
-        # anything, gets recorded about it.
-        response = self._post(self._webhook_url, json=_teams_card(alert))
+        # A transport exception (timeout, DNS failure, refused connection,
+        # TLS error) is caught here rather than left to propagate: with the
+        # real transport, `requests`/urllib3 render the target URL — webhook
+        # token included — into the exception's own message, so letting it
+        # through unchanged would write the credential into whatever catches
+        # it upstream (logs, an error tracker, a traceback). Only the
+        # exception's type name survives; `from None` stops the original
+        # (and its message) from riding along as `__cause__`.
+        try:
+            response = self._post(self._webhook_url, json=_teams_card(alert))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Teams webhook transport failure: {type(exc).__name__}"
+            ) from None
 
         if response.status_code < 200 or response.status_code >= 300:
             # Named: the status code, never the URL. A caller triaging a
