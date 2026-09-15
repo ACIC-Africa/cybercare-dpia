@@ -404,6 +404,42 @@ def test_record_succeeds_delegate_fails_the_register_insert_is_rolled_back(db):
     assert remaining == [], "the register insert must not survive a failed delegate()"
 
 
+# --- Task 4, R1 probe (parked residual from plan 14's final review). The
+# create route's docstring claimed a register row can never survive a right
+# that failed to delegate. The drift test above cannot exercise that claim:
+# it raises ValueError from delegate() BEFORE delegate() ever reaches
+# PrivacyRequest.create — the first ORM write. This test forces a failure
+# AFTER that write instead, by breaking persist_identity, to find out
+# whether the claim actually holds. Per controller ruling, this is a probe:
+# read what it reports rather than assuming the answer.
+
+
+def test_a_failure_after_the_fides_request_is_created(db, monkeypatch):
+    monkeypatch.setattr(
+        "fides.api.models.privacy_request.privacy_request.PrivacyRequest.persist_identity",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    subject = _subject()
+
+    with pytest.raises(Exception):
+        create_dsr_request(
+            DsrRequestCreate(right="access", subject_identifier=subject),
+            db=db,
+            client=_fake_client("carol@serianu.com"),
+        )
+
+    orphaned = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_dsr_request WHERE subject_identifier = :s"
+        ),
+        {"s": subject},
+    ).scalar()
+    assert orphaned == 0, (
+        "a register row survived a failed delegation — the create route's "
+        "docstring claims this cannot happen"
+    )
+
+
 # --- Minor finding (final review): _days_left used math.ceil unconditionally,
 # so a deadline breached by less than 24 hours reported 0 — read by the UI
 # as "due today" rather than "already overdue". The alerting plan will

@@ -46,6 +46,7 @@ from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_dsr_router
 from fides.api.privacycare.dsr.delegation import delegate
 from fides.api.privacycare.dsr.register import (
+    discard_request,
     get_request,
     list_requests,
     record_decision,
@@ -161,10 +162,29 @@ def create_dsr_request(
     delegate rejects a delegating right whose Fides policy was never
     provisioned (ensure_kenyan_policies not yet run) or whose provisioned
     policy has drifted from the current Kenyan clock (D-DSR-7, I2). Both
-    raise ValueError, both map to the same 400 here, carrying the core's
-    own message — the core decided what's wrong, this route only reports
-    it. Either failure rolls back record_request's own insert: a register
-    row must never exist for a right that failed to delegate.
+    raise ValueError before delegate() ever reaches Fides' own
+    PrivacyRequest.create, so for both, db.rollback() still has
+    record_request's insert to undo and a register row never survives.
+
+    R1 (task 4, final review of plan 14): those two ValueErrors are not the
+    only way delegate() can fail. Once it reaches PrivacyRequest.create,
+    Fides' own persist_obj (add/commit/refresh) commits unconditionally —
+    a real commit, not ours to skip — which makes record_request's
+    still-pending insert durable right along with it. A later failure in
+    that same delegate() call (persist_identity, persist_masking_secrets)
+    therefore has nothing left for db.rollback() to undo: the register row
+    is already on disk. This route closes that gap itself rather than
+    leaving it open — any exception from delegate() other than the two
+    ValueErrors above triggers a compensating discard_request() of the row
+    record_request just inserted, committed explicitly (rollback alone
+    cannot undo what Fides has already committed), before the original
+    exception is re-raised. So: a register row still never survives a
+    failed delegation, for every reachable failure — but the Fides-side
+    privacyrequest this route created (and its identity/masking rows) is
+    NOT cleaned up by that compensation; it is left as Fides' own orphaned,
+    unqueued, pending-approval request (see delegate()'s own docstring on
+    why a created-but-unapproved PrivacyRequest is otherwise a normal
+    resting state).
 
     I4: `received_at` is validated here, not in the core — a future date
     would grant the controller more time than the statute allows, so it is
@@ -189,6 +209,7 @@ def create_dsr_request(
             )
 
     created_by = _created_by_from_client(client)
+    request_id: Optional[str] = None
     try:
         request_id = record_request(
             db,
@@ -204,6 +225,26 @@ def create_dsr_request(
         raise HTTPException(
             status_code=status_codes.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    except Exception:
+        # R1: delegate() failed past the point where Fides' own commit may
+        # already have made record_request's insert durable — db.rollback()
+        # alone has nothing left to undo THAT insert (it lives in a prior,
+        # already-closed transaction). But this exception may itself be a
+        # database-level error (not our probe's plain RuntimeError), which
+        # leaves the CURRENT transaction aborted — any further statement,
+        # including our own compensating DELETE, would be rejected until
+        # that is cleared. Rolling back first is always safe here: it only
+        # ever discards whatever this (still-open, separate) transaction
+        # was in the middle of, never the prior commit. Compensate
+        # explicitly so the register row still never survives a failed
+        # delegation, then let the original exception continue (this route
+        # makes no claim about what kind of failure it was, only that the
+        # register stays clean).
+        if request_id is not None:
+            db.rollback()
+            discard_request(db, request_id)
+            db.commit()
+        raise
     db.commit()
     logger.info(
         "PrivacyCare DSR request {} ({}) recorded by {}",

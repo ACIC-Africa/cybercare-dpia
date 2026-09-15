@@ -53,6 +53,8 @@ _NOTIFY_SQL = sqlalchemy.text(
     "UPDATE privacycare_dsr_request SET subject_notified_at = :notified_at WHERE id = :id"
 )
 
+_DISCARD_SQL = sqlalchemy.text("DELETE FROM privacycare_dsr_request WHERE id = :id")
+
 _REQUEST_COLUMNS = (
     'id, "right", subject_identifier, received_at, deadline_at, owner_email, '
     "owner_source, business_process_id, "
@@ -201,6 +203,21 @@ def record_notification(db: Session, *, request_id: str, notified_at: datetime) 
     )
     if result.rowcount == 0:
         raise ValueError(f"no such request: {request_id!r}")
+
+
+def discard_request(db: Session, request_id: str) -> None:
+    """Compensating delete for `record_request`'s own insert (api/dsr.py's
+    create route, R1). Exists because Fides' `PrivacyRequest.create` commits
+    unconditionally: once `delegate()` reaches it, that commit can make
+    `record_request`'s still-pending insert durable too, along with
+    whatever it was itself in the middle of — at which point `db.rollback()`
+    has nothing left to undo. This is the caller's explicit undo for that
+    case. Never commits (same rule as every other function here) — the
+    caller decides the session boundary, same as `record_request` above.
+    Idempotent: deleting an id that no longer exists (or never did) is a
+    silent no-op, not an error, since the caller will have hit this from an
+    `except` block chasing an id it does not know the fate of."""
+    db.execute(_DISCARD_SQL, {"id": request_id})
 
 
 def get_request(db: Session, request_id: str) -> dict:
