@@ -186,6 +186,34 @@ def test_the_list_reads_delegated_statuses_in_one_query_not_one_per_row(db):
     assert len(seen) == 1, f"expected one batched read, got {len(seen)}"
 
 
+# --- Fix round 2 on task 4. The R2 report claimed the "vanished" sentinel
+# behaviour was preserved through the batched read, but the only test that
+# actually drives "vanished" (test_a_vanished_delegated_request_is_reported_
+# explicitly, above) goes through the single-row get_dsr_request path, not
+# list_dsr_requests' batched fides_request_statuses call. That claim rested
+# on inspection of the shared _fides_privacy_request_status function, not
+# on a test exercising the list endpoint's own code path. This closes that
+# gap directly rather than just noting it.
+
+
+def test_the_list_reports_vanished_for_a_deleted_delegated_request(db):
+    live = _create(db, "access")
+    vanished = _create(db, "access")
+    db.execute(
+        sqlalchemy.text("DELETE FROM privacyrequest WHERE id = :id"),
+        {"id": vanished.fides_privacy_request_id},
+    )
+
+    page = list_dsr_requests(
+        right="access", status=None, params=Params(page=1, size=50),
+        db=db, client=_fake_client("carol@serianu.com"),
+    )
+
+    by_id = {item.id: item.fides_privacy_request_status for item in page.items}
+    assert by_id[live.id] == "pending"
+    assert by_id[vanished.id] == "vanished"
+
+
 def test_viewer_has_neither_dsr_scope(db):
     # I3 (final review, 2026-09-15): this used to assert Viewer had
     # PRIVACYCARE_DSR_READ (mirroring privacycare_discovery's split) and
@@ -502,6 +530,13 @@ def test_a_failure_after_the_fides_request_is_created(db, monkeypatch):
 
 
 def test_a_failed_delegation_actually_calls_discard_request(db, monkeypatch):
+    # Fix round 2, Finding 1: the earlier version of this test only
+    # counted calls (asserted len(calls) == 1) without checking the
+    # argument — it would have passed even if the route handed
+    # discard_request a wrong or stale id. This version captures the id
+    # record_request actually minted (by spying on record_request itself,
+    # the only source of that id) and asserts discard_request was called
+    # with THAT id, not merely once.
     subject = _subject()
     monkeypatch.setattr(
         "fides.api.models.privacy_request.privacy_request.PrivacyRequest.persist_identity",
@@ -510,14 +545,24 @@ def test_a_failed_delegation_actually_calls_discard_request(db, monkeypatch):
 
     import fides.api.privacycare.api.dsr as dsr_module
 
+    real_record_request = dsr_module.record_request
+    minted_ids: list = []
+
+    def _record_request_spy(*args, **kwargs):
+        minted_id = real_record_request(*args, **kwargs)
+        minted_ids.append(minted_id)
+        return minted_id
+
+    monkeypatch.setattr(dsr_module, "record_request", _record_request_spy)
+
     real_discard_request = dsr_module.discard_request
     calls: list = []
 
-    def _spy(db_arg, request_id_arg):
+    def _discard_spy(db_arg, request_id_arg):
         calls.append(request_id_arg)
         return real_discard_request(db_arg, request_id_arg)
 
-    monkeypatch.setattr(dsr_module, "discard_request", _spy)
+    monkeypatch.setattr(dsr_module, "discard_request", _discard_spy)
 
     with pytest.raises(Exception):
         create_dsr_request(
@@ -526,7 +571,11 @@ def test_a_failed_delegation_actually_calls_discard_request(db, monkeypatch):
             client=_fake_client("carol@serianu.com"),
         )
 
-    assert len(calls) == 1, f"expected discard_request called once, got {len(calls)}"
+    assert len(minted_ids) == 1, f"expected record_request called once, got {len(minted_ids)}"
+    assert calls == minted_ids, (
+        f"expected discard_request called once with the minted id "
+        f"{minted_ids}, got {calls}"
+    )
 
 
 # --- Fix round 1 on task 4, Finding 3. If the compensation itself fails

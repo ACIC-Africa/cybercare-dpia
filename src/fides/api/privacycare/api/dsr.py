@@ -192,20 +192,22 @@ def create_dsr_request(
     ValueErrors above triggers a compensating discard_request() of the row
     record_request just inserted, committed explicitly (rollback alone
     cannot undo what Fides has already committed), before the original
-    exception is re-raised. So: a register row still never survives a
-    failed delegation for every reachable delegate() failure — but two
-    narrower things remain true and are NOT claimed here: (1) the
-    Fides-side privacyrequest this route created (and its identity/masking
-    rows) is not cleaned up by that compensation; it is left as Fides' own
-    orphaned, unqueued, pending-approval request (see delegate()'s own
-    docstring on why a created-but-unapproved PrivacyRequest is otherwise a
-    normal resting state), and (2) fix round 1, Finding 3: if the
-    compensation ITSELF fails (discard_request or the commit after it
-    raising, e.g. on a dropped connection) the register row is left in
-    place too — that failure is only logged, never raised, so the client
-    still sees delegate()'s original error rather than the cleanup's, but
-    a future reader must check the logs rather than assume a compensation
-    failure would surface any other way.
+    exception is re-raised.
+
+    The true shape of the guarantee, stated once rather than asserted and
+    then narrowed: a register row survives a failed delegate() call ONLY
+    if the compensation itself also fails (discard_request or the commit
+    after it raising — e.g. a dropped connection). That case is caught,
+    logged via logger.exception (search "compensating discard_request
+    failed" to find it), and never raised — the client still sees
+    delegate()'s original error, not the cleanup's, but a future reader
+    must check the logs rather than assume a compensation failure would
+    surface any other way. Separately, and always, regardless of whether
+    the compensation succeeds: the Fides-side privacyrequest this route
+    created (and its identity/masking rows) is never cleaned up by it; it
+    is left as Fides' own orphaned, unqueued, pending-approval request
+    (see delegate()'s own docstring on why a created-but-unapproved
+    PrivacyRequest is otherwise a normal resting state).
 
     I4: `received_at` is validated here, not in the core — a future date
     would grant the controller more time than the statute allows, so it is
