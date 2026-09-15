@@ -221,3 +221,29 @@ def test_rows_from_another_monitor_are_untouched(db):
     assert still_there != "removal", (
         "reconciling one monitor marked another monitor's resources removed"
     )
+
+
+def test_a_resurrected_resource_is_marked_addition_not_unchanged(db):
+    # Found -> gone -> found again. A urn that comes back after being marked
+    # `removal` must become `addition` again and be counted in `added` --
+    # NOT silently folded into `unchanged`, which would assert (falsely, in
+    # a record of processing) that nothing changed about a resource that in
+    # fact vanished and reappeared between two scans.
+    found = [
+        FoundResource(urn="m1.db.public", name="db", resource_type="Database",
+                      parent_urn=None, field_type=None),
+        FoundResource(urn="m1.db.public.orders", name="orders", resource_type="Table",
+                      parent_urn="m1.db.public", field_type=None),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    # orders goes away.
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=[found[0]])
+    assert _diff_status(db, "m1.db.public.orders") == "removal"
+
+    # orders is back.
+    summary = reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert _diff_status(db, "m1.db.public.orders") == "addition"
+    assert summary.added == 1  # orders, resurrected
+    assert summary.unchanged == 1  # just the database

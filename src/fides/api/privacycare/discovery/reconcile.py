@@ -16,20 +16,33 @@ There is no DELETE statement anywhere below.
 D-EX-6: a re-scan that finds the same resources again must not touch their
 existing row at all -- not even to "confirm" it -- so a consultant can
 re-run discovery as often as they like without generating diff noise. Only
-two things ever change a stored row here: (1) it is new, so it gets
-INSERTed as 'addition', or (2) it went missing from this scan and its
-monitor's row gets UPDATEd to 'removal'. Everything else is left alone.
+three things ever change a stored row here: (1) it is new, so it gets
+INSERTed as 'addition'; (2) it went missing from this scan and its
+monitor's row gets UPDATEd to 'removal'; or (3) it was marked 'removal' by
+an earlier scan and is back, so it gets UPDATEd back to 'addition' (see
+Resurrection below). Everything else is left alone.
 
-Scoping (the controller's ruling on this task): the "went missing" query
-below is filtered on `monitor_config_id`. Without that filter, the FIRST
-run of a brand-new monitor would compare its (small) found list against
-*every* stagedresource row from *every* monitor and mark them all
-`removal` -- a fleet of false "this table disappeared" findings, for
-tables the new monitor never looked at. Every query in this module that
-decides what has gone carries that filter.
+Resurrection: a urn that was staged, went missing (diff_status='removal'),
+and is found again is not "unchanged" -- unchanged would silently assert
+that nothing happened to it, which is false: it vanished and came back
+between two scans. It is treated as an addition relative to the last
+observed state (counted in `added`, not `unchanged`) precisely so a
+reviewer looks at it again rather than have it slide back into the
+furniture unnoticed. Left un-handled, a resurrected urn would stay on
+`removal` forever -- D-EX-5 exists to stop us destroying evidence that a
+resource *was* there; this exists to stop us asserting a resource is gone
+when this very scan proves it is not.
+
+Scoping (the controller's ruling on this task): every query below that
+decides what has gone, what already exists, or what has come back is
+filtered on `monitor_config_id`. Without that filter, the FIRST run of a
+brand-new monitor would compare its (small) found list against *every*
+stagedresource row from *every* monitor and mark them all `removal` -- a
+fleet of false "this table disappeared" findings, for tables the new
+monitor never looked at.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import sqlalchemy
 from sqlalchemy.orm import Session
@@ -48,8 +61,20 @@ from fides.api.privacycare.discovery.walk import FoundResource
 # ("stagedresource"[:3]), the same way core.py's own
 # create_all_staged_resource_ancestor_links hand-spells "srl_" for
 # stagedresourceancestor rather than relying on the ORM default.
+#
+# Scoped by monitor_config_id even though `urn` is already globally unique
+# (walk.py's D-EX-2 contract puts monitor_key in every urn's first
+# segment), so this query's correctness does not rest on a contract owned
+# by a different module. Selects diff_status too, not just urn -- that is
+# what lets reconcile() tell an unchanged match from a resurrected one
+# (see the module docstring's Resurrection paragraph) without a second
+# round-trip.
 _FIND_EXISTING_SQL = sqlalchemy.text(
-    "SELECT urn FROM stagedresource WHERE urn = ANY(CAST(:urns AS text[]))"
+    """
+    SELECT urn, diff_status FROM stagedresource
+    WHERE monitor_config_id = :monitor_config_id
+      AND urn = ANY(CAST(:urns AS text[]))
+    """
 )
 
 _INSERT_SQL = sqlalchemy.text(
@@ -80,9 +105,32 @@ _MARK_REMOVED_SQL = sqlalchemy.text(
     """
 )
 
+# See the module docstring's Resurrection paragraph. Scoped by
+# monitor_config_id for the same reason as every other query here that
+# decides a urn's fate, though the urn list itself is already known-exact
+# (computed in Python from _FIND_EXISTING_SQL's own result), so this is a
+# second scoping belt on top of a first, not the only one.
+_RESURRECT_SQL = sqlalchemy.text(
+    """
+    UPDATE stagedresource
+    SET diff_status = :addition
+    WHERE monitor_config_id = :monitor_config_id
+      AND urn = ANY(CAST(:urns AS text[]))
+    """
+)
+
 
 @dataclass(frozen=True)
 class ReconcileSummary:
+    """The result of one reconcile() call. All three fields are counts of
+    what changed THIS call, not running totals -- `removed`, in particular,
+    is "urns newly marked removal by this call", not "urns currently
+    removal under this monitor" (a urn already sitting on `removal` from an
+    earlier call is left untouched and is not recounted). `added` includes
+    both brand-new urns and resurrected ones -- see reconcile.py's module
+    docstring, Resurrection.
+    """
+
     added: int
     removed: int
     unchanged: int
@@ -109,10 +157,26 @@ def reconcile(
     """
     found_urns = [resource.urn for resource in found]
 
-    existing_urns: Set[str] = set(
-        db.execute(_FIND_EXISTING_SQL, {"urns": found_urns}).scalars().all()
-    )
-    new_resources = [resource for resource in found if resource.urn not in existing_urns]
+    # diff_status per already-staged urn (scoped to this monitor) is what
+    # separates three cases below: absent entirely (new), present but on
+    # 'removal' (resurrected), present and anything else (unchanged, and
+    # therefore untouched -- D-EX-6).
+    existing_status: Dict[str, Optional[str]] = {
+        row.urn: row.diff_status
+        for row in db.execute(
+            _FIND_EXISTING_SQL,
+            {"monitor_config_id": monitor_config_id, "urns": found_urns},
+        )
+    }
+
+    new_resources = [
+        resource for resource in found if resource.urn not in existing_status
+    ]
+    resurrected_urns = [
+        resource.urn
+        for resource in found
+        if existing_status.get(resource.urn) == DiffStatus.REMOVAL.value
+    ]
 
     if new_resources:
         db.execute(
@@ -130,6 +194,16 @@ def reconcile(
             ],
         )
 
+    if resurrected_urns:
+        db.execute(
+            _RESURRECT_SQL,
+            {
+                "monitor_config_id": monitor_config_id,
+                "urns": resurrected_urns,
+                "addition": DiffStatus.ADDITION.value,
+            },
+        )
+
     removed_urns = (
         db.execute(
             _MARK_REMOVED_SQL,
@@ -145,10 +219,11 @@ def reconcile(
 
     _write_ancestry(db, found)
 
+    added = len(new_resources) + len(resurrected_urns)
     return ReconcileSummary(
-        added=len(new_resources),
+        added=added,
         removed=len(removed_urns),
-        unchanged=len(found) - len(new_resources),
+        unchanged=len(found) - added,
     )
 
 
