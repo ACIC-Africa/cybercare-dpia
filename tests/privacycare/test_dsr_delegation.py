@@ -10,6 +10,7 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+from fides.api.models.privacy_request import ProvidedIdentity
 from fides.api.privacycare.dsr.delegation import (
     DELEGATING_RIGHTS,
     delegate,
@@ -44,12 +45,21 @@ def test_only_the_data_moving_rights_delegate(db):
 
 def test_the_two_deadlines_agree_for_every_delegating_right(db):
     # D-DSR-7. A DPO who sees 7 days on one screen and 45 on another will trust
-    # neither. This is the test that keeps them from disagreeing.
-    written = ensure_kenyan_policies(db)
+    # neither. This is the test that keeps them from disagreeing — so it must
+    # read the number Ethyca's own screens actually display (policy.execution_timeframe
+    # as persisted), not the value ensure_kenyan_policies merely computed in memory.
+    ensure_kenyan_policies(db)
 
     for right, policy_key in DELEGATING_RIGHTS.items():
-        assert written[policy_key] == timeline_days(db, right), (
-            f"{right}: the Fides policy timeframe and the Kenyan clock disagree"
+        stored_timeframe = db.execute(
+            sqlalchemy.text(
+                "SELECT execution_timeframe FROM policy WHERE key = :key"
+            ),
+            {"key": policy_key},
+        ).scalar()
+        assert stored_timeframe == timeline_days(db, right), (
+            f"{right}: the persisted Fides policy timeframe and the Kenyan "
+            "clock disagree"
         )
 
 
@@ -77,6 +87,25 @@ def test_delegating_an_access_request_creates_a_fides_privacy_request(db):
         {"id": fides_id},
     ).scalar()
     assert exists == 1
+
+
+def test_delegating_attaches_the_registers_subject_identifier_as_the_fides_identity(db):
+    # D-DSR-7's failure mode isn't only the deadline: a delegated request
+    # with no identity attached would show up on Ethyca's own screens as
+    # belonging to nobody. persist_identity must actually run.
+    ensure_kenyan_policies(db)
+    subject = _subject()
+    request_id = record_request(db, right="access", subject_identifier=subject)
+
+    fides_id = delegate(db, request_id=request_id)
+
+    identity = (
+        db.query(ProvidedIdentity)
+        .filter_by(privacy_request_id=fides_id, field_name="external_id")
+        .first()
+    )
+    assert identity is not None, "no identity was persisted for the delegated request"
+    assert identity.encrypted_value["value"] == subject
 
 
 def test_restriction_creates_no_fides_request_at_all(db):

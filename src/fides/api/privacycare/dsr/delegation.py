@@ -23,6 +23,7 @@ from fides.api.models.privacy_request import PrivacyRequest
 from fides.api.privacycare.dsr.register import get_request
 from fides.api.privacycare.dsr.timelines import timeline_days
 from fides.api.schemas.policy import ActionType
+from fides.api.schemas.redis_cache import Identity
 from fides.api.service.privacy_request.request_service import (
     build_required_privacy_request_kwargs,
 )
@@ -166,6 +167,15 @@ def delegate(db: Session, *, request_id: str) -> Optional[str]:
             verification_required=False,
             authenticated=True,
         ),
+    )
+    # The register's subject_identifier carries no guaranteed format (email,
+    # phone, national ID, ...), so it goes on as external_id rather than
+    # Identity.email — assuming email shape would raise on anything that
+    # isn't one. persist_identity writes a plain ProvidedIdentity row via
+    # this same session; it does not touch Redis (that's cache_identity, a
+    # different method, which nothing here has asked for).
+    privacy_request.persist_identity(
+        db=db, identity=Identity(external_id=row["subject_identifier"])
     )
 
     db.execute(
