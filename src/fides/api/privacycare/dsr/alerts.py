@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from math import ceil
 from typing import Optional
 
+import psycopg2.errorcodes  # type: ignore[import-untyped]
 import sqlalchemy
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -23,6 +24,19 @@ from sqlalchemy.orm import Session
 APPROACHING = "approaching"
 BREACHED = "breached"
 _VALID_KINDS = (APPROACHING, BREACHED)
+
+# The one constraint record_alert is entitled to swallow. Matched on both
+# the Postgres error code AND the constraint's own name (fix round 1,
+# Finding 1): `IntegrityError` also covers a foreign-key violation
+# (dsr_request_id pointing at nothing) or a not-null violation, and
+# `record_alert`'s False return is documented to mean exactly one thing —
+# "already sent". Returning it for "never sent, insert was simply invalid"
+# is the worst available lie for this function: the caller records nothing,
+# the (still-absent) unique row lets a retry through, and the ledger
+# implicitly asserts an owner was told when they were not — precisely what
+# the ledger exists to prevent. Everything that is not this exact
+# constraint re-raises.
+_ONCE_ONLY_CONSTRAINT = "uq_privacycare_dsr_alert"
 
 _INSERT_ALERT_SQL = sqlalchemy.text(
     "INSERT INTO privacycare_dsr_alert "
@@ -103,6 +117,12 @@ def record_alert(
     including whatever the caller already wrote earlier in the same run (or,
     under the test fixture, the seeded timelines and register rows the test
     depends on). Only the failed insert needs undoing.
+
+    Only the once-only unique constraint is caught (see
+    _ONCE_ONLY_CONSTRAINT above) — a foreign-key or not-null violation
+    (e.g. a `dsr_request_id` that does not exist) is a caller bug, not a
+    "already sent" state, and re-raises rather than returning a False that
+    would misreport it.
     """
     if kind not in _VALID_KINDS:
         raise ValueError(
@@ -121,8 +141,17 @@ def record_alert(
                     "recipient": recipient,
                 },
             )
-    except IntegrityError:
-        return False
+    except IntegrityError as exc:
+        orig = exc.orig
+        pgcode = getattr(orig, "pgcode", None)
+        diag = getattr(orig, "diag", None)
+        constraint_name = getattr(diag, "constraint_name", None)
+        if (
+            pgcode == psycopg2.errorcodes.UNIQUE_VIOLATION
+            and constraint_name == _ONCE_ONLY_CONSTRAINT
+        ):
+            return False
+        raise
     return True
 
 
