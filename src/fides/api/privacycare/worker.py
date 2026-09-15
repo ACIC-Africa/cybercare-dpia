@@ -11,14 +11,17 @@ our tasks first so the @celery_app.task decorator runs and registers them,
 then re-export Fides' celery_app for the CLI to find. Start it with:
 
     celery -A fides.api.privacycare.worker worker \
-           --queues=fidesplus.privacy_assessments
+           --queues=fidesplus.privacy_assessments,fidesplus.discovery_monitors_detection
 
 Nothing Ethyca owns is edited; docker-compose.privacycare.yml repoints the
 command.
 """
 from fides.api.privacycare import tasks  # noqa: F401  (import registers the task)
+from fides.api.privacycare.discovery import (
+    execute,  # noqa: F401  (import registers the task)
+)
 from fides.api.tasks import celery_app
 
 app = celery_app
 
-__all__ = ["app", "celery_app", "tasks"]
+__all__ = ["app", "celery_app", "tasks", "execute"]

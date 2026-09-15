@@ -74,7 +74,9 @@ from fides.api.privacycare.api.monitor_schemas import (
     MonitorStatusResponse,
 )
 from fides.api.privacycare.api.router import privacycare_monitors_router
+from fides.api.privacycare.discovery.execute import execute_monitor_task
 from fides.api.service.connectors import get_connector
+from fides.api.tasks import DISCOVERY_MONITORS_DETECTION_QUEUE_NAME
 from fides.common.scope_registry import (
     PRIVACYCARE_DISCOVERY_READ,
     PRIVACYCARE_DISCOVERY_UPDATE,
@@ -314,6 +316,38 @@ def delete_monitor(
     db.delete(monitor)
     db.commit()
     return DeleteMonitorResponse(count=1)
+
+
+@privacycare_monitors_router.post(
+    "/{monitor_config_id}/execute",
+    dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_UPDATE])],
+    status_code=status_codes.HTTP_202_ACCEPTED,
+)
+def execute_monitor(
+    monitor_config_id: str,
+    db: Session = Depends(get_db),
+    client: ClientDetail = Security(verify_oauth_client, scopes=[PRIVACYCARE_DISCOVERY_UPDATE]),
+) -> dict:
+    """Queue a discovery scan. This is the route plan 10 deliberately left
+    out: running a scan is a privileged act, not a read, hence
+    PRIVACYCARE_DISCOVERY_UPDATE rather than the _READ scope every other
+    route on this surface but `put_monitor`/`delete_monitor` carries.
+
+    Returns as soon as the job is queued rather than waiting for the scan to
+    finish -- walking a real catalogue can take a while, and the shipped
+    UI's mutation (`executeDiscoveryMonitor`, discovery-detection.slice.ts)
+    types its response as `any` and reads nothing from it; it only
+    invalidates the "Discovery Monitor Configs" tag to re-poll status. Work
+    itself -- the walk, the reconcile, and recording the
+    `MonitorExecution` row -- all happens in `execute_monitor_task` /
+    `run_monitor` (discovery/execute.py), off the request.
+    """
+    monitor = _monitor_or_404(db, monitor_config_id)
+    execute_monitor_task.apply_async(
+        args=[monitor.key], queue=DISCOVERY_MONITORS_DETECTION_QUEUE_NAME
+    )
+    logger.info("PrivacyCare discovery scan queued for monitor {}", monitor.key)
+    return {"detail": f"Discovery scan queued for monitor {monitor.key}"}
 
 
 @privacycare_monitors_router.get(
