@@ -74,7 +74,10 @@ from fides.api.privacycare.api.monitor_schemas import (
     MonitorStatusResponse,
 )
 from fides.api.privacycare.api.router import privacycare_monitors_router
-from fides.api.privacycare.discovery.execute import execute_monitor_task
+from fides.api.privacycare.discovery.execute import (
+    STATUS_IN_PROGRESS,
+    execute_monitor_task,
+)
 from fides.api.service.connectors import get_connector
 from fides.api.tasks import DISCOVERY_MONITORS_DETECTION_QUEUE_NAME
 from fides.common.scope_registry import (
@@ -104,6 +107,26 @@ _STAGED_RESOURCE_COUNT_SQL = sqlalchemy.text(
 _ACTIVE_MONITOR_TASK_COUNT_SQL = sqlalchemy.text(
     "SELECT count(*) FROM monitortask WHERE monitor_config_id = :id "
     "AND status NOT IN ('complete', 'error', 'skipped')"
+)
+
+# F3 (second half): nothing before this fix stopped a double-clicked Scan
+# button, or a retry racing a still-running execution, from queuing two
+# `run_monitor` calls against the same monitor. Both would walk the same
+# catalogue from the same pre-state and reconcile it independently —
+# harmless to `stagedresource` itself now that reconcile()'s own INSERT is
+# `ON CONFLICT DO NOTHING` (see reconcile.py), but still two redundant scans
+# hitting the target concurrently, and two `MonitorExecution` rows racing to
+# be "the" record of one logical run. Checked by key, matching every other
+# lookup on this surface (`monitorexecution.monitor_config_key` holds the
+# monitor's key, same as `stagedresource.monitor_config_id` — see this
+# module's own note on that column above `_STAGED_RESOURCE_COUNT_SQL`).
+# Not perfectly race-free on its own (a check-then-queue has the same
+# TOCTOU gap any such check does), but it closes the common case this
+# finding names: a user clicking Scan twice while the first run is still
+# `In progress`.
+_ACTIVE_EXECUTION_COUNT_SQL = sqlalchemy.text(
+    "SELECT count(*) FROM monitorexecution WHERE monitor_config_key = :key "
+    "AND status = :in_progress"
 )
 
 
@@ -341,8 +364,27 @@ def execute_monitor(
     itself -- the walk, the reconcile, and recording the
     `MonitorExecution` row -- all happens in `execute_monitor_task` /
     `run_monitor` (discovery/execute.py), off the request.
+
+    F3: raises 409 rather than queuing a second scan while one is already
+    `In progress` for this monitor -- a double-clicked Scan button, or a
+    retry racing a still-running execution, would otherwise walk the same
+    catalogue twice concurrently and leave two `MonitorExecution` rows
+    racing to record one logical run.
     """
     monitor = _monitor_or_404(db, monitor_config_id)
+
+    # F3: refuse a second scan while one is already `In progress` for this
+    # monitor -- see `_ACTIVE_EXECUTION_COUNT_SQL`'s own comment.
+    active_executions = db.execute(
+        _ACTIVE_EXECUTION_COUNT_SQL,
+        {"key": monitor.key, "in_progress": STATUS_IN_PROGRESS},
+    ).scalar()
+    if active_executions:
+        raise HTTPException(
+            status_code=status_codes.HTTP_409_CONFLICT,
+            detail=f"A discovery scan is already in progress for monitor {monitor.key}",
+        )
+
     execute_monitor_task.apply_async(
         args=[monitor.key], queue=DISCOVERY_MONITORS_DETECTION_QUEUE_NAME
     )

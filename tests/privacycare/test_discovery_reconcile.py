@@ -11,11 +11,17 @@ OTHER monitor's resources removed on the first run of a new one.
 No connector, no scanning: every FoundResource here is constructed by hand,
 exactly the shape Task 1's walk_catalogue would have produced.
 """
+from typing import Optional
+
 import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.discovery.reconcile import ReconcileSummary, reconcile
+from fides.api.privacycare.discovery.reconcile import (
+    _INSERT_SQL,
+    ReconcileSummary,
+    reconcile,
+)
 from fides.api.privacycare.discovery.walk import FoundResource
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -35,7 +41,15 @@ def db(monkeypatch):
         session.rollback()
 
 
-def _stage_one(db: Session, *, monitor_config_id: str, monitor_key: str, urn: str) -> str:
+def _stage_one(
+    db: Session,
+    *,
+    monitor_config_id: str,
+    monitor_key: str,
+    urn: str,
+    diff_status: str = "addition",
+    resource_type: str = "Table",
+) -> str:
     """Insert a single stagedresource row directly (bypassing reconcile()
     entirely) so a test can set up "what was already staged" before calling
     reconcile() to see what it does with that state. Fills every NOT NULL
@@ -45,6 +59,11 @@ def _stage_one(db: Session, *, monitor_config_id: str, monitor_key: str, urn: st
     reconcile() call does -- there is no stagedresource.monitor_key column
     (see reconcile.py's own module docstring: the monitor_key is already
     implicit in the urn's first segment), so it is not written anywhere.
+
+    `diff_status` defaults to 'addition' but a caller can stage a resource
+    already sitting on a DiffStatus a real scan never produces on its own
+    (e.g. 'monitored' -- F5's round trip needs a resource a user has already
+    promoted, not one fresh out of a first scan).
     """
     del monitor_key
     db.execute(
@@ -54,12 +73,17 @@ def _stage_one(db: Session, *, monitor_config_id: str, monitor_key: str, urn: st
                 id, urn, name, resource_type, monitor_config_id, diff_status,
                 classifications, user_assigned_data_categories, children, meta
             ) VALUES (
-                'sta_' || gen_random_uuid(), :urn, :urn, 'Table',
-                :monitor_config_id, 'addition', '{}', '{}', '{}', '{}'::jsonb
+                'sta_' || gen_random_uuid(), :urn, :urn, :resource_type,
+                :monitor_config_id, :diff_status, '{}', '{}', '{}', '{}'::jsonb
             )
             """
         ),
-        {"urn": urn, "monitor_config_id": monitor_config_id},
+        {
+            "urn": urn,
+            "monitor_config_id": monitor_config_id,
+            "diff_status": diff_status,
+            "resource_type": resource_type,
+        },
     )
     return urn
 
@@ -67,6 +91,20 @@ def _stage_one(db: Session, *, monitor_config_id: str, monitor_key: str, urn: st
 def _diff_status(db: Session, urn: str) -> str:
     return db.execute(
         sqlalchemy.text("SELECT diff_status FROM stagedresource WHERE urn = :urn"),
+        {"urn": urn},
+    ).scalar()
+
+
+def _meta(db: Session, urn: str) -> dict:
+    return db.execute(
+        sqlalchemy.text("SELECT meta FROM stagedresource WHERE urn = :urn"),
+        {"urn": urn},
+    ).scalar()
+
+
+def _is_leaf(db: Session, urn: str) -> Optional[bool]:
+    return db.execute(
+        sqlalchemy.text("SELECT is_leaf FROM stagedresource WHERE urn = :urn"),
         {"urn": urn},
     ).scalar()
 
@@ -247,3 +285,164 @@ def test_a_resurrected_resource_is_marked_addition_not_unchanged(db):
     assert _diff_status(db, "m1.db.public.orders") == "addition"
     assert summary.added == 1  # orders, resurrected
     assert summary.unchanged == 1  # just the database
+
+
+def test_removal_stashes_the_prior_status_and_resurrection_restores_it(db):
+    # F5 deliberate-break proof (see fix-wave-report.md). Before this fix,
+    # `_RESURRECT_SQL` unconditionally reset diff_status to 'addition' --
+    # a promoted ('monitored') or muted ('muted') resource that missed one
+    # scan would resurrect as brand-new work, its status silently gone, no
+    # audit trail of what it had been. Round trip BOTH the plain 'addition'
+    # case and the 'monitored' case, since a bug here would most plausibly
+    # be "restores addition fine, but forgets anything else was possible".
+    found = [
+        FoundResource(urn="m1.db.public", name="db", resource_type="Database",
+                      parent_urn=None, field_type=None),
+        FoundResource(urn="m1.db.public.orders", name="orders", resource_type="Table",
+                      parent_urn="m1.db.public", field_type=None),
+        FoundResource(urn="m1.db.public.customers", name="customers", resource_type="Table",
+                      parent_urn="m1.db.public", field_type=None),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    # "orders" stays a plain 'addition'. "customers" gets promoted the way
+    # plan 12 will (simulated directly -- reconcile() itself never writes
+    # 'monitored', nothing does yet).
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE stagedresource SET diff_status = 'monitored' WHERE urn = :urn"
+        ),
+        {"urn": "m1.db.public.customers"},
+    )
+
+    # Both go missing from the next scan.
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=[found[0]])
+
+    assert _diff_status(db, "m1.db.public.orders") == "removal"
+    assert _meta(db, "m1.db.public.orders")["pre_removal_diff_status"] == "addition"
+    assert _diff_status(db, "m1.db.public.customers") == "removal"
+    assert _meta(db, "m1.db.public.customers")["pre_removal_diff_status"] == "monitored"
+
+    # Both come back.
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert _diff_status(db, "m1.db.public.orders") == "addition", (
+        "a plain 'addition' resource did not round-trip back to 'addition'"
+    )
+    assert _diff_status(db, "m1.db.public.customers") == "monitored", (
+        "F5's whole point: a promoted resource resurrected as 'addition' "
+        "instead of restoring 'monitored' -- the user's decision was lost"
+    )
+    # The stashed key is cleaned up on restore, not left behind for a
+    # second removal/resurrection cycle to find stale.
+    assert "pre_removal_diff_status" not in _meta(db, "m1.db.public.orders")
+    assert "pre_removal_diff_status" not in _meta(db, "m1.db.public.customers")
+
+
+def test_resurrection_defaults_to_addition_when_nothing_was_stashed(db):
+    # F5: a row marked 'removal' by code that predates this fix (or any
+    # other gap) has no stashed status to restore. COALESCE must fall back
+    # to 'addition' rather than resurrecting as NULL or raising.
+    _stage_one(db, monitor_config_id="mon1", monitor_key="m1",
+               urn="m1.db.public.legacy", diff_status="removal")
+
+    found = [
+        FoundResource(urn="m1.db.public.legacy", name="legacy", resource_type="Table",
+                      parent_urn=None, field_type=None),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert _diff_status(db, "m1.db.public.legacy") == "addition"
+
+
+def test_a_new_field_writes_its_sql_type_into_meta(db):
+    # F7: Ethyca's own convention is meta->>'data_type'; classification
+    # (plan 13) is the direct consumer and would otherwise have to re-scan
+    # every field for a value this scan already held.
+    found = [
+        FoundResource(urn="m1.db.public.orders", name="orders", resource_type="Table",
+                      parent_urn=None, field_type=None),
+        FoundResource(urn="m1.db.public.orders.id", name="id", resource_type="Field",
+                      parent_urn="m1.db.public.orders", field_type="INTEGER"),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert _meta(db, "m1.db.public.orders.id")["data_type"] == "INTEGER"
+    # A Table's meta carries no data_type -- that key is Field-only.
+    assert "data_type" not in _meta(db, "m1.db.public.orders")
+
+
+def test_a_view_writes_its_table_type_into_meta_and_an_ordinary_table_does_not(db):
+    # F8: StagedResourceType has no View member, so a view is staged as a
+    # Table tagged via meta.table_type (walk.py's FoundResource.table_type).
+    # An ordinary table (table_type=None) leaves meta.table_type unset.
+    found = [
+        FoundResource(urn="m1.db.public.orders", name="orders", resource_type="Table",
+                      parent_urn=None, field_type=None, table_type=None),
+        FoundResource(urn="m1.db.public.v_orders", name="v_orders", resource_type="Table",
+                      parent_urn=None, field_type=None, table_type="view"),
+        FoundResource(urn="m1.db.public.mv_orders", name="mv_orders", resource_type="Table",
+                      parent_urn=None, field_type=None, table_type="materialized_view"),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert "table_type" not in _meta(db, "m1.db.public.orders")
+    assert _meta(db, "m1.db.public.v_orders")["table_type"] == "view"
+    assert _meta(db, "m1.db.public.mv_orders")["table_type"] == "materialized_view"
+
+
+def test_a_new_field_is_leaf_and_a_new_table_is_not(db):
+    # F6: is_leaf is documented as "None = not applicable (non-datastore
+    # monitors)" -- our rows ARE datastore resources and were all landing
+    # as NULL, which is in neither of the two partial indexes plan 12's
+    # results queries rely on (WHERE is_leaf IS NOT NULL / IS TRUE).
+    found = [
+        FoundResource(urn="m1.db", name="db", resource_type="Database",
+                      parent_urn=None, field_type=None),
+        FoundResource(urn="m1.db.public", name="public", resource_type="Schema",
+                      parent_urn="m1.db", field_type=None),
+        FoundResource(urn="m1.db.public.orders", name="orders", resource_type="Table",
+                      parent_urn="m1.db.public", field_type=None),
+        FoundResource(urn="m1.db.public.orders.id", name="id", resource_type="Field",
+                      parent_urn="m1.db.public.orders", field_type="INTEGER"),
+    ]
+    reconcile(db, monitor_config_id="mon1", monitor_key="m1", found=found)
+
+    assert _is_leaf(db, "m1.db.public.orders.id") is True
+    assert _is_leaf(db, "m1.db") is False
+    assert _is_leaf(db, "m1.db.public") is False
+    assert _is_leaf(db, "m1.db.public.orders") is False
+
+
+def test_the_insert_is_idempotent_under_a_racing_duplicate_urn(db):
+    # F3: two overlapping runs (a double-clicked Scan, or a retry racing a
+    # still-running execution) can independently decide the same urn is
+    # "new" -- both ran their own _FIND_EXISTING_SQL before either's INSERT
+    # landed -- and both attempt to INSERT it. `ix_stagedresource_urn` is a
+    # UNIQUE index, so without ON CONFLICT DO NOTHING the loser's INSERT
+    # would raise IntegrityError and abort its entire transaction, not just
+    # that one row.
+    #
+    # Driven directly against `_INSERT_SQL` (the exact statement reconcile()
+    # uses) rather than through two reconcile() calls: reconcile()'s own
+    # existence check (_FIND_EXISTING_SQL) would see the first call's row
+    # once it exists and correctly treat the urn as already-staged, never
+    # re-attempting the INSERT at all -- masking the very race this test
+    # exists to prove is now harmless. This is exactly the situation two
+    # genuinely concurrent callers would produce: each decided "new"
+    # independently, and only one of their INSERTs can win.
+    params = {
+        "urn": "m1.db.public.orders", "name": "orders", "resource_type": "Table",
+        "parent": "m1.db.public", "monitor_config_id": "mon1",
+        "diff_status": "addition", "meta": "{}", "is_leaf": False,
+    }
+
+    winner = db.execute(_INSERT_SQL, [params])
+    assert winner.rowcount == 1
+
+    loser = db.execute(_INSERT_SQL, [params])
+    assert loser.rowcount == 0, (
+        "a racing duplicate INSERT must be a silent no-op, not an error"
+    )
+
+    assert _row_count(db) == 1

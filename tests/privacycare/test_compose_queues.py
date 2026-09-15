@@ -104,3 +104,13 @@ def test_the_generic_worker_excludes_our_queue():
         f"worker-other does not exclude {GENERATION_QUEUE!r}; it will steal "
         f"generation messages it cannot execute."
     )
+    # MINOR fix: the assertion above only ever covered HALF the drift this
+    # test exists to make loud. worker-other never imports
+    # fides.api.privacycare.discovery.execute either, so a discovery-scan
+    # message is exactly as unregistered there as a generation message is —
+    # the exclusion IS present in the YAML today, but nothing here would
+    # have failed loudly if it had been dropped.
+    assert DISCOVERY_MONITORS_DETECTION_QUEUE_NAME in excluded, (
+        f"worker-other does not exclude {DISCOVERY_MONITORS_DETECTION_QUEUE_NAME!r}; "
+        f"it will steal discovery-scan messages it cannot execute."
+    )

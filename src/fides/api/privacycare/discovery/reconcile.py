@@ -41,8 +41,9 @@ stagedresource row from *every* monitor and mark them all `removal` -- a
 fleet of false "this table disappeared" findings, for tables the new
 monitor never looked at.
 """
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlalchemy
 from sqlalchemy.orm import Session
@@ -50,8 +51,40 @@ from sqlalchemy.orm import Session
 from fides.api.models.detection_discovery.core import (
     DiffStatus,
     StagedResourceAncestor,
+    StagedResourceType,
 )
 from fides.api.privacycare.discovery.walk import FoundResource
+
+# F7: Ethyca's own convention for a column's SQL type is meta->>'data_type'
+# (see backfill_stagedresource_is_leaf.py's own is_leaf formula, which reads
+# this same key). F8: a view/materialised view is staged as a Table (see
+# walk.py's FoundResource.table_type docstring) with this key naming what it
+# really is; an ordinary table leaves meta.table_type unset.
+_META_DATA_TYPE_KEY = "data_type"
+_META_TABLE_TYPE_KEY = "table_type"
+# F5: stashed onto a row the moment it is marked 'removal' so resurrection
+# can restore the status it actually had -- see _MARK_REMOVED_SQL /
+# _RESURRECT_SQL and the module docstring's Resurrection paragraph below.
+_META_PRE_REMOVAL_STATUS_KEY = "pre_removal_diff_status"
+
+
+def _meta_for(resource: FoundResource) -> Dict[str, Any]:
+    """What `_INSERT_SQL` writes into a brand-new row's `meta`. Field rows
+    carry their SQL type (F7); Table rows carry `table_type` only when the
+    walk tagged them as a view or materialised view (F8) -- an ordinary
+    table's meta stays `{}`, unchanged from before this fix."""
+    if (
+        resource.resource_type == StagedResourceType.FIELD.value
+        and resource.field_type is not None
+    ):
+        return {_META_DATA_TYPE_KEY: resource.field_type}
+    if (
+        resource.resource_type == StagedResourceType.TABLE.value
+        and resource.table_type is not None
+    ):
+        return {_META_TABLE_TYPE_KEY: resource.table_type}
+    return {}
+
 
 # `StagedResource.id`'s ORM default (FidesBase.generate_uuid) derives its
 # prefix from the table name at flush time, but that default only fires for
@@ -77,15 +110,30 @@ _FIND_EXISTING_SQL = sqlalchemy.text(
     """
 )
 
+# F3: two overlapping runs (a double-clicked Scan, or a retry racing a still
+# -running execution) compute the same `new_resources` from the same
+# pre-state and both try to INSERT the same urn; `ix_stagedresource_urn` is
+# a UNIQUE index, so without ON CONFLICT the loser's entire transaction
+# aborts -- not just that one row, every write reconcile() made in the same
+# session. "DO NOTHING" makes the loser's redundant insert a no-op instead,
+# and RETURNING urn lets the caller count only the rows THIS call actually
+# inserted (a race's loser correctly reports fewer `added` than urns it
+# attempted). F6/F7/F8: is_leaf and meta are now written on insert instead
+# of left at their bare defaults -- see `_meta_for` above and the module's
+# is_leaf paragraph below.
 _INSERT_SQL = sqlalchemy.text(
     """
     INSERT INTO stagedresource (
         id, urn, name, resource_type, parent, monitor_config_id, diff_status,
-        classifications, user_assigned_data_categories, children, meta
+        classifications, user_assigned_data_categories, children, meta,
+        is_leaf
     ) VALUES (
         'sta_' || gen_random_uuid(), :urn, :name, :resource_type, :parent,
-        :monitor_config_id, :diff_status, '{}', '{}', '{}', '{}'::jsonb
+        :monitor_config_id, :diff_status, '{}', '{}', '{}',
+        CAST(:meta AS jsonb), :is_leaf
     )
+    ON CONFLICT (urn) DO NOTHING
+    RETURNING urn
     """
 )
 
@@ -94,10 +142,20 @@ _INSERT_SQL = sqlalchemy.text(
 # whose diff_status happens to be NULL is still caught, and so re-running
 # this against an already-removed row RETURNs nothing -- reconcile()'s
 # `removed` count is "newly found gone this call", not "gone in total".
+#
+# F5: `meta = meta || jsonb_build_object(...)` stashes the status the row
+# actually had a moment before this UPDATE overwrites it -- the right-hand
+# side of a Postgres UPDATE's SET clause always reads the pre-update row, so
+# `diff_status` there is still the OLD value even though the same statement
+# is about to change the column of that name. Without this, a resurrected
+# row (see _RESURRECT_SQL below) has no way to know it was ever anything
+# but 'addition' -- a promoted ('monitored') or muted resource that misses
+# one scan would resurrect as brand-new work, its status silently gone.
 _MARK_REMOVED_SQL = sqlalchemy.text(
     """
     UPDATE stagedresource
-    SET diff_status = :removal
+    SET diff_status = :removal,
+        meta = meta || jsonb_build_object(:pre_removal_key, diff_status)
     WHERE monitor_config_id = :monitor_config_id
       AND urn <> ALL(CAST(:found_urns AS text[]))
       AND diff_status IS DISTINCT FROM :removal
@@ -110,10 +168,19 @@ _MARK_REMOVED_SQL = sqlalchemy.text(
 # decides a urn's fate, though the urn list itself is already known-exact
 # (computed in Python from _FIND_EXISTING_SQL's own result), so this is a
 # second scoping belt on top of a first, not the only one.
+#
+# F5: restores whatever _MARK_REMOVED_SQL stashed rather than always
+# resetting to 'addition' -- COALESCE falls back to :addition only when
+# there is nothing stashed (a row marked 'removal' by code that predates
+# this fix, or -- defensively -- any other gap). The stashed key is then
+# deleted from meta (`meta - :pre_removal_key`) so a SECOND removal/
+# resurrection cycle stashes fresh, rather than a stale key silently
+# surviving underneath a new one written on top of it.
 _RESURRECT_SQL = sqlalchemy.text(
     """
     UPDATE stagedresource
-    SET diff_status = :addition
+    SET diff_status = COALESCE(meta->>:pre_removal_key, :addition),
+        meta = meta - :pre_removal_key
     WHERE monitor_config_id = :monitor_config_id
       AND urn = ANY(CAST(:urns AS text[]))
     """
@@ -178,8 +245,21 @@ def reconcile(
         if existing_status.get(resource.urn) == DiffStatus.REMOVAL.value
     ]
 
+    # F3: `inserted_count` -- not `len(new_resources)` -- is what actually
+    # landed. Under a race (a concurrent run's reconcile() already inserted
+    # the same urn between _FIND_EXISTING_SQL above and this INSERT),
+    # ON CONFLICT DO NOTHING makes that one row a no-op rather than
+    # aborting the whole batch, and this call's `added` count correctly
+    # reports only what IT inserted. `RETURNING` rows are not fetchable
+    # from a multi-row (executemany-style) statement in SQLAlchemy -- the
+    # DBAPI cursor closes without them -- but `rowcount` still reflects the
+    # true number of rows this statement actually inserted (verified
+    # directly: a 3-row batch with one pre-existing conflicting id reports
+    # rowcount == 2), so that is what is counted rather than the length of
+    # the attempted batch.
+    inserted_count = 0
     if new_resources:
-        db.execute(
+        result = db.execute(
             _INSERT_SQL,
             [
                 {
@@ -189,10 +269,13 @@ def reconcile(
                     "parent": resource.parent_urn,
                     "monitor_config_id": monitor_config_id,
                     "diff_status": DiffStatus.ADDITION.value,
+                    "meta": json.dumps(_meta_for(resource)),
+                    "is_leaf": resource.resource_type == StagedResourceType.FIELD.value,
                 }
                 for resource in new_resources
             ],
         )
+        inserted_count = result.rowcount
 
     if resurrected_urns:
         db.execute(
@@ -201,6 +284,7 @@ def reconcile(
                 "monitor_config_id": monitor_config_id,
                 "urns": resurrected_urns,
                 "addition": DiffStatus.ADDITION.value,
+                "pre_removal_key": _META_PRE_REMOVAL_STATUS_KEY,
             },
         )
 
@@ -211,6 +295,7 @@ def reconcile(
                 "monitor_config_id": monitor_config_id,
                 "found_urns": found_urns,
                 "removal": DiffStatus.REMOVAL.value,
+                "pre_removal_key": _META_PRE_REMOVAL_STATUS_KEY,
             },
         )
         .scalars()
@@ -219,7 +304,7 @@ def reconcile(
 
     _write_ancestry(db, found)
 
-    added = len(new_resources) + len(resurrected_urns)
+    added = inserted_count + len(resurrected_urns)
     return ReconcileSummary(
         added=added,
         removed=len(removed_urns),

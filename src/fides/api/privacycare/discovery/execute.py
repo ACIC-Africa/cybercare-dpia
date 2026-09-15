@@ -5,10 +5,15 @@ is the first thing in the pipeline that writes a `stagedresource` row. This
 module is what wires the two into one run, and — per D-EX-9 — makes sure
 every run leaves a `MonitorExecution` row behind, including a run that dies
 halfway: an operator asking "did discovery run last night?" deserves an
-answer either way, not silence. The resources a failed run already wrote
-before it died stay written (they are true observations of what the walk
-actually saw before it failed) and the next run's `reconcile` call is what
-folds them back into an honest picture.
+answer either way, not silence. F2 fix -- corrected from a claim that no
+longer described this module: `reconcile`'s writes to `db` are NOT committed
+until `_finish_execution` runs (the row-level `db.execute()` calls inside it
+are just buffered in the open transaction), so a run that dies partway
+through `reconcile` discards everything it had written so far -- this run is
+atomic, all-or-nothing, not partial-write-survives. The NEXT successful
+run's `reconcile` call still folds a true, complete picture back in; nothing
+about D-EX-9's "leaves evidence either way" guarantee depends on partial
+writes surviving.
 
 `run_monitor` is the synchronous core and is what every test below drives
 directly; `execute_monitor_task` is a thin Celery wrapper around it and
@@ -24,16 +29,29 @@ site untouched and the test would assert against a run that never failed.
 
 THE MOST DANGEROUS LINE IN THIS MODULE is the call to `reconcile()` below.
 `reconcile` decides what has GONE by diffing `found` against what is
-already staged for this monitor — so calling it with an empty list that
-came from a FAILED walk would read as "the entire catalogue vanished" and
-mark every one of this monitor's staged resources `removal`: a false,
-sweeping finding for something that never happened. The `try/except` below
-exists precisely to stop that: `walk_catalogue`'s own exception is left to
-propagate — caught only long enough to close the execution record and
-re-raise — and `reconcile` is never reached on that path. An empty list
-that comes back from a SUCCESSFUL walk is a different, legitimate case (the
-catalogue really is empty this run) and is meant to reach `reconcile`,
-which correctly marks the previous run's resources `removal`.
+already staged for this monitor — so calling it with an empty (or
+effectively empty) list that does not reflect the real catalogue would read
+as "the entire catalogue vanished" and mark every one of this monitor's
+staged resources `removal`: a false, sweeping finding for something that
+never happened. Two guards protect against that, both raising before
+`reconcile` is ever reached:
+
+  1. A FAILED walk: `walk_catalogue`'s own exception is left to propagate —
+     caught only long enough to close the execution record and re-raise.
+  2. F2 fix — reconcile()'s OWN failure (a unique violation from a
+     concurrent run, a deadlock, a DBAPI error) previously escaped with the
+     execution row still `In progress` and `completed` NULL, contradicting
+     this module's own D-EX-9 promise. Wrapped the same way: closed out as
+     `Errored` naming the exception, then re-raised.
+  3. F4 fix — a SUCCESSFUL walk whose `databases` scope is non-empty but
+     matched NO schema at all (a renamed schema, a stale scope, a role that
+     lost visibility) returns just the lone Database node. That is not the
+     same as "the catalogue really is empty" (an unscoped walk against a
+     genuinely bare connection, which correctly reaches `reconcile` and
+     marks the previous run's resources `removal`) — a scope naming only
+     non-existent schemas is far likelier a misconfiguration than a
+     vanished estate, so this case is closed out as `Errored`, naming the
+     scope and what it failed to match, and never reaches `reconcile`.
 """
 import uuid
 from datetime import datetime, timezone
@@ -42,9 +60,12 @@ from typing import List
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.models.detection_discovery.core import MonitorConfig
+from fides.api.models.detection_discovery.core import (
+    MonitorConfig,
+    StagedResourceType,
+)
 from fides.api.privacycare.discovery.reconcile import ReconcileSummary, reconcile
-from fides.api.privacycare.discovery.walk import walk_catalogue
+from fides.api.privacycare.discovery.walk import FoundResource, walk_catalogue
 from fides.api.tasks import DatabaseTask, celery_app
 
 # Pinned rather than derived from the module path, same reasoning as
@@ -61,7 +82,7 @@ EXECUTE_TASK_NAME = "privacycare.discovery.execute"
 # only ever writes IN_PROGRESS at start and one of the two terminal values
 # when it closes the row out, in the same call that observes success or
 # failure.
-_STATUS_IN_PROGRESS = "In progress"
+STATUS_IN_PROGRESS = "In progress"
 _STATUS_COMPLETE = "Completed"
 _STATUS_ERRORED = "Errored"
 
@@ -109,7 +130,7 @@ def _start_execution(db: Session, *, monitor_key: str) -> str:
         {
             "id": execution_id,
             "monitor_config_key": monitor_key,
-            "status": _STATUS_IN_PROGRESS,
+            "status": STATUS_IN_PROGRESS,
             "started": datetime.now(timezone.utc),
         },
     )
@@ -132,6 +153,31 @@ def _finish_execution(
     db.commit()
 
 
+def _scope_matched_nothing(
+    databases: List[str], found: List[FoundResource]
+) -> bool:
+    """F4: a non-empty `databases` scope that matched no schema at all. Every
+    real walk unconditionally emits the Database node (see walk.py's
+    `_walk_database`), so `found` is never truly empty on a successful walk —
+    the signal that nothing in the scope matched is the absence of any
+    Schema-level resource, not an empty list."""
+    if not databases:
+        return False
+    return not any(
+        resource.resource_type == StagedResourceType.SCHEMA.value
+        for resource in found
+    )
+
+
+class EmptyScopeError(Exception):
+    """F4: `run_monitor` raises this — after closing the execution record as
+    `Errored` — when a monitor's `databases` scope is non-empty but matched
+    no schema in the target catalogue. Its own exception type (rather than a
+    bare Exception, the way `walk_catalogue` failures propagate) so a caller
+    can distinguish "the scope is almost certainly misconfigured" from an
+    actual connection or catalogue-read failure."""
+
+
 def run_monitor(db: Session, *, monitor_config_id: str) -> ReconcileSummary:
     """Walk `monitor_config_id`'s connection, reconcile what was found, and
     record the run start-to-finish in `MonitorExecution`.
@@ -142,36 +188,76 @@ def run_monitor(db: Session, *, monitor_config_id: str) -> ReconcileSummary:
 
     Raises `LookupError` for an unknown monitor, BEFORE any `MonitorExecution`
     row is written — there is nothing to record a run against when there was
-    never a monitor to run.
+    never a monitor to run. Every other raise below happens AFTER the
+    execution row is closed out — see this module's docstring, "THE MOST
+    DANGEROUS LINE".
     """
     monitor = db.query(MonitorConfig).filter(MonitorConfig.key == monitor_config_id).first()
     if monitor is None:
         raise LookupError(f"No monitor with key {monitor_config_id}")
 
+    databases = list(monitor.databases or [])
     execution_id = _start_execution(db, monitor_key=monitor.key)
 
     try:
         found = walk_catalogue(
             monitor.connection_config,
             monitor_key=monitor.key,
-            databases=list(monitor.databases or []),
+            databases=databases,
             excluded_databases=list(monitor.excluded_databases or []),
         )
     except Exception as exc:  # noqa: BLE001 — D-EX-9: record the failure, then re-raise
-        # See this module's docstring, "THE MOST DANGEROUS LINE" — reconcile()
-        # is NEVER called on this path. The walk's own exception propagates
-        # unchanged after the execution record is closed out.
+        # reconcile() is NEVER called on this path.
         _finish_execution(
             db, execution_id, status=_STATUS_ERRORED, messages=[str(exc)]
         )
         raise
 
-    # Reached ONLY when the walk above succeeded. An empty `found` here is a
-    # legitimate "nothing there any more" from a real scan, not a symptom of
-    # failure, and correctly reaches reconcile().
-    summary = reconcile(
-        db, monitor_config_id=monitor.key, monitor_key=monitor.key, found=found
-    )
+    # F4: a scope that matched nothing is closed out as Errored and never
+    # reaches reconcile() — see this module's docstring, guard 3. Checked
+    # here, after a SUCCESSFUL walk, so it is never confused with guard 1
+    # (a failed walk) or reached when `databases` is empty (an intentionally
+    # unscoped, whole-catalogue walk, where an empty `found` past the
+    # Database node is a legitimate "nothing there").
+    if _scope_matched_nothing(databases, found):
+        message = (
+            "Monitor's databases scope "
+            f"{sorted(databases)!r} matched no schema in the catalogue; "
+            "the previous scan's resources were left untouched rather than "
+            "reconciling what looks like a misconfigured or stale scope."
+        )
+        _finish_execution(
+            db, execution_id, status=_STATUS_ERRORED, messages=[message]
+        )
+        raise EmptyScopeError(message)
+
+    # F2: reconcile()'s own failure (a unique violation from a concurrent
+    # run, a deadlock, a DBAPI error) must close the execution record the
+    # same way a failed walk does — previously it did not, and the row was
+    # left `In progress` forever. reconcile() runs inside a SAVEPOINT
+    # (`db.begin_nested()`) rather than plain `db.rollback()` on failure:
+    # unlike a walk failure (which never touches `db` at all — it opens its
+    # own separate connection), a DBAPI-level failure INSIDE reconcile()
+    # aborts `db`'s current transaction, and the UPDATE inside
+    # `_finish_execution` below would itself fail against that poisoned
+    # transaction — a plain `db.rollback()` would recover it, but would also
+    # discard `_start_execution`'s own row along with it in any caller whose
+    # "commit" does not actually commit (exactly what this module's own test
+    # fixtures do for isolation — see test_discovery_execute.py's `db`
+    # fixture). `ROLLBACK TO SAVEPOINT` undoes only what reconcile() itself
+    # wrote, leaving the execution-started row (and the transaction) intact
+    # either way.
+    try:
+        with db.begin_nested():
+            summary = reconcile(
+                db, monitor_config_id=monitor.key, monitor_key=monitor.key, found=found
+            )
+    except Exception as exc:  # noqa: BLE001 — D-EX-9: record the failure, then re-raise
+        _finish_execution(
+            db, execution_id, status=_STATUS_ERRORED, messages=[str(exc)]
+        )
+        raise
+
     _finish_execution(db, execution_id, status=_STATUS_COMPLETE, messages=[])
     return summary
 

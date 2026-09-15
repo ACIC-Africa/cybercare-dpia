@@ -15,6 +15,13 @@ uses — `get_connector(connection_config)`, `connector.create_client()`,
 same reason that function's docstring gives: `create_client()` builds a new
 Engine every call, and `with engine.connect()` only returns the connection to
 that engine's own pool, which otherwise stays open until GC.
+
+Views and materialised views (F8) are walked as well as ordinary tables --
+`_walk_table` emits both under `StagedResourceType.TABLE`, tagged via
+`FoundResource.table_type`, since a view over a personal-data table is
+exactly what discovery must find and `get_table_names()` alone never returns
+one. Still catalogue-only: `get_view_names` reads `pg_class`/`pg_namespace`
+by relkind, never the view's own defined query.
 """
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -57,6 +64,13 @@ class FoundResource:
     resource_type: str  # a StagedResourceType value: Database | Schema | Table | Field
     parent_urn: Optional[str]
     field_type: Optional[str] = None  # the column's SQL type, Field only
+    table_type: Optional[str] = None  # "view" | "materialized_view" | None, Table only.
+    # StagedResourceType has no View member and the shipped UI has no View
+    # concept (F8), so a view is emitted as a Table with this set --
+    # reconcile.py writes it into meta.table_type. None means an ordinary
+    # table; reconcile.py leaves meta.table_type unset in that case rather
+    # than writing "table", so an ordinary table's meta stays as lean as it
+    # was before this fix.
 
 
 def walk_catalogue(
@@ -167,7 +181,7 @@ def _walk_database(
 def _walk_schema(
     inspector: Inspector, *, database_urn: str, schema_name: str
 ) -> List[FoundResource]:
-    """One schema: itself, its tables, and each table's fields."""
+    """One schema: itself, its tables and views, and each one's fields."""
     found: List[FoundResource] = []
 
     schema_urn = f"{database_urn}.{schema_name}"
@@ -181,18 +195,84 @@ def _walk_schema(
     )
 
     for table_name in inspector.get_table_names(schema=schema_name):
-        table_urn = f"{schema_urn}.{table_name}"
-        found.append(
-            FoundResource(
-                urn=table_urn,
-                name=table_name,
-                resource_type=StagedResourceType.TABLE.value,
-                parent_urn=schema_urn,
+        found.extend(
+            _walk_table(
+                inspector,
+                schema_urn=schema_urn,
+                schema_name=schema_name,
+                table_name=table_name,
+                table_type=None,
             )
         )
 
-        for column in inspector.get_columns(table_name, schema=schema_name):
-            found.append(_field_resource(table_urn=table_urn, column=column))
+    # F8: a view (or materialised view) over a personal-data table is
+    # exactly what discovery must find -- get_table_names() alone only
+    # returns ordinary and partitioned tables (relkind 'r'/'p') and silently
+    # skips relkind 'v'/'m' entirely. Both calls below are catalogue-only:
+    # PGDialect.get_view_names issues "SELECT c.relname FROM pg_class c JOIN
+    # pg_namespace n ... WHERE c.relkind IN (...)" -- a bare pg_* relation
+    # read, the same shape as every other reflection query in this module --
+    # never a read of the view's own defined SELECT. Called on the dialect
+    # directly (bypassing Inspector.get_view_names, which in this
+    # SQLAlchemy version takes no `include` kwarg) so plain views and
+    # materialised views can be told apart and tagged accordingly.
+    for view_name in inspector.dialect.get_view_names(
+        inspector.bind, schema=schema_name, include=("plain",)
+    ):
+        found.extend(
+            _walk_table(
+                inspector,
+                schema_urn=schema_urn,
+                schema_name=schema_name,
+                table_name=view_name,
+                table_type="view",
+            )
+        )
+
+    for matview_name in inspector.dialect.get_view_names(
+        inspector.bind, schema=schema_name, include=("materialized",)
+    ):
+        found.extend(
+            _walk_table(
+                inspector,
+                schema_urn=schema_urn,
+                schema_name=schema_name,
+                table_name=matview_name,
+                table_type="materialized_view",
+            )
+        )
+
+    return found
+
+
+def _walk_table(
+    inspector: Inspector,
+    *,
+    schema_urn: str,
+    schema_name: str,
+    table_name: str,
+    table_type: Optional[str],
+) -> List[FoundResource]:
+    """One table-shaped relation (an ordinary table, or -- F8 -- a view or
+    materialised view) and its fields. `get_columns` reads pg_attribute /
+    pg_type by the relation's oid regardless of relkind, so it works
+    identically for a table, a view, or a materialised view -- still no
+    read of the underlying rows either way."""
+    found: List[FoundResource] = []
+
+    table_urn = f"{schema_urn}.{table_name}"
+    found.append(
+        FoundResource(
+            urn=table_urn,
+            name=table_name,
+            resource_type=StagedResourceType.TABLE.value,
+            parent_urn=schema_urn,
+            table_type=table_type,
+        )
+    )
+
+    for column in inspector.get_columns(table_name, schema=schema_name):
+        found.append(_field_resource(table_urn=table_urn, column=column))
 
     return found
 

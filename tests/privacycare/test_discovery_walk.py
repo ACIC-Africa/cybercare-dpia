@@ -6,16 +6,106 @@ statutory duty to protect what is in them, and reading personal data while
 cataloguing it is the least defensible thing this could do. The test that
 asserts no SELECT is issued is the most important test in this plan.
 """
+import re
 import uuid
 
 import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.discovery.walk import FoundResource, walk_catalogue
+from fides.api.privacycare.discovery.walk import (
+    CatalogueWalkError,
+    FoundResource,
+    walk_catalogue,
+)
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 SCRATCH_KEY = "privacycare_scratch_local_postgres"
+
+# F1 fix. The ORIGINAL guard here asserted a statement was safe if it
+# contained "pg_catalog", "information_schema", OR the bare substring
+# "pg_" -- and only ever looked at statements starting with "select". The
+# customer is an LPG marketer: `SELECT id_number FROM public.lpg_customers`
+# contains "pg_" (inside "lpg_customers") and so satisfied the guard that
+# exists to stop exactly that read. See fix-wave-report.md for the
+# deliberate-break proof below.
+#
+# This tightened version instead extracts every FROM/JOIN (and bare TABLE)
+# read target from the statement and requires EACH one, individually, to be
+# a catalogue relation: `pg_catalog.*`, `information_schema.*`, or an
+# UNQUALIFIED relation whose own name starts with "pg_" (Postgres reserves
+# the "pg_" prefix for schema names, so a qualified target like
+# "public.lpg_customers" can never satisfy this by having a table merely
+# CONTAINING "pg_" -- the schema segment must itself be pg_catalog /
+# information_schema, or there must be no schema segment at all and the
+# relation itself is bare-"pg_*"). This is a pragmatic regex-based scanner,
+# not a full SQL parser -- it is deliberately over- rather than
+# under-inclusive about what counts as a "target": scanning globally for
+# every FROM/JOIN in the whole statement (not just the outermost one) means
+# a target hidden inside a subquery is still caught, at the cost of also
+# flagging an outer CTE-alias reference (e.g. "WITH x AS (...) SELECT * FROM
+# x") -- handled by excluding names the statement itself defines as a CTE.
+_READABLE_STATEMENT_RE = re.compile(
+    r"^\s*(select|with|table|copy|fetch|explain)\b", re.IGNORECASE
+)
+_TARGET_RE = re.compile(
+    r'\b(?:from|join)\s+('
+    r'"[^"]+"(?:\."[^"]+")?'  # "schema"."table" or "table"
+    r'|[a-zA-Z_][\w$]*(?:\.[a-zA-Z_][\w$]*)?'  # schema.table or table
+    r")",
+    re.IGNORECASE,
+)
+_TABLE_SHORTHAND_RE = re.compile(
+    r'^\s*table\s+("[^"]+"(?:\."[^"]+")?|[a-zA-Z_][\w$.]*)', re.IGNORECASE
+)
+_CTE_NAME_RE = re.compile(
+    r"\b(?:with|,)\s+([a-zA-Z_][\w$]*)\s+as\s*\(", re.IGNORECASE
+)
+
+
+def _read_targets(lowered_statement: str) -> list[str]:
+    """Every FROM/JOIN target, plus a bare `TABLE <name>` shorthand's own
+    target, found anywhere in `lowered_statement`."""
+    targets = [match.group(1) for match in _TARGET_RE.finditer(lowered_statement)]
+    table_shorthand = _TABLE_SHORTHAND_RE.match(lowered_statement)
+    if table_shorthand:
+        targets.append(table_shorthand.group(1))
+    return targets
+
+
+def _is_catalogue_relation(target: str) -> bool:
+    """True only for `pg_catalog.*`, `information_schema.*`, or an
+    unqualified relation whose own name starts with "pg_"."""
+    name = target.strip('"').replace('"."', ".").replace('"', "")
+    if name.startswith("pg_catalog.") or name.startswith("information_schema."):
+        return True
+    return "." not in name and name.startswith("pg_")
+
+
+def _assert_statement_reads_only_the_catalogue(statement: str) -> None:
+    """The tightened D-EX-1 guard, factored out so both the real-walk test
+    below and the deliberate-break tests can drive the same logic. Raises
+    AssertionError naming the offending target the moment it finds a
+    read target that is not a catalogue relation.
+    """
+    lowered = " ".join(statement.lower().split())
+    if not _READABLE_STATEMENT_RE.match(lowered):
+        # Widened from the original's "startswith('select')" check: a
+        # statement that cannot read rows at all (DDL, SET, BEGIN, ...)
+        # needs no target inspection.
+        return
+    cte_names = {match.group(1) for match in _CTE_NAME_RE.finditer(lowered)}
+    for target in _read_targets(lowered):
+        bare = target.strip('"').replace('"."', ".").replace('"', "")
+        if "." not in bare and bare in cte_names:
+            # A CTE's own alias, not a real relation -- its DEFINITION was
+            # already scanned above (the global FROM/JOIN sweep does not
+            # stop at the CTE boundary), so this reference needs no check
+            # of its own.
+            continue
+        assert _is_catalogue_relation(target), (
+            f"the walk read a non-catalogue relation {target!r}: {statement}"
+        )
 
 
 @pytest.fixture
@@ -70,13 +160,64 @@ def test_the_walk_never_selects_from_a_scanned_table(scratch_connection):
     finally:
         sqlalchemy.event.remove(sqlalchemy.engine.Engine, "before_cursor_execute", _record)
 
+    # F1 fix: a walk that issued NOTHING would previously have passed this
+    # guard vacuously -- there being no statements to fail on is not the
+    # same as proving every statement was catalogue-only.
+    assert statements, "the walk issued no statements at all"
+
     for statement in statements:
-        lowered = " ".join(statement.lower().split())
-        # Catalogue reads are SELECTs against pg_catalog / information_schema.
-        # A SELECT against anything else is a read of customer data.
-        if lowered.startswith("select"):
-            assert ("pg_catalog" in lowered or "information_schema" in lowered
-                    or "pg_" in lowered), f"the walk read a non-catalogue table: {statement}"
+        _assert_statement_reads_only_the_catalogue(statement)
+
+
+def test_the_tightened_guard_rejects_a_read_of_the_customer_table():
+    # F1 deliberate-break proof (see fix-wave-report.md). The customer is an
+    # LPG marketer -- this exact statement is what the ORIGINAL guard's
+    # "pg_" bare-substring check let through, because "lpg_customers"
+    # contains "pg_" as a substring. It is fed straight to the tightened
+    # helper the real test above now uses, never actually issued against a
+    # connection, to prove the guard itself -- not the scratch fixture's
+    # honesty -- is what catches it.
+    statement = "select id_number from public.lpg_customers"
+
+    with pytest.raises(AssertionError, match="non-catalogue relation") as caught:
+        _assert_statement_reads_only_the_catalogue(statement)
+
+    assert "public.lpg_customers" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # F1's second hole: the original guard only ever inspected
+        # statements starting with "select". Each of these can read rows
+        # and was never examined at all.
+        pytest.param(
+            "with x as (select id_number from public.lpg_customers) "
+            "select * from x",
+            id="cte",
+        ),
+        pytest.param("table public.lpg_customers", id="table-shorthand"),
+        pytest.param(
+            "copy (select id_number from public.lpg_customers) to stdout",
+            id="copy-to-stdout",
+        ),
+        pytest.param(
+            "explain analyze select id_number from public.lpg_customers",
+            id="explain-analyze",
+        ),
+    ],
+)
+def test_the_tightened_guard_rejects_every_widened_statement_shape(statement):
+    with pytest.raises(AssertionError, match="non-catalogue relation"):
+        _assert_statement_reads_only_the_catalogue(statement)
+
+
+def test_the_tightened_guard_does_not_false_positive_on_a_pure_catalogue_cte():
+    # A CTE whose body only reads the catalogue, referenced by its own
+    # alias in the outer query, must NOT be flagged -- the alias itself is
+    # not a real relation.
+    statement = "with x as (select nspname from pg_namespace) select * from x"
+    _assert_statement_reads_only_the_catalogue(statement)  # must not raise
 
 
 def test_the_walk_returns_all_four_resource_levels(scratch_connection):
@@ -219,6 +360,94 @@ def test_an_unreachable_connection_raises_naming_the_connection(db):
     # 127.0.0.1:1 actually happen.
     db.refresh(unreachable)
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(CatalogueWalkError) as caught:
         walk_catalogue(unreachable, monitor_key="m1", databases=[], excluded_databases=[])
     assert unreachable.key in str(caught.value)
+
+    # MINOR fix: `pytest.raises(Exception) + key-in-message` is satisfied by
+    # ANY failure inside walk_catalogue -- every failure is wrapped in a
+    # CatalogueWalkError that always names the key, so the original
+    # assertion proved the wrapper exists, not that the socket itself
+    # failed. Assert the wrapped cause is a real connection error.
+    assert isinstance(caught.value.__cause__, sqlalchemy.exc.OperationalError), (
+        f"expected a real connection failure as the cause, got "
+        f"{caught.value.__cause__!r}"
+    )
+
+
+def test_views_and_materialised_views_are_walked_as_tables(scratch_connection):
+    # F8: get_table_names() alone only returns ordinary/partitioned tables
+    # (relkind 'r'/'p') and silently skips views and materialised views
+    # (relkind 'v'/'m') entirely -- a view over a personal-data table is
+    # exactly what discovery must find. StagedResourceType has no View
+    # member and the shipped UI has no View concept, so a view is emitted
+    # as a Table tagged via meta.table_type (written by reconcile.py, see
+    # test_discovery_reconcile.py's own coverage of that).
+    #
+    # Same "two separate Postgres sessions" reasoning as
+    # test_a_named_scope_limits_the_walk above: the probe objects are
+    # created (and dropped, in `finally`) on their own AUTOCOMMIT
+    # connection, genuinely committed, so the walk's own separate
+    # connection actually sees them; nothing is left behind afterwards.
+    suffix = uuid.uuid4().hex[:8]
+    base_table = f"t11_view_base_{suffix}"
+    plain_view = f"t11_plain_view_{suffix}"
+    matview = f"t11_matview_{suffix}"
+    probe_engine = sqlalchemy.create_engine(DB_URL, isolation_level="AUTOCOMMIT")
+    try:
+        with probe_engine.connect() as conn:
+            conn.execute(
+                sqlalchemy.text(
+                    f'CREATE TABLE public."{base_table}" (id int, id_number text)'
+                )
+            )
+            conn.execute(
+                sqlalchemy.text(
+                    f'CREATE VIEW public."{plain_view}" AS '
+                    f'SELECT id, id_number FROM public."{base_table}"'
+                )
+            )
+            conn.execute(
+                sqlalchemy.text(
+                    f'CREATE MATERIALIZED VIEW public."{matview}" AS '
+                    f'SELECT id, id_number FROM public."{base_table}"'
+                )
+            )
+
+        found = walk_catalogue(
+            scratch_connection, monitor_key="m1", databases=["public"],
+            excluded_databases=[],
+        )
+        tables_by_name = {
+            r.name: r for r in found if r.resource_type == "Table"
+        }
+
+        assert plain_view in tables_by_name, "the plain view was never found"
+        assert matview in tables_by_name, "the materialised view was never found"
+        assert tables_by_name[plain_view].table_type == "view"
+        assert tables_by_name[matview].table_type == "materialized_view"
+        # An ordinary table is untagged -- see walk.py's FoundResource
+        # docstring: None means "leave meta.table_type unset", not "table".
+        assert tables_by_name[base_table].table_type is None
+
+        view_urn = tables_by_name[plain_view].urn
+        view_fields = {
+            r.name for r in found
+            if r.resource_type == "Field" and r.parent_urn == view_urn
+        }
+        assert view_fields == {"id", "id_number"}, (
+            "the view's own columns were not walked -- get_columns() should "
+            "work identically for a view as for a table"
+        )
+    finally:
+        with probe_engine.connect() as conn:
+            conn.execute(
+                sqlalchemy.text(f'DROP MATERIALIZED VIEW IF EXISTS public."{matview}"')
+            )
+            conn.execute(
+                sqlalchemy.text(f'DROP VIEW IF EXISTS public."{plain_view}"')
+            )
+            conn.execute(
+                sqlalchemy.text(f'DROP TABLE IF EXISTS public."{base_table}" CASCADE')
+            )
+        probe_engine.dispose()

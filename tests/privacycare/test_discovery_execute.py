@@ -12,6 +12,7 @@ import contextlib
 import json
 import uuid
 from datetime import datetime
+from typing import List, Optional
 
 import pytest
 import sqlalchemy
@@ -23,6 +24,7 @@ from starlette.testclient import TestClient
 from fides.api.models.connectionconfig import ConnectionConfig
 from fides.api.privacycare.discovery import execute as execute_module
 from fides.api.privacycare.discovery.execute import (
+    EmptyScopeError,
     execute_monitor_task,
     run_monitor,
 )
@@ -46,7 +48,9 @@ def db(monkeypatch):
         session.rollback()
 
 
-def _a_monitor_against_the_scratch_connection(db: Session) -> str:
+def _a_monitor_against_the_scratch_connection(
+    db: Session, *, databases: Optional[List[str]] = None
+) -> str:
     """A real MonitorConfig row pointed at the seeded scratch connection
     (plan 10, D-DM-5), with its secrets overridden to the HOST's view of
     fides-db -- the same override test_discovery_walk.py's own
@@ -55,6 +59,10 @@ def _a_monitor_against_the_scratch_connection(db: Session) -> str:
     CONTAINER's view (fides-db:5432), and host-side pytest is not on that
     Docker network. This mutates only the in-memory ORM instance inside
     this session, rolled back at teardown.
+
+    `databases` defaults to unscoped (the column's own NOT NULL '{}'
+    default) -- pass it to build a monitor scoped to specific schema names,
+    e.g. for F4's "scope matched nothing" case.
 
     Returns the monitor's `key` -- what `monitor_config_id` means
     everywhere on this surface (api/monitors.py's own module docstring).
@@ -71,14 +79,16 @@ def _a_monitor_against_the_scratch_connection(db: Session) -> str:
     monitor_key = f"t11_exec_mon_{uuid.uuid4().hex[:8]}"
     db.execute(
         sqlalchemy.text(
-            "INSERT INTO monitorconfig (id, name, key, connection_config_id) "
-            "VALUES (:id, :name, :key, :connection_config_id)"
+            "INSERT INTO monitorconfig (id, name, key, connection_config_id, databases) "
+            "VALUES (:id, :name, :key, :connection_config_id, "
+            "CAST(:databases AS character varying[]))"
         ),
         {
             "id": f"mnt_{uuid.uuid4().hex[:12]}",
             "name": monitor_key,
             "key": monitor_key,
             "connection_config_id": connection.id,
+            "databases": databases or [],
         },
     )
     db.flush()
@@ -202,6 +212,99 @@ def test_a_failed_walk_never_reaches_reconcile(db, monkeypatch):
     )
 
 
+def test_a_failed_reconcile_still_closes_the_execution_record(db, monkeypatch):
+    # F2. execute.py's try/except previously wrapped ONLY walk_catalogue --
+    # a unique violation from a concurrent run, a deadlock, or any other
+    # DBAPI error inside reconcile() escaped with the row still
+    # `In progress` and `completed` NULL forever, contradicting D-EX-9's own
+    # promise (and this module's docstring, which claimed otherwise).
+    monitor_key = _a_monitor_against_the_scratch_connection(db)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("reconcile blew up")
+
+    monkeypatch.setattr(execute_module, "reconcile", _explode)
+
+    with pytest.raises(RuntimeError):
+        run_monitor(db, monitor_config_id=monitor_key)
+
+    row = db.execute(
+        sqlalchemy.text(
+            "SELECT status, started, completed, messages FROM monitorexecution "
+            "WHERE monitor_config_key = :key"
+        ),
+        {"key": monitor_key},
+    ).mappings().first()
+    assert row is not None
+    assert row["started"] is not None
+    assert row["completed"] is not None, (
+        "a failed reconcile() must still close the execution record"
+    )
+    assert row["status"] == "Errored"
+    assert any("reconcile blew up" in m for m in row["messages"])
+
+    # The session itself must still be usable afterwards -- a DBAPI-level
+    # failure inside reconcile() would otherwise leave `db`'s transaction
+    # aborted and this very query would fail with "current transaction is
+    # aborted" if the SAVEPOINT around reconcile() were missing.
+    still_alive = db.execute(sqlalchemy.text("SELECT 1")).scalar()
+    assert still_alive == 1
+
+
+def test_a_scope_that_matches_nothing_errors_out_instead_of_reconciling(db):
+    # F4. A *successful* walk whose `databases` scope matches no schema
+    # returns just the lone Database node -- reaching reconcile() there
+    # would mark every one of this monitor's OTHER already-staged resources
+    # `removal`, with the execution row reading `Completed` and `messages`
+    # empty: a silent false "your whole estate vanished" finding for what
+    # is far more likely a renamed schema or a stale/typo'd scope.
+    monitor_key = _a_monitor_against_the_scratch_connection(
+        db, databases=["t11_never_a_real_schema"]
+    )
+
+    # A resource an earlier, correctly-scoped run staged, which must survive
+    # untouched.
+    db.execute(
+        sqlalchemy.text(
+            """
+            INSERT INTO stagedresource (
+                id, urn, name, resource_type, monitor_config_id, diff_status,
+                classifications, user_assigned_data_categories, children, meta
+            ) VALUES (
+                'sta_' || gen_random_uuid(), :urn, :urn, 'Table',
+                :monitor_config_id, 'addition', '{}', '{}', '{}', '{}'::jsonb
+            )
+            """
+        ),
+        {"urn": f"{monitor_key}.db.public.orders", "monitor_config_id": monitor_key},
+    )
+    db.flush()
+
+    with pytest.raises(EmptyScopeError, match="t11_never_a_real_schema"):
+        run_monitor(db, monitor_config_id=monitor_key)
+
+    row = db.execute(
+        sqlalchemy.text(
+            "SELECT status, completed, messages FROM monitorexecution "
+            "WHERE monitor_config_key = :key"
+        ),
+        {"key": monitor_key},
+    ).mappings().first()
+    assert row is not None
+    assert row["completed"] is not None
+    assert row["status"] == "Errored"
+    assert any("t11_never_a_real_schema" in m for m in row["messages"])
+
+    still_staged = db.execute(
+        sqlalchemy.text("SELECT diff_status FROM stagedresource WHERE urn = :urn"),
+        {"urn": f"{monitor_key}.db.public.orders"},
+    ).scalar()
+    assert still_staged == "addition", (
+        "reconcile() must never run when the scope matched nothing -- the "
+        "pre-existing resource would otherwise be marked removal"
+    )
+
+
 def test_the_route_returns_4xx_for_an_unknown_monitor(db):
     from fides.api.privacycare.api.monitors import execute_monitor
 
@@ -210,6 +313,31 @@ def test_the_route_returns_4xx_for_an_unknown_monitor(db):
             "no_such_monitor_at_all", db=db, client=_fake_client("carol@example.com")
         )
     assert 400 <= caught.value.status_code < 500
+
+
+def test_the_route_refuses_to_queue_a_second_scan_while_one_is_in_progress(db):
+    # F3 (route half). A double-clicked Scan button, or a retry racing a
+    # still-running execution, must not queue a second walk against the
+    # same monitor while one is already `In progress` -- both would walk
+    # the same catalogue from the same pre-state concurrently.
+    from fides.api.privacycare.api.monitors import execute_monitor
+
+    monitor_key = _a_monitor_against_the_scratch_connection(db)
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO monitorexecution (id, monitor_config_key, status, started, "
+            "classification_instances, messages) VALUES "
+            "(:id, :key, 'In progress', now(), '{}', '{}')"
+        ),
+        {"id": f"mxn_{uuid.uuid4().hex[:12]}", "key": monitor_key},
+    )
+    db.flush()
+
+    with pytest.raises(HTTPException) as caught:
+        execute_monitor(monitor_key, db=db, client=_fake_client("carol@example.com"))
+
+    assert caught.value.status_code == status.HTTP_409_CONFLICT
+    assert monitor_key in caught.value.detail
 
 
 def test_the_route_requires_the_update_scope():
