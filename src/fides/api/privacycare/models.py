@@ -224,6 +224,16 @@ dsr_request_table = Table(
     # NULL where the right is unclocked.
     Column("deadline_at", DateTime(timezone=True)),
     Column("owner_email", String(255)),
+    # D-DSR-8's fallback chain resolves to one of four values (see
+    # register.resolve_owner: "explicit" | "business_process" |
+    # "configured_dpo" | "unassigned") every time a request is recorded.
+    # Nullable rather than NOT NULL: this column did not exist when the
+    # table was created (fix round 1 on task 4), and a hand-written INSERT
+    # that predates that fix, or any future write path that never calls
+    # resolve_owner, must remain a legal row rather than fail a constraint
+    # it cannot satisfy. There are zero live rows to backfill as of this
+    # migration.
+    Column("owner_source", String(32)),
     Column("status", String(32), nullable=False, server_default="open"),
     Column("outcome", String(32)),
     Column("outcome_grounds", Text),

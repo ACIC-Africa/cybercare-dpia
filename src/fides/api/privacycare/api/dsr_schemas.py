@@ -35,14 +35,21 @@ class DsrNotificationRequest(BaseModel):
 
 
 class DsrRequestResponse(BaseModel):
-    # Every privacycare_dsr_request column, plus two fields the table does
-    # not carry:
-    #   - owner_source: see dsr.py's _owner_source for why this is a coarse
-    #     "explicit" / "unassigned" read of the *current* owner_email column
-    #     rather than a replay of D-DSR-8's four-step resolution chain — the
-    #     chain's business_process_id and DPO-env-var inputs are never
-    #     persisted, so replaying them after the fact is not just harder,
-    #     it is impossible to do honestly.
+    # Every privacycare_dsr_request column, plus one computed field the
+    # table does not carry:
+    #   - owner_source: D-DSR-8's fallback chain (explicit |
+    #     business_process | configured_dpo | unassigned), STORED by
+    #     record_request at creation (register.py) and read straight off
+    #     the row here — not re-derived. Fix round 1 on task 4: an earlier
+    #     version inferred this at read time from owner_email alone
+    #     ("explicit" if set, else "unassigned"), which could report
+    #     "explicit" for a row the business-process or DPO fallback had
+    #     actually produced — a false claim, not merely an imprecise one,
+    #     about how a regulatory obligation's owner was determined.
+    #     Optional because the column is nullable (a hand-written INSERT
+    #     bypassing record_request, or a future write path that never
+    #     calls resolve_owner, must still be a legal row) — see the
+    #     05b1920196e4_dsr_owner_source migration.
     #   - days_left: computed from deadline_at at response time, None when
     #     the right is unclocked (objection, OQ-PRIVACY-02) — never 0, which
     #     would read as "due today" rather than "no deadline exists".
@@ -55,7 +62,7 @@ class DsrRequestResponse(BaseModel):
     received_at: datetime
     deadline_at: Optional[datetime]
     owner_email: Optional[str]
-    owner_source: str
+    owner_source: Optional[str]
     status: str
     outcome: Optional[str]
     outcome_grounds: Optional[str]

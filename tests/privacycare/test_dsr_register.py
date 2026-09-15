@@ -188,3 +188,69 @@ def test_the_register_lists_by_right_and_status(db):
     only_access = [r for r in list_requests(db, right="access")
                    if r["subject_identifier"] == subject]
     assert len(only_access) == 1
+
+
+# --- Fix round 1 on plan 14 task 4 (coordinator ruling): owner_source must
+# be STORED at creation, not inferred at read time. An earlier version of
+# the HTTP layer inferred "explicit" for any row with a non-null
+# owner_email, which silently misreported a business_process- or
+# configured_dpo-resolved owner as if a human had typed it in. These four
+# tests lock down that record_request now persists the real D-DSR-8 source
+# resolve_owner computed, for each of its four possible values —
+# configured_dpo in particular had NO coverage anywhere in this suite
+# before this fix (test_an_unresolvable_owner_is_flagged_not_rejected only
+# ever exercised the "nothing configured" -> unassigned branch).
+
+
+def test_an_explicit_owner_source_is_stored_on_the_row(db):
+    request_id = record_request(
+        db,
+        right="restriction",
+        subject_identifier=_subject(),
+        owner_email="dpo@customer.co.ke",
+    )
+    row = get_request(db, request_id)
+    assert row["owner_email"] == "dpo@customer.co.ke"
+    assert row["owner_source"] == "explicit"
+
+
+def test_a_business_process_owner_source_is_stored_on_the_row(db):
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, owner_email) "
+            "VALUES (:id, :name, :email)"
+        ),
+        {"id": process_id, "name": "Fuel card applications", "email": "ops@customer.co.ke"},
+    )
+
+    request_id = record_request(
+        db,
+        right="restriction",
+        subject_identifier=_subject(),
+        business_process_id=process_id,
+    )
+
+    row = get_request(db, request_id)
+    assert row["owner_email"] == "ops@customer.co.ke"
+    assert row["owner_source"] == "business_process"
+
+
+def test_a_configured_dpo_owner_source_is_stored_on_the_row(db, monkeypatch):
+    monkeypatch.setenv("PRIVACYCARE_DPO_EMAIL", "dpo-fallback@customer.co.ke")
+
+    request_id = record_request(db, right="restriction", subject_identifier=_subject())
+
+    row = get_request(db, request_id)
+    assert row["owner_email"] == "dpo-fallback@customer.co.ke"
+    assert row["owner_source"] == "configured_dpo"
+
+
+def test_an_unassigned_owner_source_is_stored_on_the_row(db, monkeypatch):
+    monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
+
+    request_id = record_request(db, right="restriction", subject_identifier=_subject())
+
+    row = get_request(db, request_id)
+    assert row["owner_email"] is None
+    assert row["owner_source"] == "unassigned"

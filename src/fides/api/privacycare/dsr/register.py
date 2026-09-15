@@ -36,8 +36,10 @@ _BUSINESS_PROCESS_OWNER_SQL = sqlalchemy.text(
 
 _INSERT_REQUEST_SQL = sqlalchemy.text(
     "INSERT INTO privacycare_dsr_request "
-    '(id, "right", subject_identifier, received_at, deadline_at, owner_email) '
-    "VALUES (:id, :right, :subject_identifier, :received_at, :deadline_at, :owner_email)"
+    '(id, "right", subject_identifier, received_at, deadline_at, owner_email, '
+    'owner_source) '
+    "VALUES (:id, :right, :subject_identifier, :received_at, :deadline_at, "
+    ":owner_email, :owner_source)"
 )
 
 _DECIDE_SQL = sqlalchemy.text(
@@ -53,6 +55,7 @@ _NOTIFY_SQL = sqlalchemy.text(
 
 _REQUEST_COLUMNS = (
     'id, "right", subject_identifier, received_at, deadline_at, owner_email, '
+    "owner_source, "
     "status, outcome, outcome_grounds, decided_by, decided_at, subject_notified_at, "
     "fides_privacy_request_id, created_at, updated_at"
 )
@@ -129,6 +132,14 @@ def record_request(
             "received_at": received_at,
             "deadline_at": deadline_at,
             "owner_email": resolution.owner_email,
+            # D-DSR-8's chain (explicit | business_process | configured_dpo
+            # | unassigned) — resolve_owner already computed this above; a
+            # response-layer reader must be able to report the real reason,
+            # not re-infer a coarser guess from owner_email alone (fix round
+            # 1 on task 4: the previous inferred version could report
+            # "explicit" for a business_process- or configured_dpo-derived
+            # owner, which is a false claim, not merely an imprecise one).
+            "owner_source": resolution.source,
         },
     )
     return request_id

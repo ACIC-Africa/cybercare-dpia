@@ -54,27 +54,6 @@ from fides.api.privacycare.dsr.register import (
 from fides.common.scope_registry import PRIVACYCARE_DSR_READ, PRIVACYCARE_DSR_UPDATE
 
 
-def _owner_source(owner_email: Optional[str]) -> str:
-    """A coarse, always-honest read of the CURRENT owner_email column —
-    "explicit" (someone is on record) or "unassigned" (nobody is) — not a
-    replay of D-DSR-8's four-step chain (explicit -> business process ->
-    configured DPO -> unassigned) that register.resolve_owner walks at
-    creation time.
-
-    That chain cannot be replayed honestly after the fact:
-    privacycare_dsr_request stores only the resolved owner_email, never the
-    business_process_id that was passed in, and PRIVACYCARE_DPO_EMAIL is
-    read from the environment at call time rather than stored at all. A
-    version of this that called resolve_owner() again with the stored email
-    as `explicit` would always answer "explicit" — even for a row the DPO
-    fallback actually produced — and a version that re-read the DPO env var
-    would drift if that var changed after the row was written. Reporting
-    the coarser, always-true fact is more honest than reporting a specific
-    wrong one.
-    """
-    return "explicit" if owner_email else "unassigned"
-
-
 def _days_left(deadline_at: Optional[datetime]) -> Optional[int]:
     """None when the right is unclocked (objection, OQ-PRIVACY-02) — never
     0, which would misread as "due today" rather than "no deadline exists
@@ -101,7 +80,10 @@ def _response_from_row(row: dict) -> DsrRequestResponse:
         received_at=row["received_at"],
         deadline_at=row["deadline_at"],
         owner_email=row["owner_email"],
-        owner_source=_owner_source(row["owner_email"]),
+        # Stored by record_request (register.py), not inferred here — see
+        # DsrRequestResponse's own docstring for why a read-time guess was
+        # a defect (fix round 1 on task 4) rather than a simplification.
+        owner_source=row["owner_source"],
         status=row["status"],
         outcome=row["outcome"],
         outcome_grounds=row["outcome_grounds"],

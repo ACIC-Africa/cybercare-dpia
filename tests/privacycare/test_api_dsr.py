@@ -27,6 +27,7 @@ from fides.api.privacycare.api.dsr_schemas import (
     DsrRequestCreate,
 )
 from fides.api.privacycare.dsr.delegation import ensure_kenyan_policies
+from fides.api.privacycare.dsr.register import get_request as _core_get_request
 from fides.api.privacycare.dsr.timelines import seed_timelines
 from fides.common.scope_registry import PRIVACYCARE_DSR_READ, PRIVACYCARE_DSR_UPDATE
 from tests.privacycare.test_api_assessments import _fake_client
@@ -231,3 +232,50 @@ def test_notifying_a_request_that_does_not_exist_is_404(db):
             client=_fake_client("carol@serianu.com"),
         )
     assert caught.value.status_code == 404
+
+
+# --- Fix round 1 (coordinator ruling): owner_source is now STORED at
+# creation (register.record_request), not inferred at read time — an
+# earlier version of _response_from_row guessed "explicit" for any row
+# with a non-null owner_email, which could misreport a business_process-
+# or configured_dpo-resolved owner. This test drives all four of D-DSR-8's
+# possible sources through the HTTP layer and checks the API response
+# reports EXACTLY what the core stored on the row — not merely a
+# plausible-looking value.
+
+
+def test_owner_source_round_trips_through_the_api_for_all_four_sources(db, monkeypatch):
+    monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
+
+    explicit = _create(db, "restriction", owner_email="dpo@customer.co.ke")
+    assert explicit.owner_source == "explicit"
+    assert explicit.owner_source == _core_get_request(db, explicit.id)["owner_source"]
+
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, owner_email) "
+            "VALUES (:id, :name, :email)"
+        ),
+        {"id": process_id, "name": "Fuel card applications", "email": "ops@customer.co.ke"},
+    )
+    from_process = _create(db, "restriction", business_process_id=process_id)
+    assert from_process.owner_source == "business_process"
+    assert (
+        from_process.owner_source
+        == _core_get_request(db, from_process.id)["owner_source"]
+    )
+
+    monkeypatch.setenv("PRIVACYCARE_DPO_EMAIL", "dpo-fallback@customer.co.ke")
+    from_dpo = _create(db, "restriction")
+    assert from_dpo.owner_source == "configured_dpo"
+    assert from_dpo.owner_source == _core_get_request(db, from_dpo.id)["owner_source"]
+
+    monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
+    unassigned = _create(db, "restriction")
+    assert unassigned.owner_source == "unassigned"
+    assert unassigned.owner_email is None
+    assert (
+        unassigned.owner_source
+        == _core_get_request(db, unassigned.id)["owner_source"]
+    )
