@@ -1,15 +1,23 @@
 # Queue names live in two places that cannot import each other.
 #
 # Python gets them from Ethyca: GENERATION_QUEUE is
-# fides.api.tasks.PRIVACY_ASSESSMENTS_QUEUE_NAME, imported, not retyped. YAML
-# cannot import anything, so docker-compose.privacycare.yml spells all eight
-# out as literals — the seven Ethyca queues worker-other excludes, plus ours.
+# fides.api.tasks.PRIVACY_ASSESSMENTS_QUEUE_NAME, and
+# DISCOVERY_MONITORS_DETECTION_QUEUE_NAME is Ethyca's own constant of the
+# same name — both imported, not retyped. YAML cannot import anything, so
+# docker-compose.privacycare.yml spells all eight out as literals — the
+# seven Ethyca queues worker-other excludes, plus ours.
 #
 # That split is the hazard. Rename a queue upstream and the Python moves with
 # it while the YAML does not: the API publishes to the new queue, the worker
 # listens on the old one, and the message is never consumed. No error is
-# raised anywhere — a DPIA generation simply never happens, and the UI polls a
-# task that stays `in_processing` forever.
+# raised anywhere — a DPIA generation, or a discovery scan, simply never
+# happens, and the UI polls a task that stays `in_processing` forever.
+#
+# worker-privacycare (Task 4 fix) listens on BOTH queues: generation
+# (api/tasks.py's route) and discovery detection
+# (api/monitors.py's execute route) are two different task families served
+# by the one process that imports both fides.api.privacycare.tasks and
+# fides.api.privacycare.discovery.execute (see worker.py).
 #
 # So the YAML is checked against the Python. It is the only direction
 # available, and it is enough to make the drift loud.
@@ -21,6 +29,7 @@ import yaml
 
 from fides.api import tasks as ethyca_tasks
 from fides.api.privacycare.tasks import GENERATION_QUEUE
+from fides.api.tasks import DISCOVERY_MONITORS_DETECTION_QUEUE_NAME
 
 COMPOSE = pathlib.Path(__file__).parents[2] / "docker-compose.privacycare.yml"
 
@@ -69,12 +78,19 @@ def test_every_queue_name_in_the_compose_file_is_one_python_exports(service, fla
     )
 
 
-def test_the_privacycare_worker_listens_on_exactly_the_queue_python_publishes_to():
+def test_the_privacycare_worker_listens_on_exactly_the_queues_python_publishes_to():
+    # Two task families, two queues: DPIA generation (fides.api.privacycare.
+    # tasks.GENERATION_QUEUE) and discovery-monitor execution
+    # (api/monitors.py's execute route, which queues to Ethyca's
+    # DISCOVERY_MONITORS_DETECTION_QUEUE_NAME). worker-privacycare is the
+    # only process that imports both task modules (see worker.py), so it
+    # must listen on exactly these two — no more, no fewer.
     listening = _queue_args(_service_command("worker-privacycare"), "queues")
-    assert listening == {GENERATION_QUEUE}, (
-        f"worker-privacycare listens on {sorted(listening)} but the route "
-        f"publishes to {GENERATION_QUEUE!r}. A mismatch means every generation "
-        f"message is queued and never consumed."
+    expected = {GENERATION_QUEUE, DISCOVERY_MONITORS_DETECTION_QUEUE_NAME}
+    assert listening == expected, (
+        f"worker-privacycare listens on {sorted(listening)} but the routes "
+        f"publish to {sorted(expected)}. A mismatch means a generation or "
+        f"discovery-scan message is queued and never consumed."
     )
 
 

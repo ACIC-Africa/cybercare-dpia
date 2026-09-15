@@ -42,10 +42,24 @@ services:
     # entirely, matching the healthcheck below (which already used this
     # form) — the command was the one place still using the bare, broken
     # form, found and fixed only by actually running the container.
+    #
+    # Task 4 fix (verification found the gap unassigned): this worker is
+    # the ONLY process that imports fides.api.privacycare.discovery.execute
+    # (see worker.py's own docstring, which already documented this exact
+    # two-queue invocation before the command here was updated to match
+    # it). api/monitors.py's execute route queues to
+    # fidesplus.discovery_monitors_detection, and worker-other above
+    # explicitly excludes that queue on the assumption that a dedicated
+    # worker consumes it. Before this fix, this worker listened only on
+    # fidesplus.privacy_assessments (the DPIA generation queue), so a
+    # discovery-detection message landed in a queue nothing consumed: no
+    # error anywhere, the scan appears to hang forever. Both queues are
+    # listed so this one worker serves both PrivacyCare task families —
+    # DPIA generation and discovery-monitor execution.
     command: >
       /opt/fides/bin/python -m celery -A fides.api.privacycare.worker worker
       --loglevel=info
-      --queues=fidesplus.privacy_assessments
+      --queues=fidesplus.privacy_assessments,fidesplus.discovery_monitors_detection
     healthcheck:
       test:
         ["CMD", "/opt/fides/bin/python", "-m", "celery",
