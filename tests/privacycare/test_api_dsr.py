@@ -151,6 +151,41 @@ def test_the_list_filters_by_right_and_returns_the_page_envelope(db):
     assert all(item.right == "access" for item in page.items)
 
 
+# --- Task 4, R2 (parked residual from plan 14's final review).
+# _fides_privacy_request_status used to call PrivacyRequest.get_by per row,
+# loading the whole entity — including the multi-megabyte columns
+# (_filtered_final_upload, access_result_urls) Fides' own
+# query_without_large_columns exists to keep out of list reads. Same shape
+# as test_dsr_alert_job.py's test_the_statuses_are_read_in_one_query_not_one_
+# per_row, which covers Task 3's fides_request_statuses; this covers the
+# other call site task 3 named as sharing that helper (api/dsr.py's list
+# route) rather than duplicating the query.
+
+
+def test_the_list_reads_delegated_statuses_in_one_query_not_one_per_row(db):
+    for _ in range(3):
+        _create(db, "access")
+
+    seen: list = []
+
+    @sqlalchemy.event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _record(conn, cursor, statement, *args):  # noqa: ANN001
+        if "privacyrequest" in statement.lower():
+            seen.append(statement)
+
+    try:
+        page = list_dsr_requests(
+            right="access", status=None, params=Params(page=1, size=50),
+            db=db, client=_fake_client("carol@serianu.com"),
+        )
+    finally:
+        sqlalchemy.event.remove(db.get_bind(), "before_cursor_execute", _record)
+
+    assert len(page.items) == 3
+    assert all(item.fides_privacy_request_status == "pending" for item in page.items)
+    assert len(seen) == 1, f"expected one batched read, got {len(seen)}"
+
+
 def test_viewer_has_neither_dsr_scope(db):
     # I3 (final review, 2026-09-15): this used to assert Viewer had
     # PRIVACYCARE_DSR_READ (mirroring privacycare_discovery's split) and

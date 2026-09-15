@@ -34,7 +34,6 @@ from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
-from fides.api.models.privacy_request import PrivacyRequest
 from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare.api.dsr_schemas import (
     DsrDecisionRequest,
@@ -44,7 +43,7 @@ from fides.api.privacycare.api.dsr_schemas import (
 )
 from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_dsr_router
-from fides.api.privacycare.dsr.delegation import delegate
+from fides.api.privacycare.dsr.delegation import delegate, fides_request_statuses
 from fides.api.privacycare.dsr.register import (
     discard_request,
     get_request,
@@ -92,24 +91,30 @@ def _days_left(deadline_at: Optional[datetime]) -> Optional[int]:
 
 
 def _fides_privacy_request_status(
-    db: Session, fides_privacy_request_id: Optional[str]
+    fides_privacy_request_id: Optional[str], statuses: dict
 ) -> Optional[str]:
-    """I5 (narrowed, per ruling): read the delegated request's CURRENT
-    status live, rather than mirroring/storing it. None when the right
+    """I5 (narrowed, per ruling): report the delegated request's status out
+    of an already-fetched `id -> status` map (`fides_request_statuses`,
+    dsr/delegation.py) rather than querying per call. None when the right
     never delegated at all (id is None). `_VANISHED` — never a real status
-    string — when an id IS stored but no `privacyrequest` row answers to it
-    any more, so the caller never mistakes a dead id for a live one."""
+    string — when an id IS stored but `statuses` has nothing for it (the
+    `privacyrequest` row no longer exists), so the caller never mistakes a
+    dead id for a live one.
+
+    R2 (task 4, final review of plan 14): this used to call
+    `PrivacyRequest.get_by` itself, one full-entity load per row — the same
+    N+1 `fides_request_statuses`'s own docstring names as the reason it
+    exists (`_filtered_final_upload` / `access_result_urls` are
+    multi-megabyte columns). Every caller below now fetches the map once
+    (one row for a single-request response, one page's worth for the list
+    route) and passes it in here instead of a db handle.
+    """
     if fides_privacy_request_id is None:
         return None
-    privacy_request = PrivacyRequest.get_by(
-        db, field="id", value=fides_privacy_request_id
-    )
-    if privacy_request is None:
-        return _VANISHED
-    return privacy_request.status.value
+    return statuses.get(fides_privacy_request_id, _VANISHED)
 
 
-def _response_from_row(row: dict, db: Session) -> DsrRequestResponse:
+def _response_from_row(row: dict, statuses: dict) -> DsrRequestResponse:
     return DsrRequestResponse(
         id=row["id"],
         right=row["right"],
@@ -130,12 +135,21 @@ def _response_from_row(row: dict, db: Session) -> DsrRequestResponse:
         subject_notified_at=row["subject_notified_at"],
         fides_privacy_request_id=row["fides_privacy_request_id"],
         fides_privacy_request_status=_fides_privacy_request_status(
-            db, row["fides_privacy_request_id"]
+            row["fides_privacy_request_id"], statuses
         ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         days_left=_days_left(row["deadline_at"]),
     )
+
+
+def _response_for_single_row(db: Session, row: dict) -> DsrRequestResponse:
+    """The single-row endpoints' path into `_response_from_row`: one
+    `fides_request_statuses` call for that row's own id (or none at all
+    when it never delegated — see that function's own empty-set short
+    circuit)."""
+    statuses = fides_request_statuses(db, [row["fides_privacy_request_id"]])
+    return _response_from_row(row, statuses)
 
 
 @privacycare_dsr_router.post(
@@ -252,7 +266,7 @@ def create_dsr_request(
         request.right,
         created_by,
     )
-    return _response_from_row(get_request(db, request_id), db)
+    return _response_for_single_row(db, get_request(db, request_id))
 
 
 @privacycare_dsr_router.get(
@@ -272,9 +286,22 @@ def list_dsr_requests(
 ) -> Page[DsrRequestResponse]:
     """Both filters are optional and additive — an unfiltered call returns
     the whole register. See register.list_requests for the ordering
-    (oldest first)."""
+    (oldest first).
+
+    R2 (task 4, final review of plan 14): fides_privacy_request_status used
+    to be resolved per row via a full-entity `PrivacyRequest.get_by` — an
+    N+1 loading the multi-megabyte columns `query_without_large_columns`
+    exists to keep out of exactly this kind of list view. One
+    `fides_request_statuses` call now covers every row in this response,
+    regardless of how many there are.
+    """
     rows = list_requests(db, right=right, status=status)
-    return paginate([_response_from_row(row, db) for row in rows], params)
+    statuses = fides_request_statuses(
+        db, [row["fides_privacy_request_id"] for row in rows]
+    )
+    return paginate(
+        [_response_from_row(row, statuses) for row in rows], params
+    )
 
 
 @privacycare_dsr_router.get(
@@ -296,7 +323,7 @@ def get_dsr_request(
         raise HTTPException(
             status_code=status_codes.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
-    return _response_from_row(row, db)
+    return _response_for_single_row(db, row)
 
 
 @privacycare_dsr_router.post(
@@ -360,7 +387,7 @@ def record_dsr_decision(
         request.outcome,
         decided_by,
     )
-    return _response_from_row(get_request(db, request_id), db)
+    return _response_for_single_row(db, get_request(db, request_id))
 
 
 @privacycare_dsr_router.post(
@@ -434,4 +461,4 @@ def record_dsr_notification(
         request_id,
         notified_by,
     )
-    return _response_from_row(get_request(db, request_id), db)
+    return _response_for_single_row(db, get_request(db, request_id))
