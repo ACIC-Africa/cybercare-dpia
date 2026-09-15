@@ -14,7 +14,11 @@ from typing import Optional
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.dsr.alerts import alert_due, alerts_sent_for, record_alert
+from fides.api.privacycare.dsr.alerts import (
+    alert_due,
+    alerts_sent_for_many,
+    record_alert,
+)
 from fides.api.privacycare.dsr.channels import (
     Alert,
     AlertChannel,
@@ -159,6 +163,15 @@ def run_deadline_alerts(
     ]
     fides_statuses = fides_request_statuses(db, delegated_ids)
 
+    # M1 (final review of plan 15): batched the same way as fides_statuses
+    # just above, for the same reason. alerts_sent_for used to be called
+    # once per open, clocked, non-discharged row -- an N+1 issued even for
+    # rows the alert_due check below turns out not to find due at all,
+    # which is most of the register on most days.
+    already_sent_by_request = alerts_sent_for_many(
+        db, [row["id"] for row in rows]
+    )
+
     attempted = sent = failed = 0
     skipped_closed = skipped_discharged = unclocked = vanished = unowned = 0
 
@@ -206,7 +219,7 @@ def run_deadline_alerts(
             continue
 
         days_allowed = timeline_days(db, row["right"])
-        already_sent = alerts_sent_for(db, row["id"])
+        already_sent = already_sent_by_request.get(row["id"], frozenset())
         kind = alert_due(
             deadline_at=row["deadline_at"],
             days_allowed=days_allowed,
@@ -230,7 +243,13 @@ def run_deadline_alerts(
             # when delivery has nowhere to go at all.
             unowned += 1
             recipient = os.environ.get(_ESCALATION_EMAIL_ENV)
-            if recipient is None:
+            # M3: `if not recipient` -- not `is None` -- matching
+            # channel_from_environment's own check (dsr/channels.py). A
+            # blank env var (`PRIVACYCARE_ALERT_ESCALATION_EMAIL=`) reads
+            # back as `""`, which passes an `is None` check, gets sent as
+            # the destination, and lands in the ledger marked delivered to
+            # nobody -- and, being recorded, never retried.
+            if not recipient:
                 logger.error(
                     "privacycare DSR alert run: dsr_request={} right={} "
                     "kind={} is unowned and {} is not configured — alert "
@@ -277,7 +296,27 @@ def run_deadline_alerts(
             channel=channel.name,
             recipient=recipient,
         )
-        if not recorded:
+        if recorded:
+            # I1 (final review of plan 15): commit immediately after each
+            # successfully recorded alert, not only once at the end of the
+            # whole run (`_scheduled_dsr_deadline_alerts`'s own db.commit()
+            # after this function returns). Before this, the only commit
+            # was that final one; `Session.__exit__` closes without
+            # committing, so any escaping exception -- `timeline_days`
+            # raising ValueError for an unrecognised right (called
+            # uncaught, above), an OOM kill, a redeploy -- discarded every
+            # ledger row from the run even though the messages for rows
+            # processed earlier in the same run had already gone out, and
+            # the next run would re-send them. Committing here bounds that
+            # loss to the single in-flight alert -- one extra round trip
+            # per delivered alert, on a job that runs once a day. (I2: this
+            # does not close the send-then-record ordering's own, narrower
+            # window -- a second worker or a mid-run restart racing exactly
+            # this alert can still deliver the message twice, even though
+            # the ledger row itself is never duplicated. See dsr/alerts.py's
+            # module docstring.)
+            db.commit()
+        else:
             # A concurrent run recorded this exact (id, kind) between this
             # run's alert_due check and this insert. Delivery already
             # happened (channel.send returned normally above), so this is

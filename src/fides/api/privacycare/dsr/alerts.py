@@ -11,10 +11,21 @@
 # retry. record_alert degrades a collision to "already sent" (returns
 # False) rather than raising, so a concurrent second worker never crashes
 # the run.
+#
+# I2 (final review of plan 15): stated precisely, this is the LEDGER's
+# once-only guarantee, not delivery's. The unique constraint stops a second
+# ROW; it cannot stop a second MESSAGE. alert_job.py sends before it
+# records (see that module's docstring for why that order was chosen, and
+# why it was NOT inverted), so a second worker racing the same alert, or a
+# process restart between a successful send and this insert, can still
+# deliver the same message twice — the constraint only ever degrades the
+# second INSERT to a no-op, which is what `record_alert`'s False return
+# means below.
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta
 from math import ceil
-from typing import Optional
+from typing import Iterable, Optional
 
 import psycopg2.errorcodes  # type: ignore[import-untyped]
 import sqlalchemy
@@ -47,6 +58,13 @@ _INSERT_ALERT_SQL = sqlalchemy.text(
 _ALERTS_SENT_SQL = sqlalchemy.text(
     "SELECT kind FROM privacycare_dsr_alert WHERE dsr_request_id = :dsr_request_id"
 )
+
+# M1. The batched form's query: one round trip for however many ids the
+# caller is holding, grouped in Python rather than issued once per id.
+_ALERTS_SENT_MANY_SQL = sqlalchemy.text(
+    "SELECT dsr_request_id, kind FROM privacycare_dsr_alert "
+    "WHERE dsr_request_id IN :dsr_request_ids"
+).bindparams(sqlalchemy.bindparam("dsr_request_ids", expanding=True))
 
 
 def warn_threshold(days_allowed: int) -> int:
@@ -162,3 +180,39 @@ def alerts_sent_for(db: Session, dsr_request_id: str) -> frozenset[str]:
         _ALERTS_SENT_SQL, {"dsr_request_id": dsr_request_id}
     ).scalars().all()
     return frozenset(rows)
+
+
+def alerts_sent_for_many(
+    db: Session, dsr_request_ids: Iterable[str]
+) -> dict[str, frozenset[str]]:
+    """M1 (final review of plan 15). The batched form of `alerts_sent_for`,
+    covering however many register rows the caller is holding in ONE query
+    — matching the pattern `dsr/delegation.py`'s `fides_request_statuses`
+    already established one screen over in alert_job.py for the Fides
+    status read. `run_deadline_alerts` used to call `alerts_sent_for` once
+    per open, clocked, non-discharged row — an N+1 issued even for rows
+    that turn out not to be due once `alert_due` actually looks at the
+    threshold, i.e. most of the register on most days.
+
+    Ids are deduplicated and falsy ones dropped before the query runs; an
+    empty result short-circuits without touching the database at all — an
+    `IN ()` clause is wasted work at best. A `dsr_request_id` absent from
+    the returned mapping has no alerts on record at all; callers default to
+    `frozenset()` for it (`dict.get(id, frozenset())`), the same empty
+    value `alerts_sent_for` itself returns for a request with no ledger
+    rows.
+    """
+    ids = {dsr_request_id for dsr_request_id in dsr_request_ids if dsr_request_id}
+    if not ids:
+        return {}
+
+    rows = db.execute(
+        _ALERTS_SENT_MANY_SQL, {"dsr_request_ids": list(ids)}
+    ).all()
+    by_request: dict[str, set[str]] = defaultdict(set)
+    for dsr_request_id, kind in rows:
+        by_request[dsr_request_id].add(kind)
+    return {
+        dsr_request_id: frozenset(kinds)
+        for dsr_request_id, kinds in by_request.items()
+    }

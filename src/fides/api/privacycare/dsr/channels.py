@@ -24,11 +24,29 @@ from datetime import datetime
 from typing import Callable, List, Optional, Protocol
 
 import requests
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+# M5: `logging.getLogger(__name__)` (stdlib) used to sit here where every
+# other PrivacyCare module uses loguru's `logger` — differently-shaped call
+# sites (`%s` positional vs `{}`) for no reason tied to this module. Kept as
+# a plain `import logging` below only for the C2 fix, which has to reach
+# into urllib3's own stdlib logger by name — that is not this module's
+# logger and must stay stdlib to address urllib3's.
 
 _ENV_CHANNEL = "PRIVACYCARE_ALERT_CHANNEL"
 _ENV_TEAMS_WEBHOOK = "PRIVACYCARE_ALERT_TEAMS_WEBHOOK"
+
+# C2. `requests`/urllib3 log the full request line — scheme, host, port,
+# method, URL — at DEBUG (`urllib3.connectionpool.HTTPConnectionPool.
+# _make_request`), and for a Teams incoming webhook the URL PATH is the
+# bearer credential. Fides installs `InterceptHandler` on the ROOT logger
+# (`util/logger.py`), so a DEBUG-level deployment (`FIDES__DEV_MODE=True` —
+# which is also exactly what an operator reaches for when a webhook looks
+# broken) prints the token on every successful send unless this specific
+# logger is muted around the call. Named by string, not imported: urllib3 is
+# a `requests` dependency, not a PrivacyCare one, and importing it here only
+# to reach its logger would be a strange reason to add the dependency.
+_URLLIB3_CONNECTIONPOOL_LOGGER = "urllib3.connectionpool"
 
 _TEAMS = "teams"
 _LOGGING = "logging"
@@ -63,7 +81,18 @@ class AlertChannel(Protocol):
         """Raises on any failure to deliver — including a transport failure,
         not only a rejected request — so that a caller which only records
         the alert as sent on normal return never mistakes "could not even
-        reach the endpoint" for delivery."""
+        reach the endpoint" for delivery.
+
+        M4: any credential this implementation holds (a webhook URL, an API
+        token, a WhatsApp access token — whatever a future channel is
+        configured with) must never reach a log line or an exception
+        message that `send` lets escape. This is not only
+        `TeamsWebhookChannel`'s obligation to itself: the caller
+        (alert_job.py) logs a failed send's exception verbatim, so an
+        implementation that leaks its own credential through an unsanitised
+        exception leaks it again here, one level up, regardless of what
+        this docstring said before this line existed.
+        """
         ...
 
 
@@ -81,8 +110,8 @@ class LoggingChannel:
     def send(self, alert: Alert) -> None:
         self.sent.append(alert)
         logger.info(
-            "privacycare DSR alert (logging channel): request=%s right=%s "
-            "kind=%s days_left=%s recipient=%s",
+            "privacycare DSR alert (logging channel): request={} right={} "
+            "kind={} days_left={} recipient={}",
             alert.dsr_request_id,
             alert.right,
             alert.kind,
@@ -125,15 +154,31 @@ class TeamsWebhookChannel:
 
     The webhook URL is a bearer credential: anyone holding it can post into
     the customer's Teams channel, so it must never reach a log line or an
-    exception message. The non-2xx path only ever interpolates the response
-    status code. The transport-failure path needs its own guard: `requests`
-    characteristically embeds the request URL — webhook token included — in
-    the string form of a connection error (`HTTPSConnectionPool(...):
-    Max retries exceeded with url: /webhookb2/<guid>/IncomingWebhook/<token>/
-    ...`), so `send` catches the raw transport exception and re-raises
-    carrying only its type name, never its message and never itself as
-    `__cause__` (chaining would put the leaking text straight back into the
-    traceback).
+    exception message — two different routes, closed two different ways.
+
+    The exception route: the non-2xx path only ever interpolates the
+    response status code. The transport-failure path needs its own guard:
+    `requests` characteristically embeds the request URL — webhook token
+    included — in the string form of a connection error
+    (`HTTPSConnectionPool(...): Max retries exceeded with url:
+    /webhookb2/<guid>/IncomingWebhook/<token>/...`), so `send` catches the
+    raw transport exception and re-raises carrying only its type name, never
+    its message and never itself as `__cause__` (chaining would put the
+    leaking text straight back into the traceback).
+
+    The log route (C2, final review of plan 15): `requests`/urllib3 log the
+    full request line — including that same URL — at DEBUG regardless of
+    whether the exception path is ever reached, on every successful send as
+    much as a failed one (`urllib3.connectionpool.HTTPConnectionPool.
+    _make_request`). Fides installs its `InterceptHandler` on the root
+    logger, so any process running at DEBUG (`FIDES__DEV_MODE=True` —
+    itself exactly what an operator reaches for while diagnosing why a
+    webhook is not working) prints the token to the container log the
+    moment a real webhook URL is configured. `send` closes this by raising
+    `urllib3.connectionpool`'s own logger to WARNING for the duration of the
+    one call that can trigger it, then restoring whatever level it had
+    before — never touching the root logger or any other logger, so nothing
+    else's DEBUG output is affected.
     """
 
     name = _TEAMS
@@ -148,20 +193,39 @@ class TeamsWebhookChannel:
         self._post = post or requests.post
 
     def send(self, alert: Alert) -> None:
-        # A transport exception (timeout, DNS failure, refused connection,
-        # TLS error) is caught here rather than left to propagate: with the
-        # real transport, `requests`/urllib3 render the target URL — webhook
-        # token included — into the exception's own message, so letting it
-        # through unchanged would write the credential into whatever catches
-        # it upstream (logs, an error tracker, a traceback). Only the
-        # exception's type name survives; `from None` stops the original
-        # (and its message) from riding along as `__cause__`.
+        # M6: built outside the transport `try` below — a serialisation bug
+        # in `_teams_card` has nothing to do with the transport and must not
+        # be re-raised as "Teams webhook transport failure: TypeError",
+        # which would send whoever triages it looking at the network
+        # instead of the payload.
+        card = _teams_card(alert)
+
+        # C2: mute urllib3's own request-line logging for exactly the
+        # duration of the call that can trigger it (see the class
+        # docstring). Saved and restored, never hard-set to a fixed level —
+        # an operator's own explicit level for this logger must survive a
+        # send that happens to run while they're debugging something else.
+        urllib3_logger = logging.getLogger(_URLLIB3_CONNECTIONPOOL_LOGGER)
+        previous_urllib3_level = urllib3_logger.level
+        urllib3_logger.setLevel(logging.WARNING)
         try:
-            response = self._post(self._webhook_url, json=_teams_card(alert))
-        except Exception as exc:
-            raise RuntimeError(
-                f"Teams webhook transport failure: {type(exc).__name__}"
-            ) from None
+            # A transport exception (timeout, DNS failure, refused
+            # connection, TLS error) is caught here rather than left to
+            # propagate: with the real transport, `requests`/urllib3 render
+            # the target URL — webhook token included — into the
+            # exception's own message, so letting it through unchanged
+            # would write the credential into whatever catches it upstream
+            # (logs, an error tracker, a traceback). Only the exception's
+            # type name survives; `from None` stops the original (and its
+            # message) from riding along as `__cause__`.
+            try:
+                response = self._post(self._webhook_url, json=card)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Teams webhook transport failure: {type(exc).__name__}"
+                ) from None
+        finally:
+            urllib3_logger.setLevel(previous_urllib3_level)
 
         if response.status_code < 200 or response.status_code >= 300:
             # Named: the status code, never the URL. A caller triaging a

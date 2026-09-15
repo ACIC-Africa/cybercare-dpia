@@ -310,6 +310,28 @@ def test_an_unowned_obligation_goes_to_the_escalation_address(db, monkeypatch):
     assert alerts_sent_for(db, other_id) == frozenset()
 
 
+def test_a_blank_escalation_address_is_treated_the_same_as_unset(db, monkeypatch):
+    # M3, final review of plan 15. `PRIVACYCARE_ALERT_ESCALATION_EMAIL=`
+    # (present but empty) reads back as `""` from os.environ.get, which
+    # passes an `is None` check -- the bug this test catches -- and would
+    # be sent as the destination and recorded in the ledger as delivered,
+    # never retried, to nobody. `if not recipient` (the fix) treats "" the
+    # same as unset: logged, counted in unowned, nothing attempted.
+    monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
+    monkeypatch.setenv("PRIVACYCARE_ALERT_ESCALATION_EMAIL", "")
+
+    request_id = record_request(db, right="access", subject_identifier=_subject())
+    _set_deadline(db, request_id, NOW - timedelta(hours=1))
+
+    channel = LoggingChannel()
+    summary = run_deadline_alerts(db, channel=channel, now=NOW)
+
+    assert summary.unowned == 1
+    assert (summary.attempted, summary.sent, summary.failed) == (0, 0, 0)
+    assert channel.sent == []
+    assert alerts_sent_for(db, request_id) == frozenset()
+
+
 def test_a_channel_failure_leaves_the_alert_unsent_and_unrecorded(db):
     # D-AL-7 / acceptance 7. If a failed send were recorded, the unique
     # constraint would suppress the retry forever — the owner would never be
@@ -369,6 +391,122 @@ def test_the_statuses_are_read_in_one_query_not_one_per_row(db):
         sqlalchemy.event.remove(db.get_bind(), "before_cursor_execute", _record)
 
     assert len(seen) == 1, f"expected one batched read, got {len(seen)}"
+
+
+def test_the_alert_ledger_is_read_in_one_query_not_one_per_row(db):
+    # M1, final review of plan 15. alerts_sent_for used to be called once
+    # per open, clocked, non-discharged row -- issued even for rows that
+    # turn out not to be due once alert_due looks at the threshold, which
+    # is most of the register on most days. Batched the same way as the
+    # Fides-status read just above (test_the_statuses_are_read_in_one_
+    # query_not_one_per_row), via alerts_sent_for_many.
+    for _ in range(3):
+        request_id = record_request(db, right="access", subject_identifier=_subject(),
+                                    owner_email="ops@customer.co.ke")
+        _set_deadline(db, request_id, NOW + timedelta(days=1))
+
+    seen: list = []
+
+    @sqlalchemy.event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _record(conn, cursor, statement, *args):  # noqa: ANN001
+        lowered = statement.lower()
+        if "select" in lowered and "privacycare_dsr_alert" in lowered:
+            seen.append(statement)
+
+    try:
+        run_deadline_alerts(db, channel=LoggingChannel(), now=NOW)
+    finally:
+        sqlalchemy.event.remove(db.get_bind(), "before_cursor_execute", _record)
+
+    assert len(seen) == 1, f"expected one batched read, got {len(seen)}"
+
+
+def test_each_successfully_recorded_alert_is_committed_immediately(db, monkeypatch):
+    # I1, final review of plan 15. Before this fix, run_deadline_alerts
+    # never committed at all -- only _scheduled_dsr_deadline_alerts did,
+    # once, after the whole loop. Session.__exit__ closes without
+    # committing, so an escaping exception anywhere in the loop (an
+    # unrecognised right raising ValueError out of timeline_days, an OOM
+    # kill, a redeploy) discarded every ledger row from the run even though
+    # the messages for rows processed earlier had already gone out.
+    #
+    # The `db` fixture already monkeypatches `commit` to `flush` (never a
+    # no-op) so nothing here survives the test's own rollback -- what this
+    # proves is that `db.commit` is now CALLED once per successfully
+    # recorded alert, not once at the very end of the run.
+    ids = []
+    for _ in range(3):
+        request_id = record_request(db, right="access", subject_identifier=_subject(),
+                                    owner_email="ops@customer.co.ke")
+        _set_deadline(db, request_id, NOW - timedelta(hours=1))
+        ids.append(request_id)
+
+    commit_calls = []
+    real_commit = db.commit  # the fixture's flush stand-in
+
+    def _counting_commit():
+        real_commit()
+        commit_calls.append(True)
+
+    monkeypatch.setattr(db, "commit", _counting_commit)
+
+    summary = run_deadline_alerts(db, channel=LoggingChannel(), now=NOW)
+
+    assert summary.sent == 3
+    assert len(commit_calls) == 3, (
+        f"expected one commit per successfully recorded alert (3), got "
+        f"{len(commit_calls)} -- commits are batched to the end of the "
+        f"run rather than happening immediately after each success"
+    )
+    for request_id in ids:
+        assert alerts_sent_for(db, request_id) == frozenset({"breached"})
+
+
+def test_a_crash_mid_run_still_commits_the_alerts_already_sent(db, monkeypatch):
+    # I1. The bounded-loss claim directly: a row processed BEFORE an
+    # escaping exception must already be committed by the time the
+    # exception propagates out of run_deadline_alerts, so the next run
+    # (the retry a caught D-AL-7 failure relies on) does not re-send an
+    # alert that already went out. `timeline_days` is forced to raise on
+    # the SECOND row only -- the same failure mode as an unrecognised
+    # right, uncaught anywhere in the loop (alert_job.py calls it directly,
+    # with no try/except, unlike channel.send).
+    ok_id = record_request(db, right="access", subject_identifier=_subject(),
+                           owner_email="a@customer.co.ke")
+    _set_deadline(db, ok_id, NOW - timedelta(hours=1))
+    crashes_id = record_request(db, right="access", subject_identifier=_subject(),
+                                owner_email="b@customer.co.ke")
+    _set_deadline(db, crashes_id, NOW - timedelta(hours=1))
+
+    import fides.api.privacycare.dsr.alert_job as alert_job_module
+
+    real_timeline_days = alert_job_module.timeline_days
+    calls = {"n": 0}
+
+    def _timeline_days_that_crashes_on_the_second_row(db_, right):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ValueError("simulated crash mid-run")
+        return real_timeline_days(db_, right)
+
+    monkeypatch.setattr(
+        alert_job_module, "timeline_days", _timeline_days_that_crashes_on_the_second_row
+    )
+
+    commit_calls = []
+    real_commit = db.commit
+    monkeypatch.setattr(
+        db, "commit", lambda: (real_commit(), commit_calls.append(True))
+    )
+
+    with pytest.raises(ValueError, match="simulated crash mid-run"):
+        run_deadline_alerts(db, channel=LoggingChannel(), now=NOW)
+
+    # Exactly one commit happened -- for the row processed before the
+    # crash. Without the fix, this would be zero: nothing commits until
+    # the whole loop finishes, which it never does here.
+    assert len(commit_calls) == 1
+    assert alerts_sent_for(db, ok_id) == frozenset({"breached"})
 
 
 def test_initiate_scheduled_dsr_alerts_is_a_noop_under_test_mode(db):

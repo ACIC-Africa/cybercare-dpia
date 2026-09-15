@@ -9,15 +9,19 @@ PrivacyCare's own Alembic chain. Touches no Ethyca table: the only foreign
 key is to privacycare_dsr_request, which this same chain created
 (ff91bc4d23d9_dsr_register.py).
 
-This table IS the once-only guarantee plan 15 / D-DSR-5 demands: the unique
-constraint on (dsr_request_id, kind) is what stops an alert repeating, not a
-flag on the request row — a flag would lose to a second worker, a restart
-mid-run, or a retry, and an owner who gets the same warning twice stops
-reading the channel. ondelete='CASCADE' on dsr_request_id (unlike
-business_process_id's SET NULL on the parent table): an alert ledger row has
-no meaning once the obligation it warned about is gone, so it does not
-survive deleting the request the way a regulatory record survives losing a
-business-process link.
+This table IS the once-only guarantee plan 15 / D-DSR-5 demands FOR THE
+LEDGER ROW: the unique constraint on (dsr_request_id, kind) is what stops a
+ROW repeating, not a flag on the request row — a flag would lose to a
+second worker, a restart mid-run, or a retry. I2 (final review of plan 15):
+that is narrower than "stops an alert repeating" — a second worker or a
+mid-run restart racing the same alert can still re-deliver the underlying
+MESSAGE before this table's insert lands; the constraint only ever
+degrades the second insert to a no-op, never lets a second row through.
+ondelete='CASCADE' on dsr_request_id (unlike business_process_id's SET
+NULL on the parent table): an alert ledger row has no meaning once the
+obligation it warned about is gone, so it does not survive deleting the
+request the way a regulatory record survives losing a business-process
+link.
 """
 import sqlalchemy as sa
 from alembic import op

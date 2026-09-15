@@ -105,9 +105,12 @@ def _fides_privacy_request_status(
     `PrivacyRequest.get_by` itself, one full-entity load per row — the same
     N+1 `fides_request_statuses`'s own docstring names as the reason it
     exists (`_filtered_final_upload` / `access_result_urls` are
-    multi-megabyte columns). Every caller below now fetches the map once
-    (one row for a single-request response, one page's worth for the list
-    route) and passes it in here instead of a db handle.
+    multi-megabyte columns). Every caller below now fetches the map once —
+    one row for a single-request response; for the list route (M2, final
+    review of plan 15: corrected here — it is NOT "one page's worth", see
+    that route's own docstring), the WHOLE filtered register, since
+    `list_dsr_requests` fetches statuses before `paginate` slices the
+    response in Python — and passes it in here instead of a db handle.
     """
     if fides_privacy_request_id is None:
         return None

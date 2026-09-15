@@ -4,6 +4,7 @@ Meta credentials exist (spec D-AL-1).
 No test here performs real network I/O: TeamsWebhookChannel takes an injectable
 transport precisely so the suite can prove its behaviour without a webhook.
 """
+import logging
 import traceback
 from datetime import datetime, timezone
 
@@ -107,6 +108,99 @@ def test_the_webhook_url_never_appears_in_a_transport_exception_message():
         )
     )
     assert "super-secret-token" not in rendered
+
+
+def test_urllib3_request_logging_never_prints_the_webhook_token(caplog):
+    # C2, final review of plan 15. The docstring's other half: even a
+    # SUCCESSFUL send must not leak the token, because it is the real
+    # transport (`requests`/urllib3), not this module, that would print it
+    # -- at DEBUG, via `urllib3.connectionpool.HTTPConnectionPool.
+    # _make_request`'s own `log.debug('%s://%s:%s "%s %s %s" %s %s', ...,
+    # url, ...)` call (connectionpool.py, around line 545), where `url` is
+    # the request PATH -- webhook token included. Fides runs
+    # `InterceptHandler` on the root logger at DEBUG in this deployment
+    # (FIDES__DEV_MODE=True), so that call alone is the whole exposure.
+    #
+    # No real network I/O: the fake transport below does not open a socket,
+    # but it DOES call the real "urllib3.connectionpool" logger the same
+    # way urllib3's own code does, with the fixture token embedded in the
+    # message the same way a real request would embed it in the URL --
+    # standing in for the real transport without needing one, per the
+    # "drive a fake transport that makes the real urllib3 log call"
+    # instruction this test exists to satisfy.
+    urllib3_logger = logging.getLogger("urllib3.connectionpool")
+
+    def fake_post_that_logs_like_the_real_transport(url, **kwargs):
+        urllib3_logger.debug(
+            '%s://%s:%s "%s %s %s" %s %s',
+            "https",
+            "example.invalid",
+            443,
+            "POST",
+            url,
+            "HTTP/1.1",
+            200,
+            0,
+        )
+        return type("R", (), {"status_code": 200, "text": "1"})()
+
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        TeamsWebhookChannel(
+            WEBHOOK, post=fake_post_that_logs_like_the_real_transport
+        ).send(_alert())
+
+    for record in caplog.records:
+        assert "super-secret-token" not in record.getMessage(), (
+            f"the webhook token appeared in a captured log record: "
+            f"{record.getMessage()!r}"
+        )
+
+
+def test_urllib3_logging_is_restored_to_its_previous_level_after_send():
+    # The suppression must be temporary and must restore whatever level the
+    # logger had before -- not hard-code a level -- so an operator's own
+    # explicit configuration for this logger survives a send that happens
+    # to run while they're debugging something unrelated.
+    urllib3_logger = logging.getLogger("urllib3.connectionpool")
+    urllib3_logger.setLevel(logging.INFO)
+    try:
+
+        def fake_post(url, **kwargs):
+            # Mid-send, the level must be suppressed (raised to WARNING or
+            # above), not left at whatever it was before this call.
+            assert urllib3_logger.level >= logging.WARNING
+            return type("R", (), {"status_code": 200, "text": "1"})()
+
+        TeamsWebhookChannel(WEBHOOK, post=fake_post).send(_alert())
+        assert urllib3_logger.level == logging.INFO
+    finally:
+        urllib3_logger.setLevel(logging.NOTSET)
+
+
+def test_a_serialisation_bug_is_not_reported_as_a_transport_failure():
+    # M6. `_teams_card` sat inside the transport `try` before this fix, so a
+    # bug in it (unserialisable field, whatever) would be caught by the
+    # same `except Exception` as a real transport failure and re-raised as
+    # "Teams webhook transport failure: <type>" -- sending whoever triages
+    # it looking at the network instead of the payload. Force such a bug by
+    # handing `send` an Alert with a `days_left` that breaks the card's own
+    # f-string interpolation is hard to arrange without breaking the
+    # dataclass's typing, so instead this monkeypatches `_teams_card`
+    # itself to raise, and asserts the ORIGINAL exception type propagates
+    # unwrapped -- proof the transport `try` no longer covers it.
+    import fides.api.privacycare.dsr.channels as channels_module
+
+    original_teams_card = channels_module._teams_card
+
+    def _boom(alert):
+        raise TypeError("not a card")
+
+    channels_module._teams_card = _boom
+    try:
+        with pytest.raises(TypeError, match="not a card"):
+            TeamsWebhookChannel(WEBHOOK, post=lambda url, **kw: None).send(_alert())
+    finally:
+        channels_module._teams_card = original_teams_card
 
 
 def test_the_null_channel_sends_nothing_and_the_logging_channel_records():

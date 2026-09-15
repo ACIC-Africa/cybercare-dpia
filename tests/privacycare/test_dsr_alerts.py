@@ -17,6 +17,7 @@ from fides.api.privacycare.dsr.alerts import (
     BREACHED,
     alert_due,
     alerts_sent_for,
+    alerts_sent_for_many,
     record_alert,
     warn_threshold,
 )
@@ -117,6 +118,40 @@ def test_an_unknown_kind_is_rejected(db):
     with pytest.raises(ValueError, match="nagging"):
         record_alert(db, dsr_request_id=request_id, kind="nagging",
                      channel="logging", recipient=None)
+
+
+def test_alerts_sent_for_many_matches_the_single_id_form_batched(db):
+    # M1, final review of plan 15. The batched form must return exactly
+    # what looking each id up individually with alerts_sent_for would --
+    # just in one query instead of one per id (alert_job.py's own test
+    # proves the query count; this proves the values).
+    with_both = record_request(db, right="erasure",
+                               subject_identifier=f"s-{uuid.uuid4().hex[:8]}@example.com")
+    record_alert(db, dsr_request_id=with_both, kind=APPROACHING,
+                 channel="logging", recipient=None)
+    record_alert(db, dsr_request_id=with_both, kind=BREACHED,
+                 channel="logging", recipient=None)
+
+    with_one = record_request(db, right="access",
+                              subject_identifier=f"s-{uuid.uuid4().hex[:8]}@example.com")
+    record_alert(db, dsr_request_id=with_one, kind=APPROACHING,
+                 channel="logging", recipient=None)
+
+    with_none = record_request(db, right="access",
+                               subject_identifier=f"s-{uuid.uuid4().hex[:8]}@example.com")
+
+    by_request = alerts_sent_for_many(db, [with_both, with_one, with_none])
+
+    assert by_request.get(with_both, frozenset()) == frozenset({APPROACHING, BREACHED})
+    assert by_request.get(with_one, frozenset()) == frozenset({APPROACHING})
+    # A request with no alerts on record is absent from the mapping
+    # entirely -- callers default to frozenset() for it, same as
+    # alerts_sent_for's own empty return.
+    assert with_none not in by_request
+
+
+def test_alerts_sent_for_many_short_circuits_on_an_empty_id_list(db):
+    assert alerts_sent_for_many(db, []) == {}
 
 
 # --- Fix round 1 findings -----------------------------------------------

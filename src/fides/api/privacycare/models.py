@@ -299,8 +299,14 @@ dsr_alert_table = Table(
 @mapper_registry.mapped
 class DsrAlert:
     # One row per alert actually delivered. This table IS the once-only
-    # guarantee D-DSR-5 demands: a flag in the request row would lose to a
-    # second worker, a restart mid-run, or a retry, and an owner who gets the
-    # same warning twice stops reading the channel — at which point the
-    # mechanism is worse than not having built it.
+    # guarantee D-DSR-5 demands FOR THE LEDGER: a flag in the request row
+    # would lose to a second worker, a restart mid-run, or a retry, so the
+    # unique constraint on (dsr_request_id, kind) lives here instead. I2
+    # (final review of plan 15): that is the row's guarantee, not
+    # delivery's — a second worker or a mid-run restart racing the same
+    # alert can still re-deliver the underlying MESSAGE before this row is
+    # written; only the second INSERT is stopped, degrading to a no-op
+    # rather than a duplicate row. An owner who gets the same warning twice
+    # occasionally is a smaller failure than a channel muted by a genuinely
+    # repeating alert, which is what this table exists to prevent.
     __table__ = dsr_alert_table
