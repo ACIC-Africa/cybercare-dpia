@@ -35,6 +35,23 @@ def scratch_connection(db):
     connection = ConnectionConfig.get_by(db, field="key", value=SCRATCH_KEY)
     if connection is None:
         pytest.skip(f"{SCRATCH_KEY} is not seeded; run scripts/privacycare/seed_connection.py --commit")
+
+    # TWO NETWORK VIEWS, ON PURPOSE (see scripts/privacycare/seed_connection.py's
+    # own "TWO DIFFERENT NETWORK VIEWS" docstring section). The row on disk
+    # deliberately holds the CONTAINER's view of fides-db (host="fides-db",
+    # port=5432) — that is what the live `fides` API container needs to
+    # reach this same datastore in production, and it is Docker-internal
+    # DNS, not host DNS. Host-side pytest is not on that network and cannot
+    # resolve "fides-db" at all. Rather than depending on a host
+    # `/etc/hosts` entry (wrong on any other machine, wrong in CI, and
+    # stale the moment the container is recreated with a new bridge IP),
+    # override the in-memory secrets to the HOST's view (127.0.0.1:5442,
+    # the docker-compose port mapping — same host/port as this file's own
+    # DB_URL) for the life of this test only. This mutates the ORM instance
+    # inside the `db` fixture's session, which is rolled back at teardown,
+    # so the row on disk keeps the container view production needs; only
+    # this in-memory copy, local to the test process, sees the host view.
+    connection.secrets = {**connection.secrets, "host": "127.0.0.1", "port": 5442}
     return connection
 
 
@@ -108,15 +125,49 @@ def test_information_schema_is_never_walked(scratch_connection):
 
 def test_a_named_scope_limits_the_walk(scratch_connection):
     # D-EX-8: a monitor naming databases scans only those.
-    everything = walk_catalogue(scratch_connection, monitor_key="m1",
-                                databases=[], excluded_databases=[])
-    a_schema = next(r for r in everything if r.resource_type == "Schema")
-    schema_name = a_schema.name
+    #
+    # The scratch database's only non-system schema is "public" -- an
+    # unscoped walk always returns exactly {"public"}, so scoping to
+    # "public" and asserting the result is {"public"} would hold whether the
+    # inclusion filter is present, inverted, or deleted: there is nothing
+    # for a broken filter to wrongly include. A second, genuinely distinct
+    # schema is required so the test has something to prove the filter
+    # excludes.
+    #
+    # `db`'s own transaction (rolled back at teardown) is NOT enough to
+    # create it: walk_catalogue opens its own connection via
+    # get_connector()/create_client(), a separate Postgres backend session
+    # from `db`'s, and Postgres never lets one session see another
+    # session's uncommitted writes -- verified directly (see task-1-report.md):
+    # a schema created and flushed, but not committed, in one connection
+    # does not appear in get_schema_names() on a second, independent
+    # connection to the same database. So the probe schema below is created
+    # on its own autocommit connection -- genuinely committed, so the walk's
+    # own separate connection actually sees it -- and dropped again in a
+    # `finally` on that same connection. That is a real create-then-drop,
+    # not a transactional rollback, but the net effect is identical: nothing
+    # is left behind. The DB enumeration check (schema count back to
+    # baseline) is the proof.
+    probe_schema = f"t11_scope_probe_{uuid.uuid4().hex[:8]}"
+    probe_engine = sqlalchemy.create_engine(DB_URL, isolation_level="AUTOCOMMIT")
+    try:
+        with probe_engine.connect() as conn:
+            conn.execute(sqlalchemy.text(f'CREATE SCHEMA "{probe_schema}"'))
 
-    scoped = walk_catalogue(scratch_connection, monitor_key="m1",
-                            databases=[schema_name], excluded_databases=[])
+        everything = walk_catalogue(scratch_connection, monitor_key="m1",
+                                    databases=[], excluded_databases=[])
+        schema_names = {r.name for r in everything if r.resource_type == "Schema"}
+        assert probe_schema in schema_names, "probe schema was not visible to the walk"
 
-    assert {r.name for r in scoped if r.resource_type == "Schema"} == {schema_name}
+        scoped = walk_catalogue(scratch_connection, monitor_key="m1",
+                                databases=["public"], excluded_databases=[])
+
+        scoped_schema_names = {r.name for r in scoped if r.resource_type == "Schema"}
+        assert scoped_schema_names == {"public"}, scoped_schema_names
+    finally:
+        with probe_engine.connect() as conn:
+            conn.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS "{probe_schema}" CASCADE'))
+        probe_engine.dispose()
 
 
 def test_an_excluded_scope_removes_it(scratch_connection):
@@ -154,6 +205,19 @@ def test_an_unreachable_connection_raises_naming_the_connection(db):
                            "username": "u", "password": "p"}
     db.add(unreachable)
     db.flush()
+    # A plain attribute assignment (connection_type="postgres" above) never
+    # goes through the Enum column's result-processing -- only a DB load
+    # does -- so without this, `connection_type` stays the raw str
+    # "postgres" rather than becoming ConnectionType.postgres, and
+    # get_connector() dies one step earlier than intended, at
+    # `conn_config.connection_type.value` ('str' object has no attribute
+    # 'value'), before anything ever tries to open a socket. db.refresh()
+    # reloads the row from the DB within this same (uncommitted, still
+    # rolled back at teardown) transaction, which does run it through the
+    # column's result processor and coerces connection_type to the real
+    # enum -- letting get_connector() succeed and the connect attempt to
+    # 127.0.0.1:1 actually happen.
+    db.refresh(unreachable)
 
     with pytest.raises(Exception) as caught:
         walk_catalogue(unreachable, monitor_key="m1", databases=[], excluded_databases=[])
