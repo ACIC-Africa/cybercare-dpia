@@ -10,6 +10,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Integer,
     MetaData,
     String,
     Table,
@@ -172,3 +173,82 @@ declaration_ground_table = Table(
 class DeclarationGround:
     # D-KT-5: which Kenyan ground produced this declaration's Article 6 value.
     __table__ = declaration_ground_table
+
+
+dsr_timeline_table = Table(
+    "privacycare_dsr_timeline",
+    PRIVACYCARE_METADATA,
+    Column("right", String(32), primary_key=True),
+    # Nullable on purpose: the brief gives objection no timeline, and inventing
+    # one would decide when a controller is in breach. NULL means "unclocked",
+    # which is a reportable state, not a missing value (OQ-PRIVACY-02, Carol).
+    Column("days", Integer),
+    Column("source_note", Text),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+)
+
+
+@mapper_registry.mapped
+class DsrTimeline:
+    # How long Kenya gives a controller to answer each right. A table rather
+    # than a constant because two of these values are still open questions for
+    # the SME, and answering one must not require a deploy.
+    __table__ = dsr_timeline_table
+
+
+dsr_request_table = Table(
+    "privacycare_dsr_request",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column(
+        "right",
+        String(32),
+        ForeignKey("privacycare_dsr_timeline.right"),
+        nullable=False,
+        index=True,
+    ),
+    Column("subject_identifier", String(255), nullable=False),
+    Column(
+        "received_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    # Computed from the timeline at creation and then FROZEN: a later change to
+    # the timeline table must not silently move a live obligation's deadline.
+    # NULL where the right is unclocked.
+    Column("deadline_at", DateTime(timezone=True)),
+    Column("owner_email", String(255)),
+    Column("status", String(32), nullable=False, server_default="open"),
+    Column("outcome", String(32)),
+    Column("outcome_grounds", Text),
+    Column("decided_by", String(255)),
+    Column("decided_at", DateTime(timezone=True)),
+    Column("subject_notified_at", DateTime(timezone=True)),
+    # No FK: privacyrequest's lifecycle belongs to upstream Fides, same reason
+    # process_declaration_table carries no FK to privacydeclaration. NULL for
+    # restriction and objection, which move no data and so have no Fides side.
+    Column("fides_privacy_request_id", String(255), index=True),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+)
+
+
+@mapper_registry.mapped
+class DsrRequest:
+    # A Kenyan data-subject right the customer owes an answer to. Fides has a
+    # privacy request, but it is anchored on execution — it exists to move data
+    # across integrations. Two of Kenya's six rights move no data at all, and
+    # Fides has no owner field to alert, which is why the obligation lives here
+    # and only the data movement is delegated (spec D-DSR-1, Barbara 2026-09-15).
+    __table__ = dsr_request_table
