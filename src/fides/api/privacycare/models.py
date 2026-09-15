@@ -275,3 +275,32 @@ class DsrRequest:
     # Fides has no owner field to alert, which is why the obligation lives here
     # and only the data movement is delegated (spec D-DSR-1, Barbara 2026-09-15).
     __table__ = dsr_request_table
+
+
+dsr_alert_table = Table(
+    "privacycare_dsr_alert",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column(
+        "dsr_request_id",
+        String(255),
+        ForeignKey("privacycare_dsr_request.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("kind", String(32), nullable=False),
+    Column("sent_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("channel", String(32), nullable=False),
+    Column("recipient", String(255)),
+    UniqueConstraint("dsr_request_id", "kind", name="uq_privacycare_dsr_alert"),
+)
+
+
+@mapper_registry.mapped
+class DsrAlert:
+    # One row per alert actually delivered. This table IS the once-only
+    # guarantee D-DSR-5 demands: a flag in the request row would lose to a
+    # second worker, a restart mid-run, or a retry, and an owner who gets the
+    # same warning twice stops reading the channel — at which point the
+    # mechanism is worse than not having built it.
+    __table__ = dsr_alert_table
