@@ -23,7 +23,7 @@ from fides.api.privacycare.dsr.alert_job import (
 from fides.api.privacycare.dsr.alerts import alerts_sent_for
 from fides.api.privacycare.dsr.channels import LoggingChannel
 from fides.api.privacycare.dsr.delegation import delegate, ensure_kenyan_policies
-from fides.api.privacycare.dsr.register import record_request
+from fides.api.privacycare.dsr.register import record_decision, record_request
 from fides.api.privacycare.dsr.timelines import seed_timelines
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -85,7 +85,7 @@ def test_an_obligation_at_its_threshold_warns_its_owner_once(db):
     first = run_deadline_alerts(db, channel=channel, now=NOW)
 
     assert first == RunSummary(
-        attempted=1, sent=1, failed=0, skipped_discharged=0,
+        attempted=1, sent=1, failed=0, skipped_closed=0, skipped_discharged=0,
         unclocked=0, vanished=0, unowned=0,
     )
     assert len(channel.sent) == 1
@@ -95,7 +95,7 @@ def test_an_obligation_at_its_threshold_warns_its_owner_once(db):
 
     second = run_deadline_alerts(db, channel=channel, now=NOW)
     assert second == RunSummary(
-        attempted=0, sent=0, failed=0, skipped_discharged=0,
+        attempted=0, sent=0, failed=0, skipped_closed=0, skipped_discharged=0,
         unclocked=0, vanished=0, unowned=0,
     )
     assert len(channel.sent) == 1, "the second run must send nothing"
@@ -120,6 +120,46 @@ def test_a_breached_obligation_escalates_once_and_distinctly(db):
     again = run_deadline_alerts(db, channel=channel, now=NOW)
     assert (again.attempted, again.sent) == (0, 0)
     assert len(channel.sent) == 1
+
+
+def test_the_alert_reports_days_left_correctly_at_its_boundaries(db):
+    # Fix round 1, Finding 2. The ceil-for-future / floor-for-past split
+    # in _days_left exists precisely so "due today" and "just breached"
+    # read differently — nothing asserted that anywhere. Read it off the
+    # Alert payloads actually delivered, at the three instants the split
+    # was built to distinguish.
+    exactly_now = record_request(
+        db, right="access", subject_identifier=_subject(),
+        owner_email="ops@customer.co.ke",
+    )
+    _set_deadline(db, exactly_now, NOW)  # remaining == 0: breached, days_left == 0
+
+    just_passed = record_request(
+        db, right="access", subject_identifier=_subject(),
+        owner_email="ops@customer.co.ke",
+    )
+    # a hair past the deadline: still breached, but days_left must NOT
+    # read 0 — that would misreport "just breached" as "due today".
+    _set_deadline(db, just_passed, NOW - timedelta(seconds=1))
+
+    six_hours_out = record_request(
+        db, right="access", subject_identifier=_subject(),
+        owner_email="ops@customer.co.ke",
+    )
+    # inside the 3-day approaching threshold (warn_threshold(7) == 3), and
+    # ceil(0.25) must round UP to 1, not truncate to 0.
+    _set_deadline(db, six_hours_out, NOW + timedelta(hours=6))
+
+    channel = LoggingChannel()
+    run_deadline_alerts(db, channel=channel, now=NOW)
+
+    by_id = {alert.dsr_request_id: alert for alert in channel.sent}
+    assert by_id[exactly_now].kind == "breached"
+    assert by_id[exactly_now].days_left == 0
+    assert by_id[just_passed].kind == "breached"
+    assert by_id[just_passed].days_left == -1
+    assert by_id[six_hours_out].kind == "approaching"
+    assert by_id[six_hours_out].days_left == 1
 
 
 def test_an_objection_is_never_alerted_and_is_reported_as_unclocked(db):
@@ -159,6 +199,60 @@ def test_an_obligation_fides_already_completed_is_not_alerted(db):
     summary = run_deadline_alerts(db, channel=channel, now=NOW)
 
     assert summary.skipped_discharged == 1
+    assert summary.attempted == 0
+    assert channel.sent == []
+    assert alerts_sent_for(db, request_id) == frozenset()
+
+
+def test_a_closed_non_delegating_obligation_is_not_alerted(db):
+    # Fix round 1, Finding 1. Rectification never delegates (no Fides
+    # analogue exists), so nothing about Fides' status could ever have
+    # protected it — only the register's own status can. Barbara's ruling
+    # makes the register the record of truth: a human closed this, so it
+    # is never alerted on, breached or not.
+    request_id = record_request(
+        db, right="rectification", subject_identifier=_subject(),
+        owner_email="ops@customer.co.ke",
+    )
+    _set_deadline(db, request_id, NOW - timedelta(hours=1))  # would otherwise breach
+    record_decision(
+        db, request_id=request_id, outcome="granted",
+        grounds="corrected per subject's request", decided_by="dpo@customer.co.ke",
+    )
+
+    channel = LoggingChannel()
+    summary = run_deadline_alerts(db, channel=channel, now=NOW)
+
+    assert summary.skipped_closed == 1
+    assert summary.attempted == 0
+    assert summary.unclocked == 0
+    assert channel.sent == []
+    assert alerts_sent_for(db, request_id) == frozenset()
+
+
+def test_a_closed_delegating_obligation_is_not_alerted_even_mid_flight(db):
+    # Fix round 1, Finding 1. The register row is closed, but Fides' side
+    # is still merely "pending" — not "complete", so the discharge check
+    # (skipped_discharged) would NOT have caught this on its own. The
+    # register's own status must take priority regardless of what Fides
+    # separately reports.
+    ensure_kenyan_policies(db)
+    request_id = record_request(
+        db, right="access", subject_identifier=_subject(),
+        owner_email="ops@customer.co.ke",
+    )
+    delegate(db, request_id=request_id)
+    _set_deadline(db, request_id, NOW - timedelta(hours=1))  # would otherwise breach
+    record_decision(
+        db, request_id=request_id, outcome="granted",
+        grounds="access package delivered", decided_by="dpo@customer.co.ke",
+    )
+
+    channel = LoggingChannel()
+    summary = run_deadline_alerts(db, channel=channel, now=NOW)
+
+    assert summary.skipped_closed == 1
+    assert summary.skipped_discharged == 0
     assert summary.attempted == 0
     assert channel.sent == []
     assert alerts_sent_for(db, request_id) == frozenset()

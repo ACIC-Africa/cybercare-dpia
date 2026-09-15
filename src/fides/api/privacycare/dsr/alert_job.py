@@ -42,20 +42,38 @@ _DISCHARGED_STATUS = PrivacyRequestStatus.complete.value
 
 DSR_DEADLINE_ALERTS_JOB = "privacycare_dsr_deadline_alerts"
 
+# Fix round 1, Finding 1. record_request's INSERT defaults this to "open"
+# (migration ff91bc4d23d9); record_decision (register.py) is the only
+# writer that ever moves it, to "closed". No other value exists today, but
+# this checks "is open" rather than "is closed" so an unanticipated future
+# status is treated the safer way — as not-open, i.e. do not alert on it —
+# rather than silently falling through to the live-obligation path.
+_REGISTER_STATUS_OPEN = "open"
+
 
 @dataclass(frozen=True)
 class RunSummary:
-    """One run's whole story, in seven numbers an operator can read without
+    """One run's whole story, in eight numbers an operator can read without
     opening a log. `attempted` always equals `sent + failed` — every
     obligation the run actually tried to deliver an alert for lands in
     exactly one of those two. Everything else in the register that day
     either was not yet due (no counter — the common case, most of the
     register on most days) or is accounted for by exactly one of
-    skipped_discharged / unclocked / vanished / unowned."""
+    skipped_closed / skipped_discharged / unclocked / vanished / unowned.
+
+    skipped_closed and skipped_discharged are deliberately two different
+    counters, not one (fix round 1, Finding 1): "a human recorded a
+    decision and closed the register row" and "Fides independently
+    reports the delegated work as complete" are different facts, observed
+    through different systems, and can happen in either order or not at
+    all for a given obligation — collapsing them would hide which one
+    actually stopped the alert.
+    """
 
     attempted: int
     sent: int
     failed: int
+    skipped_closed: int
     skipped_discharged: int
     unclocked: int
     vanished: int
@@ -102,13 +120,20 @@ def run_deadline_alerts(
     environment here — that happens once, in the Celery wrapper below, so
     this function has no global state and no import-time side effect.
 
-    Order of checks per row, and why it is this order: a delegating row's
-    Fides status (discharged / vanished) is decided FIRST and
-    unconditionally, before any deadline arithmetic runs at all — D-AL-6
-    is about what Fides has already done, which overrides whether the
-    register's own clock would otherwise call an alert due. Only a row
-    that survives that check is asked "is an alert due", and only a due
-    alert is resolved to a recipient and attempted.
+    Order of checks per row, and why it is this order: the register's own
+    `status` is decided FIRST, before anything about Fides or the clock —
+    Barbara's ruling makes the register the record of truth, so a row a
+    human has already closed (record_decision) is never alerted on,
+    whether or not it delegates and whether or not Fides has separately
+    finished (fix round 1, Finding 1 — D-AL-6 as originally scoped only
+    covered "Fides finished the delegated work", which missed rectification
+    and restriction entirely, since neither ever delegates, and missed a
+    register row closed before Fides caught up on the three that do). Only
+    an OPEN row reaches the delegating row's Fides status (discharged /
+    vanished), decided next and unconditionally, before any deadline
+    arithmetic runs — D-AL-6's original scope is still exactly right for
+    that half. Only a row that survives both checks is asked "is an alert
+    due", and only a due alert is resolved to a recipient and attempted.
 
     A channel failure (D-AL-7) is caught around exactly one call —
     `channel.send` — so it can never suppress the loop, and the ledger
@@ -135,9 +160,20 @@ def run_deadline_alerts(
     fides_statuses = fides_request_statuses(db, delegated_ids)
 
     attempted = sent = failed = 0
-    skipped_discharged = unclocked = vanished = unowned = 0
+    skipped_closed = skipped_discharged = unclocked = vanished = unowned = 0
 
     for row in rows:
+        if row["status"] != _REGISTER_STATUS_OPEN:
+            # Fix round 1, Finding 1: the register is the record of truth
+            # (Barbara's ruling). A closed row is never alerted on —
+            # checked before the Fides status below, and before any clock
+            # arithmetic, so this applies identically to a right that
+            # never delegates (rectification, restriction) and to a
+            # delegating right whose Fides side hasn't independently
+            # reported completion yet.
+            skipped_closed += 1
+            continue
+
         fides_id = row["fides_privacy_request_id"]
         if fides_id:
             status = fides_statuses.get(fides_id)
@@ -259,6 +295,7 @@ def run_deadline_alerts(
         attempted=attempted,
         sent=sent,
         failed=failed,
+        skipped_closed=skipped_closed,
         skipped_discharged=skipped_discharged,
         unclocked=unclocked,
         vanished=vanished,
@@ -285,11 +322,12 @@ def _scheduled_dsr_deadline_alerts(self: DatabaseTask) -> None:
         db.commit()
         logger.info(
             "privacycare DSR deadline alert run complete: attempted={} "
-            "sent={} failed={} skipped_discharged={} unclocked={} "
-            "vanished={} unowned={}",
+            "sent={} failed={} skipped_closed={} skipped_discharged={} "
+            "unclocked={} vanished={} unowned={}",
             summary.attempted,
             summary.sent,
             summary.failed,
+            summary.skipped_closed,
             summary.skipped_discharged,
             summary.unclocked,
             summary.vanished,
@@ -323,7 +361,13 @@ def initiate_scheduled_dsr_alerts() -> None:
         func=_scheduled_dsr_deadline_alerts,
         kwargs={},
         id=DSR_DEADLINE_ALERTS_JOB,
-        coalesce=True,
+        # coalesce=False, matching request_service.py's own cron job for
+        # the same reason theirs does (DSR_DATA_REMOVAL, its closest
+        # analogue — a daily cron job, not an interval poll): there was no
+        # deliberate reason to diverge (fix round 1, "not in scope this
+        # round" note), so this follows the shipped convention rather than
+        # inventing a different one.
+        coalesce=False,
         replace_existing=True,
         trigger="cron",
         minute="0",
