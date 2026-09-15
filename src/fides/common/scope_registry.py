@@ -71,6 +71,11 @@ SYSTEM_INTEGRATION_LINK = "system_integration_link"
 # which upstream has no concept of. Naming the scope for us also means a future
 # upstream take cannot grant authority over our routes by string match.
 PRIVACYCARE_DISCOVERY = "privacycare_discovery"
+# PrivacyCare (spec 2026-09-13 D-DSR-1): the Kenyan DSR register is ours —
+# Barbara's 2026-09-15 ruling gives PrivacyCare the register and Fides only
+# the execution of the three rights that move data — so it gets its own
+# scope name for the same reason PRIVACYCARE_DISCOVERY does.
+PRIVACYCARE_DSR = "privacycare_dsr"
 SYSTEM_MANAGER = "system_manager"
 TAXONOMY = "taxonomy"
 TEST = "test"
@@ -249,6 +254,10 @@ SYSTEM_DELETE = f"{SYSTEM}:{DELETE}"
 PRIVACYCARE_DISCOVERY_READ = f"{PRIVACYCARE_DISCOVERY}:{READ}"
 PRIVACYCARE_DISCOVERY_UPDATE = f"{PRIVACYCARE_DISCOVERY}:{UPDATE}"
 
+# PrivacyCare (spec 2026-09-13 D-DSR-1)
+PRIVACYCARE_DSR_READ = f"{PRIVACYCARE_DSR}:{READ}"
+PRIVACYCARE_DSR_UPDATE = f"{PRIVACYCARE_DSR}:{UPDATE}"
+
 
 SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE = (
     f"{SYSTEM_INTEGRATION_LINK}:{CREATE_OR_UPDATE}"
@@ -395,6 +404,9 @@ SCOPE_DOCS = {
     # PrivacyCare (spec 2026-09-14 D-DM-1)
     PRIVACYCARE_DISCOVERY_READ: "View discovery monitors and their results",
     PRIVACYCARE_DISCOVERY_UPDATE: "Create, edit and delete discovery monitors",
+    # PrivacyCare (spec 2026-09-13 D-DSR-1)
+    PRIVACYCARE_DSR_READ: "View DSR register requests and their status",
+    PRIVACYCARE_DSR_UPDATE: "Record and update DSR register requests",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",
     SYSTEM_INTEGRATION_LINK_DELETE: "Delete system-integration links",
     SYSTEM_INTEGRATION_LINK_READ: "Read system-integration links",

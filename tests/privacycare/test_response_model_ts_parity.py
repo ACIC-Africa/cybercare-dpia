@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from fides.api.privacycare.api.router import (
     PRIVACYCARE_CHAT_PREFIX,
+    PRIVACYCARE_DSR_PREFIX,
     PRIVACYCARE_GROUNDS_PREFIX,
     PRIVACYCARE_MONITORS_PREFIX,
     PRIVACYCARE_PREFIX,
@@ -277,6 +278,29 @@ ALLOWLIST: dict[str, dict] = {
             "simply never gave that shape a name to import."
         ),
     },
+    # The DSR register's HTTP surface (plan 14, task 4). Same pattern as the
+    # business-process ROPA surface above: the register is new, Kenyan-
+    # specific ground with no Plus analogue, so no shipped admin-UI screen
+    # calls any of these five routes and neither response model has a TS
+    # counterpart to be in parity with.
+    "DsrRequestResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: the DSR register is PrivacyCare's own "
+            "(Barbara's 2026-09-15 ruling, spec D-DSR-1), and nothing in the "
+            "shipped admin UI has a screen for it — the Privacy Center is "
+            "the intake, per api/dsr.py's module docstring, and a bespoke "
+            "register UI is explicitly out of this plan."
+        ),
+    },
+    "Page[DsrRequestResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Generic pagination wrapper over a model that itself has no TS "
+            "counterpart, same as Page[BusinessProcessResponse] above; "
+            "there is nothing to be in parity with."
+        ),
+    },
 }
 
 
@@ -299,12 +323,22 @@ ALLOWLIST: dict[str, dict] = {
 # still passed, silently checking nothing about the six new
 # /plus/discovery-monitor* routes' response models — the same
 # passes-while-measuring-nothing failure this comment already warns about.
+#
+# PRIVACYCARE_DSR_PREFIX (plan 14, task 4): a sixth router
+# (privacycare_dsr_router). Its prefix, /api/v1/privacycare/dsr-requests,
+# happens to already start with PRIVACYCARE_GROUNDS_PREFIX
+# (/api/v1/privacycare), so the walk found its routes even before this line
+# was added — listed explicitly anyway, both to follow the rule above for
+# real (a future router might not share a prefix by accident) and because a
+# reader should not have to notice the accidental substring match to know
+# DSR is covered.
 PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
     PRIVACYCARE_CHAT_PREFIX,
     PRIVACYCARE_GROUNDS_PREFIX,
     PRIVACYCARE_MONITORS_PREFIX,
+    PRIVACYCARE_DSR_PREFIX,
 )
 
 

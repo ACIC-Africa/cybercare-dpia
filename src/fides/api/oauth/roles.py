@@ -40,6 +40,7 @@ from fides.common.scope_registry import (
     PRIVACY_REQUEST_UPLOAD_DATA,
     PRIVACY_REQUEST_VIEW_DATA,
     PRIVACYCARE_DISCOVERY_READ,
+    PRIVACYCARE_DSR_READ,
     RULE_READ,
     SAAS_CONFIG_READ,
     SCOPE_READ,
@@ -130,6 +131,13 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # database — stays with Owner and Contributor, which derive from the
     # full registry.
     PRIVACYCARE_DISCOVERY_READ,
+    # PrivacyCare (spec 2026-09-13 D-DSR-1): same split as
+    # PRIVACYCARE_DISCOVERY_READ above — a Viewer may see the DSR register,
+    # recording a decision or a notification against it is a controller act
+    # and stays with Owner and Contributor, which derive
+    # PRIVACYCARE_DSR_UPDATE from the full registry rather than listing it
+    # here.
+    PRIVACYCARE_DSR_READ,
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,

@@ -79,6 +79,19 @@ privacycare_monitors_router = APIRouter(
     prefix=PRIVACYCARE_MONITORS_PREFIX, tags=["PrivacyCare Discovery"]
 )
 
+# The DSR register's HTTP surface (plan 14, task 4): a SIXTH, separate
+# prefix family, and — like privacycare_processes_router/
+# privacycare_chat_router/privacycare_grounds_router, and UNLIKE
+# PRIVACYCARE_PREFIX/PRIVACYCARE_MONITORS_PREFIX — back in OUR OWN
+# namespace, not Ethyca's `plus`. Nothing in the shipped admin UI calls
+# these routes (Barbara's 2026-09-15 ruling gives PrivacyCare the register,
+# with no Plus screen for it), so taking a `plus` path here would only risk
+# colliding with a real Plus endpoint later. See api/dsr.py's module
+# docstring for the fuller version of this argument.
+PRIVACYCARE_DSR_PREFIX = f"{V1_URL_PREFIX}/privacycare/dsr-requests"
+
+privacycare_dsr_router = APIRouter(prefix=PRIVACYCARE_DSR_PREFIX, tags=["PrivacyCare"])
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -172,9 +185,16 @@ def register() -> None:
     # tasks-vs-assessments matching-order hazard either.
     importlib.import_module("fides.api.privacycare.api.monitors")
 
+    # dsr.py (plan 14, task 4) decorates its OWN router
+    # (privacycare_dsr_router, a distinct prefix), so — same as grounds.py,
+    # chat.py and monitors.py above — it carries none of the
+    # tasks-vs-assessments matching-order hazard either.
+    importlib.import_module("fides.api.privacycare.api.dsr")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
     app_setup.ROUTERS.append(privacycare_grounds_router)
     app_setup.ROUTERS.append(privacycare_monitors_router)
+    app_setup.ROUTERS.append(privacycare_dsr_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
