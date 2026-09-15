@@ -475,6 +475,88 @@ def test_a_failure_after_the_fides_request_is_created(db, monkeypatch):
     )
 
 
+# --- Fix round 1 on task 4, Finding 1. The probe above proves the row is
+# gone; it does NOT prove discard_request is what removed it. Under this
+# fixture, commit is patched to flush for the whole session — including
+# inside Fides' persist_obj — so nothing the route does is ever a REAL
+# commit. db.rollback() runs before discard_request in the except block
+# (defensively, to clear a possibly-aborted transaction first — see that
+# block's own comment), and under THIS fixture that rollback alone already
+# discards record_request's still-flushed insert before discard_request
+# ever gets a row to delete. Proven empirically while writing this test:
+# an earlier version of it asserted the row still existed at the moment of
+# the discard_request call and that assertion itself failed — the row was
+# already gone by then, via the preceding rollback, not via
+# discard_request. That is expected and correct here (discard_request is
+# documented idempotent on a missing id), but it means even this spy
+# cannot show discard_request's own DELETE removing a still-present row
+# under test conditions — only that the route wires it in. That mechanical
+# guarantee (it deletes the row it's given and only that row) is covered
+# separately and directly in test_dsr_register.py
+# (test_discard_request_deletes_only_the_named_row), independent of this
+# fixture and of db.rollback() entirely. What THIS test proves is the
+# wiring: the route calls discard_request exactly once, with the id
+# record_request minted for this request — the half the fixture would
+# otherwise erase (delete discard_request's call from the route entirely
+# and the earlier register-clean probe still passes; this test would not).
+
+
+def test_a_failed_delegation_actually_calls_discard_request(db, monkeypatch):
+    subject = _subject()
+    monkeypatch.setattr(
+        "fides.api.models.privacy_request.privacy_request.PrivacyRequest.persist_identity",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    import fides.api.privacycare.api.dsr as dsr_module
+
+    real_discard_request = dsr_module.discard_request
+    calls: list = []
+
+    def _spy(db_arg, request_id_arg):
+        calls.append(request_id_arg)
+        return real_discard_request(db_arg, request_id_arg)
+
+    monkeypatch.setattr(dsr_module, "discard_request", _spy)
+
+    with pytest.raises(Exception):
+        create_dsr_request(
+            DsrRequestCreate(right="access", subject_identifier=subject),
+            db=db,
+            client=_fake_client("carol@serianu.com"),
+        )
+
+    assert len(calls) == 1, f"expected discard_request called once, got {len(calls)}"
+
+
+# --- Fix round 1 on task 4, Finding 3. If the compensation itself fails
+# (discard_request or the commit after it), an unguarded except block would
+# let that failure propagate IN PLACE of delegate()'s real error, silently
+# changing what the client sees. This proves the client still sees the
+# original RuntimeError even when discard_request also blows up.
+
+
+def test_a_failed_compensation_does_not_mask_the_original_error(db, monkeypatch):
+    monkeypatch.setattr(
+        "fides.api.models.privacy_request.privacy_request.PrivacyRequest.persist_identity",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("original delegation failure")),
+    )
+
+    import fides.api.privacycare.api.dsr as dsr_module
+
+    def _broken_discard(db_arg, request_id_arg):
+        raise RuntimeError("compensation itself is broken")
+
+    monkeypatch.setattr(dsr_module, "discard_request", _broken_discard)
+
+    with pytest.raises(RuntimeError, match="original delegation failure"):
+        create_dsr_request(
+            DsrRequestCreate(right="access", subject_identifier=_subject()),
+            db=db,
+            client=_fake_client("carol@serianu.com"),
+        )
+
+
 # --- Minor finding (final review): _days_left used math.ceil unconditionally,
 # so a deadline breached by less than 24 hours reported 0 — read by the UI
 # as "due today" rather than "already overdue". The alerting plan will

@@ -193,12 +193,19 @@ def create_dsr_request(
     record_request just inserted, committed explicitly (rollback alone
     cannot undo what Fides has already committed), before the original
     exception is re-raised. So: a register row still never survives a
-    failed delegation, for every reachable failure — but the Fides-side
-    privacyrequest this route created (and its identity/masking rows) is
-    NOT cleaned up by that compensation; it is left as Fides' own orphaned,
-    unqueued, pending-approval request (see delegate()'s own docstring on
-    why a created-but-unapproved PrivacyRequest is otherwise a normal
-    resting state).
+    failed delegation for every reachable delegate() failure — but two
+    narrower things remain true and are NOT claimed here: (1) the
+    Fides-side privacyrequest this route created (and its identity/masking
+    rows) is not cleaned up by that compensation; it is left as Fides' own
+    orphaned, unqueued, pending-approval request (see delegate()'s own
+    docstring on why a created-but-unapproved PrivacyRequest is otherwise a
+    normal resting state), and (2) fix round 1, Finding 3: if the
+    compensation ITSELF fails (discard_request or the commit after it
+    raising, e.g. on a dropped connection) the register row is left in
+    place too — that failure is only logged, never raised, so the client
+    still sees delegate()'s original error rather than the cleanup's, but
+    a future reader must check the logs rather than assume a compensation
+    failure would surface any other way.
 
     I4: `received_at` is validated here, not in the core — a future date
     would grant the controller more time than the statute allows, so it is
@@ -239,7 +246,7 @@ def create_dsr_request(
         raise HTTPException(
             status_code=status_codes.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-    except Exception:
+    except Exception as delegate_exc:
         # R1: delegate() failed past the point where Fides' own commit may
         # already have made record_request's insert durable — db.rollback()
         # alone has nothing left to undo THAT insert (it lives in a prior,
@@ -254,11 +261,28 @@ def create_dsr_request(
         # delegation, then let the original exception continue (this route
         # makes no claim about what kind of failure it was, only that the
         # register stays clean).
+        #
+        # Fix round 1 (Finding 3): the compensation itself can fail — a
+        # dropped connection during discard_request or the commit after it
+        # — and an unguarded failure there would propagate IN PLACE of
+        # delegate_exc, silently changing what the client sees (and, per
+        # Finding 2, leaving the register row behind with no visible sign
+        # beyond the logs). The client must always see the real cause of
+        # the 500/exception it gets, so cleanup failures are caught,
+        # logged, and never allowed to replace delegate_exc.
         if request_id is not None:
-            db.rollback()
-            discard_request(db, request_id)
-            db.commit()
-        raise
+            try:
+                db.rollback()
+                discard_request(db, request_id)
+                db.commit()
+            except Exception:
+                logger.exception(
+                    "PrivacyCare DSR request {} — compensating "
+                    "discard_request failed after a failed delegation; the "
+                    "register row may still exist",
+                    request_id,
+                )
+        raise delegate_exc
     db.commit()
     logger.info(
         "PrivacyCare DSR request {} ({}) recorded by {}",

@@ -12,6 +12,7 @@ import sqlalchemy
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.dsr.register import (
+    discard_request,
     get_request,
     list_requests,
     record_decision,
@@ -318,3 +319,32 @@ def test_an_omitted_received_at_still_defaults_to_now(db):
 
     row = get_request(db, request_id)
     assert before <= row["received_at"] <= after
+
+# --- Fix round 1 on task 4, Finding 1. discard_request is the compensating
+# delete api/dsr.py's create route calls when a delegation fails after
+# record_request's own insert may already be durable (R1). The route-level
+# probe test (test_api_dsr.py) cannot, by itself, prove THIS function is
+# what clears the row — under that test's fixture (commit patched to
+# flush), the route's own db.rollback() already discards the insert before
+# discard_request ever runs, so the probe would pass identically even with
+# discard_request turned into a no-op. This tests the function directly,
+# independent of that fixture's rollback: it must delete exactly the row
+# named, leave an unrelated row alone, and tolerate an id that no longer
+# exists.
+
+
+def test_discard_request_deletes_only_the_named_row(db):
+    target = record_request(db, right="access", subject_identifier=_subject())
+    other = record_request(db, right="access", subject_identifier=_subject())
+
+    discard_request(db, target)
+
+    with pytest.raises(ValueError):
+        get_request(db, target)
+    # the other row is untouched
+    assert get_request(db, other)["id"] == other
+
+
+def test_discard_request_on_a_missing_id_is_a_silent_no_op(db):
+    discard_request(db, str(uuid.uuid4()))  # must not raise
+
