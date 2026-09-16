@@ -41,7 +41,7 @@ from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.api.reports import _sanitize_filename, get_assessment_pdf
 from fides.api.privacycare.pdf import PDFRenderError, render_pdf
 from fides.api.privacycare.report import Report, build_report
-from fides.api.privacycare.risk.banding import LOW
+from fides.api.privacycare.risk.banding import CRITICAL, LOW
 from fides.api.privacycare.risk.odpc import CONSULTATION_WINDOW_DAYS, OdpcFinding
 from fides.api.privacycare.risk.register import add_risk
 from tests.privacycare.test_api_assessments import (
@@ -494,6 +494,70 @@ def test_pdf_states_consultation_is_required_and_names_the_window(db):
     assert str(CONSULTATION_WINDOW_DAYS) in text
     # The driving risk travels with the verdict, not off in a footnote.
     assert "catastrophic exposure of fuel card PINs" in text
+    # Fix round 1, Important finding 2: anchored to the start of
+    # processing, not a grace period from filing.
+    assert "at least 60 days before" in text
+    assert "within 60 days" not in text
+
+
+def test_pdf_promotes_the_odpc_verdict_to_its_own_callout_paragraph(db):
+    # Fix round 1, Important finding 1: the metadata table alone is not
+    # enough — every row in it shares one uniform 8.5pt grey style, so the
+    # ODPC row used to read exactly like "Created: 2026-09-16" two rows
+    # below it. render_pdf now ALSO prints the same sentence as its own
+    # paragraph (see _odpc_callout_style), so it appears twice: once
+    # structurally in the table, once as a prominent, styled callout. This
+    # proves the promotion actually happened (a count of 1 would mean only
+    # the table row survived and the callout was silently dropped).
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Critical Risk Callout DPIA")
+    add_risk(
+        db,
+        assessment_id=aid,
+        category="confidentiality",
+        description="catastrophic exposure of fuel card PINs",
+        likelihood=5,
+        severity=5,
+    )
+    db.flush()
+
+    report = build_report(db, aid)
+    text = _extract_text(render_pdf(report))
+
+    assert text.count("catastrophic exposure of fuel card PINs") == 2, (
+        f"expected the driving risk once in the metadata row and once in "
+        f"the promoted callout paragraph, got: {text!r}"
+    )
+
+
+def test_odpc_callout_style_reuses_the_unanswered_style_when_required():
+    # Direct pin on the style-selection decision itself (fix round 1,
+    # Important finding 1's "match the house convention; do not add a
+    # third style"): REQUIRED must select the exact style object passed in
+    # as unanswered_style, NOT REQUIRED must select summary_style — using
+    # sentinel objects rather than real ParagraphStyles, so this test is
+    # about which style is CHOSEN, not what either style looks like.
+    from fides.api.privacycare.pdf import _odpc_callout_style
+
+    unanswered_sentinel = object()
+    summary_sentinel = object()
+    required_finding = OdpcFinding(
+        required=True, band=CRITICAL, window_days=CONSULTATION_WINDOW_DAYS,
+        reason="x", highest_risk=None,
+    )
+    not_required_finding = OdpcFinding(
+        required=False, band=LOW, window_days=CONSULTATION_WINDOW_DAYS,
+        reason="x", highest_risk=None,
+    )
+
+    assert (
+        _odpc_callout_style(required_finding, unanswered_sentinel, summary_sentinel)
+        is unanswered_sentinel
+    )
+    assert (
+        _odpc_callout_style(not_required_finding, unanswered_sentinel, summary_sentinel)
+        is summary_sentinel
+    )
 
 
 def test_pdf_states_consultation_is_not_required_for_a_low_risk_assessment(db):

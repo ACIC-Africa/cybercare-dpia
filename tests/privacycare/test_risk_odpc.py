@@ -164,6 +164,29 @@ def test_the_reason_names_the_band_and_window_even_when_not_required(db, assessm
     assert str(CONSULTATION_WINDOW_DAYS) in finding.reason
 
 
+def test_the_reason_anchors_the_window_to_before_processing_begins(db, assessment_id):
+    # Fix round 1, Important finding 2: "submitted within 60 days" (the
+    # earlier wording) has no anchor and contradicts "before this
+    # processing activity begins" in the same sentence — a DPO could read
+    # it as a 60-day grace period from today or from filing, wait 55 days,
+    # start processing the next day, and believe themself compliant.
+    #
+    # Josephine's brief (01_brief_for_dpia.md, line 46), verbatim: "noting
+    # the 60-day submission window ahead of processing" — the anchor is
+    # the START of processing. Pinned as one exact phrase so this cannot
+    # silently regress back into the ambiguous wording.
+    add_risk(db, assessment_id=assessment_id, category="confidentiality",
+              description="critical risk", likelihood=5, severity=5)
+
+    finding = evaluate(db, assessment_id)
+
+    assert "at least 60 days before" in finding.reason
+    assert "processing" in finding.reason
+    # The old, ambiguous wording must not still be reachable.
+    assert "within 60 days" not in finding.reason
+    assert "within" not in finding.reason
+
+
 def test_a_critical_register_reports_critical_not_high(db, assessment_id):
     # THE MISTAKE THIS TEST EXISTS TO CATCH: add_risk's own sync_projection
     # writes Ethyca's three-value risk_level column as "high" for a critical

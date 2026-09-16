@@ -24,6 +24,20 @@ from fides.api.privacycare.risk.register import RiskEntry, assessment_band, list
 # Josephine's brief, not the prototype: the prototype's banding arithmetic
 # says nothing about a submission deadline, so this constant is the one
 # place that number is encoded.
+#
+# THE ANCHOR (fix round 1, Important finding 2). Josephine's brief
+# (01_brief_for_dpia.md, line 46) says, verbatim: "noting the 60-day
+# submission window ahead of processing". "Ahead of processing" is the
+# anchor: the 60 days count backward from the START of the processing
+# activity, not forward from today and not from the date of the
+# assessment. evaluate()'s reason text below is written as a single
+# clause — "at least N days before processing begins" — specifically so
+# it cannot be read as a grace period measured from filing: a DPO reading
+# the earlier, unanchored wording ("submitted within 60 days") could wait
+# 55 days and then start processing the next day, believing themself
+# compliant. See test_the_reason_anchors_the_window_to_before_processing_
+# begins in tests/privacycare/test_risk_odpc.py, which pins the exact
+# phrase so this cannot silently regress back into that ambiguity.
 CONSULTATION_WINDOW_DAYS = 60
 
 
@@ -85,19 +99,23 @@ def evaluate(db: Session, assessment_id: str) -> OdpcFinding:
     highest_risk = risks[0] if risks else None
 
     if required:
+        # One clause, one anchor: "at least N days BEFORE processing
+        # BEGINS" — see the CONSULTATION_WINDOW_DAYS comment above for why
+        # this exact phrasing, and why the earlier "submitted within N
+        # days" wording was ambiguous/wrong.
         reason = (
             f"Residual risk band is {band} — the Data Protection Act, 2019 "
             "requires prior consultation with the Office of the Data "
-            "Protection Commissioner (ODPC) before this processing "
-            f"activity begins, to be submitted within {CONSULTATION_WINDOW_DAYS} "
-            "days."
+            "Protection Commissioner (ODPC), submitted at least "
+            f"{CONSULTATION_WINDOW_DAYS} days before this processing "
+            "activity begins."
         )
     else:
         reason = (
             f"Residual risk band is {band} — prior consultation with the "
             "ODPC is NOT required. Only a high or critical residual risk "
-            f"triggers the {CONSULTATION_WINDOW_DAYS}-day ODPC submission "
-            "window."
+            "triggers the requirement to submit at least "
+            f"{CONSULTATION_WINDOW_DAYS} days before processing begins."
         )
 
     return OdpcFinding(

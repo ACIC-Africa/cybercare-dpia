@@ -61,6 +61,8 @@ from fides.api.privacycare.report import Report, ReportQuestion, ReportSection
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from importlib.resources.abc import Traversable
 
+    from fides.api.privacycare.risk.odpc import OdpcFinding
+
 
 class PDFRenderError(Exception):
     """Raised when the PDF cannot be produced — a broken/missing ReportLab
@@ -201,6 +203,31 @@ def _status_label(question: ReportQuestion) -> str:
     return question.answer_status.replace("_", " ").upper()
 
 
+def _odpc_callout_style(finding: "OdpcFinding", unanswered_style, summary_style):
+    """Which of THIS FILE'S EXISTING paragraph styles the ODPC finding is
+    rendered in for its own, dedicated paragraph — never a new one.
+
+    Fix round 1, Important finding 1: the metadata table applies one
+    uniform 8.5pt grey style (table_style, via meta_style) to every row —
+    "ODPC Prior Consultation" printed exactly like "Created: 2026-09-16"
+    two rows below it, on a document where that row can mean a regulator
+    filing is legally required before processing may begin. The brief's
+    "where it cannot be missed" is not satisfied by being in the right
+    block of the document; it has to be visually distinct too.
+
+    REQUIRED reuses unanswered_style — the same red + bold weight
+    _question_flowables already uses for "NOT YET ANSWERED" elsewhere in
+    this file — because this is the one line that must be SEEN, not read
+    carefully. NOT REQUIRED still gets promoted to its own paragraph (the
+    negative case stays visible; silence reads as "not assessed" — see
+    render_pdf) but at summary_style's plain weight, the same weight the
+    completion sentence already has: informational, not urgent. No third
+    style is introduced for this — matching the house convention rather
+    than inventing one is the point of the fix.
+    """
+    return unanswered_style if finding.required else summary_style
+
+
 def render_pdf(report: Report) -> bytes:
     """Render a Report as PDF bytes.
 
@@ -337,6 +364,25 @@ def render_pdf(report: Report) -> bytes:
         meta_table = Table(meta_rows, colWidths=[40 * mm, 130 * mm])
         meta_table.setStyle(table_style)
         story.append(meta_table)
+
+        # Task 4 fix round 1, Important finding 1: the ODPC verdict is
+        # ALSO a row inside meta_table above (report.py's _metadata_rows
+        # builds it), but that row is structural, not prominent — every
+        # row shares the same tiny grey style. Promoted here into its own
+        # paragraph, alongside the completion summary below, in whichever
+        # of the two EXISTING styles _odpc_callout_style picks (never a
+        # new one). Pulled from report.metadata rather than recomputed
+        # from report.odpc, so there is exactly one place this sentence is
+        # composed (report.py's _odpc_metadata_value) even though it now
+        # prints twice.
+        odpc_callout_text = dict(report.metadata).get("ODPC Prior Consultation")
+        if odpc_callout_text:
+            story.append(
+                Paragraph(
+                    _escaped(odpc_callout_text),
+                    _odpc_callout_style(report.odpc, unanswered_style, summary_style),
+                )
+            )
 
         # D-PDF-5 / brief: "the PDF must state what is unanswered" — an
         # assessment must never read as finished to a regulator just
