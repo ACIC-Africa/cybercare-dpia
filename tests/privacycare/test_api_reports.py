@@ -41,6 +41,9 @@ from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.api.reports import _sanitize_filename, get_assessment_pdf
 from fides.api.privacycare.pdf import PDFRenderError, render_pdf
 from fides.api.privacycare.report import Report, build_report
+from fides.api.privacycare.risk.banding import LOW
+from fides.api.privacycare.risk.odpc import CONSULTATION_WINDOW_DAYS, OdpcFinding
+from fides.api.privacycare.risk.register import add_risk
 from tests.privacycare.test_api_assessments import (
     _seed_assessment,
     _seed_question,
@@ -82,6 +85,14 @@ def _empty_report(**overrides) -> Report:
         total_count=0,
         completeness=0.0,
         export_mode="external",
+        odpc=OdpcFinding(
+            required=False,
+            band=LOW,
+            window_days=CONSULTATION_WINDOW_DAYS,
+            reason=f"Residual risk band is {LOW} — prior consultation with "
+            "the ODPC is NOT required.",
+            highest_risk=None,
+        ),
     )
     defaults.update(overrides)
     return Report(**defaults)
@@ -457,6 +468,46 @@ def test_the_officers_raw_markup_characters_do_not_break_the_document(db):
     assert "Shared with R&D" in text
     assert "partners" in text
     assert "Retention: 7 years" in text
+
+
+# ── Task 4: the ODPC finding, in the rendered PDF ─────────────────────────
+
+
+def test_pdf_states_consultation_is_required_and_names_the_window(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Critical Risk PDF DPIA")
+    add_risk(
+        db,
+        assessment_id=aid,
+        category="confidentiality",
+        description="catastrophic exposure of fuel card PINs",
+        likelihood=5,
+        severity=5,
+    )
+    db.flush()
+
+    report = build_report(db, aid)
+    text = _extract_text(render_pdf(report))
+
+    assert "ODPC" in text
+    assert "required" in text.lower()
+    assert str(CONSULTATION_WINDOW_DAYS) in text
+    # The driving risk travels with the verdict, not off in a footnote.
+    assert "catastrophic exposure of fuel card PINs" in text
+
+
+def test_pdf_states_consultation_is_not_required_for_a_low_risk_assessment(db):
+    # "Say the negative out loud" — a low-risk report must not stay silent
+    # about ODPC consultation, which would read as "not assessed".
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Low Risk PDF DPIA")
+    db.flush()
+
+    report = build_report(db, aid)
+    text = _extract_text(render_pdf(report))
+
+    assert "ODPC" in text
+    assert "not required" in text.lower()
 
 
 # ── The route: 404 / 503 / filename ──────────────────────────────────────

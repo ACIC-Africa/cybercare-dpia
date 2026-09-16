@@ -59,6 +59,8 @@ from fides.api.privacycare.api.schemas import (
     PrivacyAssessmentDetailResponse,
     QuestionGroup,
 )
+from fides.api.privacycare.risk.odpc import OdpcFinding
+from fides.api.privacycare.risk.odpc import evaluate as evaluate_odpc
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,12 @@ class Report:
     # never privacy_assessment.completeness. See the module docstring.
     completeness: float
     export_mode: str
+    # Task 4 / spec D-W2-6: whether this DPIA must go to Kenya's ODPC before
+    # processing begins, per risk.odpc.evaluate(). Carried both as this
+    # typed field (for any caller that wants it as data, not text) and as a
+    # metadata row (see _metadata_rows) — a DPIA that must be escalated
+    # should not disclose that only to a caller that knows to look for it.
+    odpc: OdpcFinding
 
 
 def _author_lookup(db: Session, assessment_id: str) -> dict[str, str | None]:
@@ -155,7 +163,38 @@ def _report_section(
     )
 
 
-def _metadata_rows(detail: PrivacyAssessmentDetailResponse) -> list[tuple[str, str]]:
+def _odpc_metadata_value(finding: OdpcFinding) -> str:
+    """The single metadata row's value: verdict, window and (when required)
+    the driving risk, all in one place.
+
+    Per the task brief: "The metadata rows are the natural home for the
+    verdict and the window; the driving risk belongs with it." Built on
+    finding.reason rather than re-deriving the verdict/band/window
+    sentence a second time — that sentence already names both (see
+    risk/odpc.py) — with the driving risk appended when there is one to
+    name. A LOW/MEDIUM finding states "NOT required" explicitly (via
+    reason) rather than the row being silently absent: silence reads as
+    "not assessed", which is the wrong answer to a regulator's question.
+    """
+    # An explicit REQUIRED/NOT REQUIRED verdict leads the row: a DPO or
+    # regulator scanning the metadata table for the one word that matters
+    # must find it without reading the full sentence that follows — the
+    # sentence (finding.reason) still carries the band and the window for
+    # anyone who does read on.
+    verdict = "REQUIRED" if finding.required else "NOT REQUIRED"
+    value = f"{verdict} — {finding.reason}"
+    if finding.required and finding.highest_risk is not None:
+        risk = finding.highest_risk
+        value += (
+            f" Driving risk: {risk.category} — {risk.description} "
+            f"(score {risk.score}/25, {risk.band})."
+        )
+    return value
+
+
+def _metadata_rows(
+    detail: PrivacyAssessmentDetailResponse, odpc: OdpcFinding
+) -> list[tuple[str, str]]:
     # "system, data use, template, dates" per the task brief, plus the
     # assessment's own name (explicitly required to appear in metadata) and
     # its status/risk so the artifact stands alone without the screen next
@@ -163,6 +202,15 @@ def _metadata_rows(detail: PrivacyAssessmentDetailResponse) -> list[tuple[str, s
     # dropping the row entirely — the label itself ("Template", "Data Use",
     # ...) must always be present so a reviewer sees what wasn't captured,
     # not a document that's silently shorter than another.
+    #
+    # "ODPC Prior Consultation" is deliberately placed among these rows,
+    # not off in a footnote — see _odpc_metadata_value. Note this row's
+    # verdict is Task 4's own computed band (risk.odpc.evaluate, driven by
+    # risk.register.assessment_band) and can legitimately differ from the
+    # "Risk Level" row above, which is Ethyca's own lossy three-value
+    # projection (privacy_assessment.risk_level, collapsing CRITICAL into
+    # "high"). That is not a bug to reconcile away: it is exactly the
+    # distinction Task 4 exists to preserve.
     return [
         ("Assessment Name", detail.name or ""),
         ("System", detail.system_name or detail.system_fides_key or ""),
@@ -170,6 +218,7 @@ def _metadata_rows(detail: PrivacyAssessmentDetailResponse) -> list[tuple[str, s
         ("Template", detail.template_name or ""),
         ("Status", detail.status or ""),
         ("Risk Level", detail.risk_level or ""),
+        ("ODPC Prior Consultation", _odpc_metadata_value(odpc)),
         ("Created", detail.created_at or ""),
         ("Last Updated", detail.updated_at or ""),
     ]
@@ -223,6 +272,10 @@ def build_report(
     """
     detail = _assessment_detail(db, assessment_id)
     authors = _author_lookup(db, assessment_id)
+    # Task 4 / spec D-W2-6: computed fresh off the risk register on every
+    # build, the same way answered_count/completeness are computed fresh
+    # rather than read off a stored column — see the module docstring.
+    odpc_finding = evaluate_odpc(db, assessment_id)
 
     sections = [_report_section(group, authors) for group in detail.question_groups]
     questions = [question for section in sections for question in section.questions]
@@ -231,7 +284,7 @@ def build_report(
 
     return Report(
         title=f"Data Protection Impact Assessment: {detail.name}",
-        metadata=_metadata_rows(detail),
+        metadata=_metadata_rows(detail, odpc_finding),
         sections=sections,
         # Counted off the questions THIS DOCUMENT PRINTS — the sections
         # above — not off a second query, and not off a number that could
@@ -252,4 +305,5 @@ def build_report(
         # source, inside one document.
         completeness=_completeness(answered_count, total_count),
         export_mode=export_mode,
+        odpc=odpc_finding,
     )

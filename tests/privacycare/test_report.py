@@ -8,6 +8,9 @@ from sqlalchemy.orm import Session
 from fides.api.privacycare.api.answers import write_answer
 from fides.api.privacycare.api.assessments import _assessment_detail
 from fides.api.privacycare.report import Report, ReportCitation, build_report
+from fides.api.privacycare.risk.banding import CRITICAL, LOW
+from fides.api.privacycare.risk.odpc import CONSULTATION_WINDOW_DAYS, OdpcFinding
+from fides.api.privacycare.risk.register import add_risk
 from tests.privacycare.test_api_assessments import (
     _seed_answer_with_evidence,
     _seed_assessment,
@@ -315,3 +318,61 @@ def test_the_officers_words_pass_through_untouched(db):
     assert awkward in answers, (
         f"the officer's text was altered on the way into the report model: {answers!r}"
     )
+
+
+# --- Task 4: the ODPC finding, wired into the report. Spec acceptance 7 is
+# not met by a function nobody can see — build_report must call
+# risk.odpc.evaluate and surface the result, both as a typed field (for any
+# future caller that wants it as data) and as metadata rows (so it is
+# printed, not just carried).
+
+
+def test_report_carries_the_odpc_finding_as_data(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Low Risk DPIA")
+    db.flush()
+
+    report = build_report(db, aid)
+
+    assert isinstance(report.odpc, OdpcFinding)
+    assert report.odpc.required is False
+    assert report.odpc.band == LOW
+    assert report.odpc.window_days == CONSULTATION_WINDOW_DAYS
+
+
+def test_a_critical_register_states_consultation_is_required_in_metadata(db):
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Critical Risk DPIA")
+    add_risk(db, assessment_id=aid, category="confidentiality",
+              description="catastrophic exposure of fuel card PINs",
+              likelihood=5, severity=5)
+    db.flush()
+
+    report = build_report(db, aid)
+    metadata = dict(report.metadata)
+
+    assert report.odpc.required is True
+    assert report.odpc.band == CRITICAL
+    # Silence reads as "not assessed" — the verdict, the 60-day window, and
+    # the risk that drove it must all be readable straight off the metadata
+    # rows a person (or a regulator) reads at the top of the document.
+    odpc_row = metadata["ODPC Prior Consultation"]
+    assert "required" in odpc_row.lower()
+    assert str(CONSULTATION_WINDOW_DAYS) in odpc_row
+    assert "catastrophic exposure of fuel card PINs" in odpc_row
+
+
+def test_a_low_risk_register_states_consultation_is_not_required_in_metadata(db):
+    # "Say the negative out loud" (task brief) — a low-risk assessment must
+    # not just omit the ODPC row; it must say NOT required, so silence can
+    # never be misread as "nobody checked".
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Low Risk DPIA")
+    db.flush()
+
+    report = build_report(db, aid)
+    metadata = dict(report.metadata)
+
+    assert report.odpc.required is False
+    odpc_row = metadata["ODPC Prior Consultation"]
+    assert "not required" in odpc_row.lower()
