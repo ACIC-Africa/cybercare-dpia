@@ -85,6 +85,7 @@ from uuid import uuid4
 
 import sqlalchemy
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import fides.api.db.base  # noqa: F401 — see below
@@ -366,18 +367,54 @@ def main(argv: list[str]) -> int:
             db.rollback()
             print(str(exc), file=sys.stderr)
             return 1
+        except SQLAlchemyError as exc:
+            # Fix round 1, Finding 2: a connection failure (server
+            # unreachable, auth refused) or a database error (e.g. an
+            # IntegrityError) raised while seeding. Inherited from
+            # seed_dsr.py's identical gap — that script's own fix is a
+            # separate plan's business, noted in the fix report, not made
+            # here. NEVER print str(exc) or the raw database_url: DBAPI
+            # driver error text can itself embed the DSN, credentials
+            # included, on some drivers, and a bare traceback is exactly
+            # the leak route the brief forbids. Only the exception's own
+            # class name and the already-safe `target` line's contents
+            # (host/port/db, never the password) go to stderr.
+            db.commit = real_commit  # type: ignore[method-assign]
+            try:
+                db.rollback()
+            except SQLAlchemyError:
+                pass
+            print(
+                f"error: database operation failed against "
+                f"{_target_description(database_url)} "
+                f"({type(exc).__name__}) — nothing written",
+                file=sys.stderr,
+            )
+            return 1
         db.commit = real_commit  # type: ignore[method-assign]
 
         _print_summary(summary)
 
         if args.commit:
-            db.commit()
+            try:
+                db.commit()
+            except SQLAlchemyError as exc:
+                print(
+                    f"error: commit failed against "
+                    f"{_target_description(database_url)} "
+                    f"({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+                return 1
             print("COMMITTED")
         else:
             db.rollback()
             print("DRY RUN — nothing written")
     finally:
-        db.close()
+        try:
+            db.close()
+        except SQLAlchemyError:
+            pass
 
     return 0
 

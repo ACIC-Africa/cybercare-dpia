@@ -14,6 +14,7 @@ consent notices — those are hers and Carol's to author (see the script's own
 module docstring).
 """
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -60,6 +61,21 @@ def db(monkeypatch):
         # inside this rolled-back transaction, regardless of whatever the
         # live table already holds.
         session.execute(sqlalchemy.text("DELETE FROM privacycare_consent_rule"))
+        # Fix round 1, Finding 1: the authorised Step 4 --commit run makes
+        # the live database permanently satisfy every idempotency check in
+        # _find_or_create_notice/_find_or_create_version -- every test
+        # below that calls cli.seed_consent_demo(db) would otherwise
+        # always take the "already exists" branch and never touch an
+        # INSERT statement at all. Clearing these four tables here too
+        # (same idiom as the rule table just above, and the one
+        # test_consent_detector.py/test_api_consent.py already use) makes
+        # the create path genuinely run inside this rolled-back
+        # transaction; the real, permanently committed demo row is
+        # untouched once teardown rolls back.
+        session.execute(sqlalchemy.text("DELETE FROM privacypreferencehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynoticehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM noticetranslation"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynotice"))
         yield session
         session.rollback()
 
@@ -78,14 +94,112 @@ def _counts_by_table() -> dict:
         engine.dispose()
 
 
-def test_dry_run_writes_nothing():
-    before = _counts_by_table()
+def _delete_live_demo_rows(notice_key: str) -> None:
+    """A REAL, committed delete of the demo notice/translation/history/
+    preference rows -- deliberately NOT inside a rolled-back session.
+
+    test_dry_run_writes_nothing below runs the seed script as a genuinely
+    separate process with its own database connection. An uncommitted
+    DELETE on a different connection is invisible to it (Postgres MVCC
+    isolation) -- nothing short of a real commit here can make that
+    subprocess's create path anything other than dead code for the
+    duration of the test. Always paired with _restore_live_demo_seed
+    below, in a finally block, so the authorised Step 4 seed this task
+    committed survives the test either way.
+    """
+    engine = sqlalchemy.create_engine(DB_URL)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                sqlalchemy.text(
+                    "DELETE FROM privacypreferencehistory "
+                    "WHERE privacy_notice_history_id IN "
+                    "(SELECT id FROM privacynoticehistory WHERE notice_key = :k)"
+                ),
+                {"k": notice_key},
+            )
+            conn.execute(
+                sqlalchemy.text(
+                    "DELETE FROM privacynoticehistory WHERE notice_key = :k"
+                ),
+                {"k": notice_key},
+            )
+            conn.execute(
+                sqlalchemy.text(
+                    "DELETE FROM noticetranslation WHERE privacy_notice_id IN "
+                    "(SELECT id FROM privacynotice WHERE notice_key = :k)"
+                ),
+                {"k": notice_key},
+            )
+            conn.execute(
+                sqlalchemy.text("DELETE FROM privacynotice WHERE notice_key = :k"),
+                {"k": notice_key},
+            )
+    finally:
+        engine.dispose()
+
+
+def _restore_live_demo_seed() -> None:
+    """Re-run the real CLI with --commit to put the authorised Step 4 demo
+    row back. Asserts success rather than silently swallowing a failure --
+    a restore that silently fails would leave the live database exactly in
+    the inert state this whole plan exists to fix."""
     result = subprocess.run(
-        [sys.executable, str(_SCRIPT_PATH)],
-        capture_output=True, text=True, check=True,
+        [sys.executable, str(_SCRIPT_PATH), "--commit"],
+        capture_output=True, text=True,
     )
-    assert "DRY RUN — nothing written" in result.stdout
-    assert _counts_by_table() == before
+    assert result.returncode == 0, (
+        "failed to restore the authorised demo seed after "
+        f"test_dry_run_writes_nothing: {result.stderr}"
+    )
+    assert "COMMITTED" in result.stdout
+
+
+def test_dry_run_writes_nothing():
+    # Fix round 1, Finding 1: after the authorised --commit run, every
+    # idempotency check the script makes takes the "already exists" branch
+    # against the live database forever -- this test would not fail even
+    # if the --commit gate were deleted and replaced with an unconditional
+    # db.commit(), because there was nothing left for either branch to
+    # write. Confirmed by actually doing that locally: with the gate
+    # replaced, this test failed (the deleted rows came back committed
+    # instead of staying at zero); restored, it passes again. See the fix
+    # report for the transcript.
+    #
+    # Fixed by genuinely deleting the demo rows from the live database (a
+    # real, committed delete, not the rolled-back `db` fixture other tests
+    # in this file use -- see _delete_live_demo_rows's own docstring for
+    # why a rolled-back session can't work here) immediately before the
+    # dry run, and genuinely restoring them in a finally block afterward.
+    cli = _load_cli()
+    _delete_live_demo_rows(cli.NOTICE_KEY)
+    try:
+        before = _counts_by_table()
+        assert before["privacynotice"] == 0, (
+            "setup failed to clear the demo notice -- the create path "
+            "below would not be exercised"
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(_SCRIPT_PATH)],
+            capture_output=True, text=True, check=True,
+        )
+        assert "DRY RUN — nothing written" in result.stdout
+
+        after = _counts_by_table()
+        # Still zero: the subprocess's own create path ran (there was
+        # something to create -- the row was genuinely gone), then rolled
+        # back rather than committing. If the --commit gate were broken to
+        # commit unconditionally, `after` would show the notice/version/
+        # preference rows created for real instead.
+        assert after == before
+    finally:
+        _restore_live_demo_seed()
+
+    restored = _counts_by_table()
+    assert restored["privacynotice"] == 1
+    assert restored["privacynoticehistory"] == 2
+    assert restored["privacypreferencehistory"] == 1
 
 
 def test_the_run_names_its_target_and_never_the_password():
@@ -207,3 +321,40 @@ def test_the_detector_finds_exactly_one_stale_consent_against_the_seed(db):
     assert stale.consented_version == 1.0
     assert stale.live_version == 2.0
     assert stale.added_uses == ["marketing.advertising.third_party"]
+
+
+def test_a_bad_database_url_exits_non_zero_with_no_traceback_and_no_credential():
+    # Fix round 1, Finding 2: main() only ever caught ValueError, but
+    # nothing in seed_consent_demo's call graph raises one -- a real
+    # failure (the database unreachable, an IntegrityError) produced a raw
+    # traceback, exactly what the brief forbids. PRIVACYCARE_DATABASE_URL
+    # takes precedence over every other env var in _database_url(), so
+    # pointing it at a syntactically valid but unreachable address (a port
+    # nothing listens on) reaches the new SQLAlchemyError handler in
+    # main() without needing a real bad password against the live server.
+    #
+    # The password embedded in this URL is a fake, distinctive string
+    # chosen specifically so it is easy to prove absent from the output --
+    # not a credential that works or that matters if it leaked, but if
+    # THIS particular literal string appeared in stdout or stderr it could
+    # only be because the script printed the raw connection string or an
+    # exception's text that embedded it.
+    fake_password = "CorrectHorseBatteryStaple9000"
+    bad_url = f"postgresql://baduser:{fake_password}@127.0.0.1:1/fides"
+    env = dict(os.environ)
+    env["PRIVACYCARE_DATABASE_URL"] = bad_url
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT_PATH)],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "Traceback" not in combined
+    assert fake_password not in combined
+    assert bad_url not in combined
+    # The target line is still expected -- it never carries the password
+    # in the first place, so printing it is not the leak this test guards
+    # against.
+    assert "target: baduser@127.0.0.1:1/fides" in result.stdout
