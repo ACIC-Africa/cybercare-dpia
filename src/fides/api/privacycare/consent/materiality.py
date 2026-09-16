@@ -7,6 +7,17 @@
 # an entire customer base, and a rule that cries wolf gets switched off,
 # which is worse than not having it.
 #
+# On the word "material" in this module's name and API. It is the customer's
+# word, from her brief — "trigger fresh consent when a processing purpose
+# changes materially" — used in its ordinary sense. It is NOT a defined
+# threshold under the Kenyan Data Protection Act, and nothing here implements
+# a statutory test. (The Act's "material scope", section 4, is an unrelated
+# term of art: it means the Act's subject matter, not the significance of a
+# change.) The name is kept for traceability back to the requirement; what
+# the code computes is narrower and entirely observable — the later notice
+# version's data_uses set gained a member. Whether that is the right trigger
+# for re-consent, and on what legal basis, is OQ-CON-01 and is open.
+#
 # is_materially_different is deliberately PURE: no database, no clock. The
 # database enters only through the rule NAME that gets asked for — the
 # predicate's own logic is provisional and owned by Carol (OQ-CON-01), which
@@ -29,9 +40,11 @@ RULE_GAINED_USE = "gained_data_use"
 _SEED_ROW_ID = "consent-materiality-rule"
 
 _SOURCE_NOTE = (
-    "Provisional default pending Carol's ruling on OQ-CON-01 (spec D-CON-2: "
-    "what counts as a material notice change). Gaining a data use is treated "
-    "as material; losing one, or a wording-only change, is not."
+    "Provisional default pending Carol's ruling on OQ-CON-01 (spec D-CON-2): "
+    "is a gained data use the right trigger for re-consent, and on what legal "
+    "basis? Gaining a data use is treated as triggering; losing one, or a "
+    "wording-only change, is not. 'Material' here is the customer brief's "
+    "word in its ordinary sense, not a Kenyan DPA threshold."
 )
 
 _SEED_SQL = sqlalchemy.text(
