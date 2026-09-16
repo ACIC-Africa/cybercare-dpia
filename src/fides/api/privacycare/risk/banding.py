@@ -135,6 +135,6 @@ def projected_risk_level(band_value: str) -> str:
         return band_value
     else:
         raise ValueError(
-            f"projected_risk_level: unknown band {band_value!r} (nonsense); "
+            f"projected_risk_level: unknown band {band_value!r}; "
             f"must be one of {LOW!r}, {MEDIUM!r}, {HIGH!r}, {CRITICAL!r}"
         )
