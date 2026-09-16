@@ -51,6 +51,24 @@ def added_uses(earlier: list[str], later: list[str]) -> list[str]:
     return sorted(set(later) - set(earlier))
 
 
+def ensure_known_rule(rule: str) -> None:
+    """Raise if `rule` isn't one this module knows how to evaluate — today
+    there is exactly one (RULE_GAINED_USE). Pulled out of
+    is_materially_different (which still calls this on every row) so a
+    caller can also validate the CONFIGURED rule once, up front, before
+    running any per-row comparisons — see validate_active_rule below and
+    api/consent.py's route, which needs exactly that to keep an
+    unrecognised rule value in the same 503-worthy "configuration problem"
+    bucket as active_rule's own empty/ambiguous-table raises, without also
+    catching whatever ELSE a per-row comparison might raise."""
+    if rule != RULE_GAINED_USE:
+        raise ValueError(
+            f"privacycare_consent_rule names an unrecognised rule {rule!r} "
+            f"— the only rule this module can evaluate today is "
+            f"{RULE_GAINED_USE!r}. Fix the `rule` column on that row."
+        )
+
+
 def is_materially_different(
     earlier: Iterable[str], later: Iterable[str], *, rule: str = RULE_GAINED_USE
 ) -> bool:
@@ -58,8 +76,7 @@ def is_materially_different(
     rule to apply — today there is exactly one (RULE_GAINED_USE), and an
     unrecognised name is a caller bug, not a data state, so it raises rather
     than silently falling back to some default behaviour."""
-    if rule != RULE_GAINED_USE:
-        raise ValueError(f"unknown consent materiality rule: {rule!r}")
+    ensure_known_rule(rule)
     return bool(added_uses(list(earlier), list(later)))
 
 
@@ -106,3 +123,27 @@ def active_rule(db: Session) -> str:
             "the active materiality rule"
         )
     return rows[0][0]
+
+
+def validate_active_rule(db: Session) -> str:
+    """Resolve the active rule AND confirm it is one this module can
+    evaluate, in a single call.
+
+    Coordinator ruling (Task 3, fix round 2): api/consent.py's route used
+    to wrap its ENTIRE find_stale_consents(...) call in one `except
+    ValueError`, which caught this module's three configuration failures
+    (empty table, ambiguous table, unrecognised rule value) alongside
+    detector.py's own per-row failures — collapsing all of them into an
+    identical 503 and, worse, discarding every OTHER row's legitimate
+    finding whenever any one row triggered it. This function exists so the
+    route can resolve and validate configuration ONCE, up front, in a try
+    block that covers ONLY these three states — active_rule's own
+    empty/ambiguous raises, plus ensure_known_rule's unrecognised-value
+    raise below — and nothing else. A find_stale_consents failure AFTER
+    this call succeeds is therefore never a configuration problem by
+    construction, and the route lets it surface as an honest 500 rather
+    than laundering it into the same 503 an operator would read as "go
+    run the seed CLI"."""
+    rule = active_rule(db)
+    ensure_known_rule(rule)
+    return rule

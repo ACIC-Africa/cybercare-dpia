@@ -108,8 +108,8 @@ _QUERY = sqlalchemy.text(
 
 @dataclass(frozen=True)
 class StaleConsent:
-    subject: str  # email, or the device id when there is no email
-    subject_kind: str  # "email" | "fides_user_device" | "external_id"
+    subject: str  # email, device id, external id, or a "privacypreferencehistory:<id>" trace-back when the row has none of those
+    subject_kind: str  # "email" | "fides_user_device" | "external_id" | "none"
     notice_key: str
     notice_name: str
     consented_version: float
@@ -133,20 +133,31 @@ def _subject(row: Any) -> tuple[str, str]:
     prefers one identity type over another for consent reporting: email,
     then the device id, then an external id. Exactly one of the three is
     expected to be set on any given row — `privacypreferencehistory` allows
-    all three to be NULL at the schema level, but a preference recorded
-    with no identity at all is a Fides data-integrity problem this
-    detector cannot paper over, so that case raises rather than returning
-    a description of a subject nobody can act on."""
+    all three to be NULL at the schema level.
+
+    Coordinator ruling (Task 3, fix round 2): a preference recorded with no
+    identity at all IS a Fides data-integrity problem, but it used to be
+    treated as a reason to raise ValueError here — which api/consent.py's
+    route caught in the SAME except block as three unrelated configuration
+    failures (see materiality.validate_active_rule), turning one bad row
+    into an identical 503 and silently discarding every OTHER row's
+    legitimate finding in the same call (find_stale_consents builds its
+    whole list before returning any of it, so one raise mid-loop loses the
+    rest). The notice, both versions and the added uses are all still true
+    and actionable even when nobody can be named, so this reports instead
+    of raising: `"none"` — never a real identity kind — as a first-class
+    `subject_kind`, the same "none is a value, not an exception" pattern
+    this codebase already uses elsewhere, paired with a subject string
+    that names the offending `privacypreferencehistory` row by id so an
+    operator can go trace and fix the underlying data rather than losing
+    the finding entirely."""
     if row.email is not None:
         return row.email, "email"
     if row.fides_user_device is not None:
         return row.fides_user_device, "fides_user_device"
     if row.external_id is not None:
         return row.external_id, "external_id"
-    raise ValueError(
-        "privacypreferencehistory row carries no identity — email, "
-        "fides_user_device and external_id are all NULL"
-    )
+    return f"privacypreferencehistory:{row.id}", "none"
 
 
 def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> list[StaleConsent]:
