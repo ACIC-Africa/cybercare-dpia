@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Seed the Kenya DPA 2019 DPIA template (spec 2026-09-16 D-W2-2, Task 5).
 
-assessment_template holds a GDPR DPIA row and two UK GDPR rows (a DPIA and
-a ROPA); it holds nothing region='Kenya'. Without this seed, api/risk.py's
-register (Tasks 1-4) has DPIAs to score but no Kenyan questionnaire to
-score them against — the same "exists in the schema, inert in the
-deployment" gap every other PrivacyCare seed script in this package (see
-seed_dsr.py, seed_consent_demo.py) exists to close.
+assessment_template holds 13 rows today (checked directly against the live
+database — see the GDPR_TEMPLATE_ID comment below for the full list); none
+is region='Kenya'. Without this seed, api/risk.py's register (Tasks 1-4)
+has DPIAs to score but no Kenyan questionnaire to score them against — the
+same "exists in the schema, inert in the deployment" gap every other
+PrivacyCare seed script in this package (see seed_dsr.py,
+seed_consent_demo.py) exists to close.
 
 **parent_template_id inherits nothing.** It is a self-referential foreign
 key with a relationship (AssessmentTemplate.parent_template in
@@ -73,11 +74,25 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 # The GDPR Data Protection Impact Assessment template — 24 questions, the
-# template this seed copies from. NOT ast_... for "UK GDPR Data Protection
-# Impact Assessment (DPIA)" (23 questions, a different row) — verified
-# directly against the live database before this constant was written:
-# `SELECT id, name, region FROM assessment_template` shows exactly these
-# three assessment_template rows exist today.
+# template this seed copies from.
+#
+# `SELECT id, name, region FROM assessment_template` against the live
+# database returns 13 rows, not 3 — the table has held 13 for a while,
+# unrelated to this task. Of those 13, two are easy to mistake for each
+# other by name alone, and a third is a decoy if you try to disambiguate
+# by region instead:
+#   - ast_b5b6e569-0b77-439b-b1b8-8f9d77506f40, "GDPR Data Protection
+#     Impact Assessment (DPIA)", region 'EU/EEA', 24 questions — this one.
+#   - ast_fadf106a-8fd6-491e-8828-4ba509dcb85e, "UK GDPR Data Protection
+#     Impact Assessment (DPIA)", region 'United Kingdom', 23 questions —
+#     NOT this one; a different template with a near-identical name.
+#   - ast_f8d6180a-b361-4819-b289-9cf46eb54a71, "UK ICO Record of
+#     Processing Activities (ROPA)", ALSO region 'United Kingdom', 42
+#     questions — not a DPIA at all; filtering by region alone would not
+#     rule this one out.
+# Selected ast_b5b6e569... because its name says "GDPR" rather than "UK
+# GDPR", its type is DPIA rather than ROPA, and its question count (24)
+# matches the count this seed is meant to reproduce.
 GDPR_TEMPLATE_ID = "ast_b5b6e569-0b77-439b-b1b8-8f9d77506f40"
 
 KENYA_ASSESSMENT_TYPE = "kenya_dpa_2019_dpia"

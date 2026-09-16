@@ -1,11 +1,12 @@
 """The Kenya DPA 2019 DPIA template seed (spec 2026-09-16 D-W2-2, Task 5).
 
 The Kenyan taxonomy has no DPIA template of its own — assessment_template
-holds a GDPR row and two UK GDPR rows, nothing region='Kenya'. Without this
-seed, api/risk.py's register has DPIAs to score but no Kenyan questionnaire
-to score them against, the same "exists in the schema, inert in the
-deployment" gap every other PrivacyCare seed script in this package exists
-to close.
+holds 13 rows today (see seed_kenya_template.py's own GDPR_TEMPLATE_ID
+comment for the full list, and why two of them are easy to confuse), none
+region='Kenya'. Without this seed, api/risk.py's register has DPIAs to
+score but no Kenyan questionnaire to score them against, the same "exists
+in the schema, inert in the deployment" gap every other PrivacyCare seed
+script in this package exists to close.
 
 parent_template_id inherits nothing — it is a self-referential FK with a
 relationship (AssessmentTemplate.parent_template) and no code anywhere
