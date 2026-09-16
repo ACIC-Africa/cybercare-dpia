@@ -358,3 +358,61 @@ def test_a_bad_database_url_exits_non_zero_with_no_traceback_and_no_credential()
     # in the first place, so printing it is not the leak this test guards
     # against.
     assert "target: baduser@127.0.0.1:1/fides" in result.stdout
+
+
+def test_a_notice_whose_english_translation_is_gone_gets_it_back(db):
+    # Final review, minor: _FIND_TRANSLATION_SQL matches language = 'en'
+    # only, and Ethyca's delete_notice_translations (called by
+    # PrivacyNotice.update for every translation an update request omits)
+    # will happily remove it. The lookup's None used to flow straight into
+    # the inserts, which then produced orphaned translation_id-NULL history
+    # rows needing a manual DB fix -- _FIND_VERSION_SQL can never match
+    # them again, because `translation_id = NULL` is never true.
+    cli = _load_cli()
+    cli.seed_consent_demo(db)
+    notice_id = db.execute(
+        sqlalchemy.text("SELECT id FROM privacynotice WHERE notice_key = :k"),
+        {"k": cli.NOTICE_KEY},
+    ).scalar()
+
+    # The FK is ondelete="SET NULL", so this is exactly what Ethyca itself
+    # does to the history rows when a translation is deleted.
+    db.execute(
+        sqlalchemy.text(
+            "DELETE FROM noticetranslation WHERE privacy_notice_id = :nid"
+        ),
+        {"nid": notice_id},
+    )
+    orphaned = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM privacynoticehistory "
+            "WHERE notice_key = :k AND translation_id IS NULL"
+        ),
+        {"k": cli.NOTICE_KEY},
+    ).scalar()
+    assert orphaned == 2, "setup: Ethyca's SET NULL should have orphaned both versions"
+
+    cli.seed_consent_demo(db)
+
+    translations = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM noticetranslation WHERE privacy_notice_id = :nid"
+        ),
+        {"nid": notice_id},
+    ).scalar()
+    assert translations == 1, "the English translation was not recreated"
+
+    still_orphaned = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM privacynoticehistory "
+            "WHERE notice_key = :k AND translation_id IS NULL"
+        ),
+        {"k": cli.NOTICE_KEY},
+    ).scalar()
+    # Only the two Ethyca's own SET NULL orphaned. The rerun added NONE of
+    # its own -- before the fix it inserted two more, unreachable forever.
+    assert still_orphaned == 2
+
+    # And the seed is coherent again: the detector finds the demo subject.
+    result = find_stale_consents(db, notice_key=cli.NOTICE_KEY)
+    assert [item.subject for item in result] == [cli.DEMO_SUBJECT_EMAIL]

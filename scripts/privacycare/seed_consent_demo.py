@@ -191,12 +191,35 @@ _INSERT_VERSION_SQL = sqlalchemy.text(
 
 
 def _find_or_create_notice(db: Session) -> tuple[str, str, bool]:
-    """Returns (notice_id, translation_id, created)."""
+    """Returns (notice_id, translation_id, created).
+
+    Final review, minor: the English-translation lookup can legitimately
+    come back empty for a notice that DOES exist — `_FIND_TRANSLATION_SQL`
+    matches `language = 'en'` only, and Ethyca's own
+    `delete_notice_translations` (called by `PrivacyNotice.update` for every
+    translation not supplied in an update request) will happily remove it.
+    Returning that `None` unchecked made `_FIND_VERSION_SQL` match nothing
+    (`translation_id = NULL` is never true) and the inserts below produce
+    orphaned, `translation_id`-NULL history rows on every rerun, needing a
+    manual DB fix. The English translation is recreated instead: this is a
+    demonstration notice this script owns end to end, so restoring the
+    piece it needs is the idempotent answer, not a failure.
+    """
     notice_id = db.execute(_FIND_NOTICE_SQL, {"key": NOTICE_KEY}).scalar()
     if notice_id is not None:
         translation_id = db.execute(
             _FIND_TRANSLATION_SQL, {"notice_id": notice_id}
         ).scalar()
+        if translation_id is None:
+            translation_id = str(uuid4())
+            db.execute(
+                _INSERT_TRANSLATION_SQL,
+                {
+                    "id": translation_id,
+                    "notice_id": notice_id,
+                    "title": NOTICE_NAME,
+                },
+            )
         return notice_id, translation_id, False
 
     notice_id = str(uuid4())
