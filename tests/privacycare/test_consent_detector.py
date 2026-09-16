@@ -484,3 +484,116 @@ def test_a_subject_identified_only_by_external_id_is_still_reported(db):
     assert len(result) == 1
     assert result[0].subject == "loyalty-99"
     assert result[0].subject_kind == "external_id"
+
+
+# ---------------------------------------------------------------------------
+# Final review, Finding 3: deleting a notice translation must not erase a
+# finding. privacynoticehistory.translation_id is ondelete="SET NULL" and
+# Ethyca's own comment says the row is retained deliberately "for consent
+# reporting"; PrivacyNotice.update deletes every translation not supplied
+# in the request.
+# ---------------------------------------------------------------------------
+
+
+def _drop_translation(db, translation_id: str) -> None:
+    """What Ethyca's own ondelete="SET NULL" does when
+    delete_notice_translations removes a translation the update request did
+    not supply: the history rows survive with a NULL translation_id."""
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacynoticehistory SET translation_id = NULL "
+            "WHERE translation_id = :tid"
+        ),
+        {"tid": translation_id},
+    )
+    db.execute(
+        sqlalchemy.text("DELETE FROM noticetranslation WHERE id = :tid"),
+        {"tid": translation_id},
+    )
+
+
+def test_a_preference_against_a_translation_less_history_row_is_still_reported(db):
+    # Josephine's notice has English and Swahili. She gains a purpose and
+    # in the same save drops Swahili. Every preference recorded against a
+    # Swahili history row used to fall out of all three INNER JOINs and
+    # vanish — the API returned 200 with a shorter list.
+    notice_id, english = make_notice(db, key="fuel_card", name="Fuel Card Marketing")
+    swahili = str(uuid4())
+    db.execute(sqlalchemy.text("""
+        INSERT INTO noticetranslation (id, language, privacy_notice_id, title)
+        VALUES (:tid, 'sw', :nid, :title)
+    """), {"tid": swahili, "nid": notice_id, "title": "Fuel Card Marketing"})
+
+    sw_v1 = make_version(
+        db, translation_id=swahili, key="fuel_card", name="Fuel Card Marketing",
+        version=1.0, data_uses=["marketing.advertising"],
+    )
+    make_version(
+        db, translation_id=english, key="fuel_card", name="Fuel Card Marketing",
+        version=2.0, data_uses=["marketing.advertising", "marketing.advertising.third_party"],
+    )
+    make_preference(db, history_id=sw_v1, preference="opt_in", email="asha@example.com")
+
+    _drop_translation(db, swahili)
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "asha@example.com"
+    assert result[0].notice_key == "fuel_card"
+    assert result[0].live_version == 2.0
+    assert result[0].added_uses == ["marketing.advertising.third_party"]
+
+
+def test_a_notice_whose_translations_are_all_gone_still_reports_its_stale_consents(db):
+    # The `translations: []` save. Every history row ends up with a NULL
+    # translation_id, so the whole notice used to disappear from the report
+    # — "nothing is stale" for a notice that had just gained a processing
+    # purpose, which is the exact false reassurance this feature exists to
+    # prevent.
+    _, v1, _v2 = _notice_that_gained_a_use(db)
+    translation_id = db.execute(
+        sqlalchemy.text("SELECT id FROM noticetranslation")
+    ).scalar()
+    make_preference(db, history_id=v1, preference="opt_in", email="alice@example.com")
+
+    _drop_translation(db, translation_id)
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].notice_key == "fuel_card"
+    assert result[0].subject == "alice@example.com"
+    # And the filter Josephine would actually type still reaches it.
+    assert len(find_stale_consents(db, notice_key="fuel_card")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Final review, minor: both notice_key and notice_name are the LIVE ones.
+# ---------------------------------------------------------------------------
+
+
+def test_the_reported_notice_key_is_the_live_one_not_the_consented_one(db):
+    # notice_key is denormalised onto each history row at the time of that
+    # edit, so a key change leaves older rows carrying the old key. The
+    # report — and the filter — must name the key Josephine sees today, or
+    # filtering by it returns nothing for exactly the people who need
+    # re-consent.
+    _, translation_id = make_notice(db, key="fuel_card_renamed", name="Fuel Card Marketing")
+    v1 = make_version(
+        db, translation_id=translation_id, key="fuel_card_old",
+        name="Fuel Card Marketing", version=1.0, data_uses=["marketing.advertising"],
+    )
+    make_version(
+        db, translation_id=translation_id, key="fuel_card_renamed",
+        name="Fuel Card Marketing", version=2.0,
+        data_uses=["marketing.advertising", "marketing.advertising.third_party"],
+    )
+    make_preference(db, history_id=v1, preference="opt_in", email="alice@example.com")
+
+    result = find_stale_consents(db)
+    assert len(result) == 1
+    assert result[0].notice_key == "fuel_card_renamed"
+
+    assert len(find_stale_consents(db, notice_key="fuel_card_renamed")) == 1
+    assert find_stale_consents(db, notice_key="fuel_card_old") == []

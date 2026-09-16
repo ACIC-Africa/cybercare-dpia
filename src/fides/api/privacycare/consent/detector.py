@@ -15,23 +15,57 @@ regulator's copy of what a subject did must not change because our
 materiality rule changed later (spec D-CON-3) — so this module has no
 write path to change it with.
 
-**The join.** `privacypreferencehistory.privacy_notice_history_id` points
-at the `privacynoticehistory` row a subject's preference was recorded
-against. That row carries `.version` and `.data_uses` for the moment it was
-created, plus `.translation_id`, which is how it reaches the notice it
-belongs to: `translation_id -> noticetranslation.id -> privacy_notice_id ->
-privacynotice.id`.
+**Reaching the notice (final review, Finding 3).** A `privacynoticehistory`
+row carries `.version` and `.data_uses` for the moment it was created,
+plus `.translation_id`, which points at the `noticetranslation` it was
+written for. This module used to reach the owning notice ONLY through that
+pointer, with three INNER JOINs — and that silently discarded findings.
+`privacynoticehistory.translation_id` is `ForeignKey(..., ondelete="SET
+NULL")`, and Ethyca's own comment on it (`models/privacy_notice.py`) says
+why: "Set to null if the translation is deleted, but we retain this record
+for consent reporting." `PrivacyNotice.update` calls
+`delete_notice_translations`, which deletes every translation NOT supplied
+in the update request. So a notice that gains a purpose and drops its
+Swahili translation in the same save loses every Swahili-recorded
+preference from the report; a save supplying `translations: []` drops the
+notice from the report entirely and returns "nothing is stale" for a
+notice that just gained a processing purpose. Ethyca deliberately
+preserves those rows; this query was the one consumer throwing them away.
+
+So a history row now resolves to its notice through, in order:
+
+1. `translation_id -> noticetranslation.privacy_notice_id` (the normal path),
+2. failing that, `privacynoticehistory.notice_key -> privacynotice.notice_key`
+   — `notice_key` is denormalised onto the history row, is `NOT NULL` in
+   the live schema (verified against `fides-db`), and is translation
+   independent, so a `translation_id`-NULL row still finds its notice,
+3. failing even that (the notice row itself is gone, or its key was
+   changed after this history row was written), the literal
+   `'notice_key:' || notice_key`, so the row is grouped with its own kind
+   rather than dropped.
+
+`privacynotice.notice_key` carries NO uniqueness constraint in the live
+schema, so step 2 is a deterministic scalar subquery (`ORDER BY ... LIMIT
+1`) rather than a join — a join would fan out and duplicate preference
+rows if a key were ever doubled.
 
 **`privacynotice` has no `version` column of its own.** A notice's LIVE
-version is the highest `version` among the `privacynoticehistory` rows
-reachable through its translations — not the most recently created row.
-History rows are versioned by an application-level counter
-(`existing_version + 1.0`, see `create_historical_record_for_notice_and_
-translation` in `fides.api.models.privacy_notice`), and nothing stops one
-from landing in the table after a higher-numbered one (a slow write racing
-an earlier one, or a backfill). `MAX(version)` is the only version-numbering
-fact that's actually true regardless of insertion order; `MAX(created_at)`
-or "last row inserted" is not.
+version is the highest `version` among the `privacynoticehistory` rows that
+resolve to it — not the most recently created row. History rows are
+versioned by an application-level counter (`existing_version + 1.0`, see
+`create_historical_record_for_notice_and_translation` in
+`fides.api.models.privacy_notice`), and nothing stops one from landing in
+the table after a higher-numbered one (a slow write racing an earlier one,
+or a backfill). `MAX(version)` is the only version-numbering fact that's
+actually true regardless of insertion order; `MAX(created_at)` or "last row
+inserted" is not.
+
+**`notice_key` and `notice_name` are both LIVE (final review, minor).**
+The reported `notice_key` — and the `notice_key` filter argument — used to
+come from the version the subject consented AGAINST while `notice_name`
+came from the live one. If a notice's key is ever changed, filtering by the
+key Josephine sees today would then return nothing for exactly the people
+who need re-consent. Both now name the live version.
 
 **Subject identity is resolved through the ORM, not through `_QUERY`.**
 `privacypreferencehistory.email` / `.phone_number` / `.fides_user_device` /
@@ -75,40 +109,54 @@ from fides.api.privacycare.consent.materiality import active_rule, added_uses, i
 # affirmative agreement that a later, broader notice can outrun.
 _STALE_ELIGIBLE_PREFERENCE = "opt_in"
 
-# `privacynoticehistory.notice_key` is a denormalised copy of the owning
-# notice's key at the time of that edit, but the query below deliberately
-# does NOT group by it. The plan's structure section defines "live version"
-# as the highest version reachable through a notice's translations — i.e.
-# grouped by `noticetranslation.privacy_notice_id` — and that is what this
-# reads.
 _QUERY = sqlalchemy.text(
     """
-    WITH live_version AS (
-        SELECT DISTINCT ON (nt.privacy_notice_id)
-            nt.privacy_notice_id AS notice_id,
-            pnh.version           AS live_version,
-            pnh.data_uses         AS live_data_uses,
-            pnh.name              AS live_name
+    WITH history AS (
+        SELECT
+            pnh.id            AS id,
+            pnh.version       AS version,
+            pnh.data_uses     AS data_uses,
+            pnh.name          AS name,
+            COALESCE(
+                nt.privacy_notice_id,
+                (
+                    SELECT pn.id
+                    FROM privacynotice pn
+                    WHERE pn.notice_key = pnh.notice_key
+                    ORDER BY pn.created_at, pn.id
+                    LIMIT 1
+                ),
+                'notice_key:' || pnh.notice_key
+            )                 AS notice_ref,
+            pnh.notice_key    AS notice_key
         FROM privacynoticehistory pnh
-        JOIN noticetranslation nt ON nt.id = pnh.translation_id
-        ORDER BY nt.privacy_notice_id, pnh.version DESC
+        LEFT JOIN noticetranslation nt ON nt.id = pnh.translation_id
+    ),
+    live_version AS (
+        SELECT DISTINCT ON (h.notice_ref)
+            h.notice_ref   AS notice_ref,
+            h.version      AS live_version,
+            h.data_uses    AS live_data_uses,
+            h.name         AS live_name,
+            h.notice_key   AS live_notice_key
+        FROM history h
+        ORDER BY h.notice_ref, h.version DESC, h.id
     )
     SELECT
         pph.id                AS pref_id,
         pph.preference        AS preference,
         pph.received_at       AS received_at,
-        cv.notice_key         AS notice_key,
+        lv.live_notice_key    AS notice_key,
         cv.version            AS consented_version,
         cv.data_uses          AS consented_data_uses,
         lv.live_version       AS live_version,
         lv.live_data_uses     AS live_data_uses,
         lv.live_name          AS live_name
     FROM privacypreferencehistory pph
-    JOIN privacynoticehistory cv ON cv.id = pph.privacy_notice_history_id
-    JOIN noticetranslation nt    ON nt.id = cv.translation_id
-    JOIN live_version lv         ON lv.notice_id = nt.privacy_notice_id
+    JOIN history cv      ON cv.id = pph.privacy_notice_history_id
+    JOIN live_version lv ON lv.notice_ref = cv.notice_ref
     WHERE pph.preference = :stale_eligible
-      AND (:notice_key IS NULL OR cv.notice_key = :notice_key)
+      AND (:notice_key IS NULL OR lv.live_notice_key = :notice_key)
     """
 )
 
@@ -189,8 +237,9 @@ def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> lis
     since gained a data use, per the currently active materiality rule
     (Task 1's `active_rule` — raises if nobody has configured one yet).
 
-    Pass `notice_key` to narrow the report to one notice; omit it for
-    every notice at once. Read-only: see the module docstring.
+    Pass `notice_key` to narrow the report to one notice — matched
+    against the notice's LIVE key, the one Josephine sees today. Omit it
+    for every notice at once. Read-only: see the module docstring.
     """
     rule = active_rule(db)
     rows = db.execute(
