@@ -116,15 +116,43 @@ def make_version(db, *, translation_id, key, name, version, data_uses) -> str:
 
 
 def make_preference(db, *, history_id, preference="opt_in", email=None,
-                    device=None) -> str:
+                    device=None, phone=None, external_id=None,
+                    received_at=None, created_at=None) -> str:
+    """One privacypreferencehistory row.
+
+    `created_at` is explicit-or-default rather than always defaulted,
+    because Postgres' `now()` is TRANSACTION start time: every row a test
+    inserts inside the rolled-back `db` fixture would otherwise carry an
+    IDENTICAL created_at, which makes the detector's created_at tiebreak
+    untestable. Pass a real timestamp when the test cares about order.
+    """
     pref_id = str(uuid4())
     db.execute(sqlalchemy.text("""
         INSERT INTO privacypreferencehistory
-          (id, preference, privacy_notice_history_id, email, fides_user_device)
-        VALUES (:id, :pref, :hid, :email, :device)
+          (id, preference, privacy_notice_history_id, email, fides_user_device,
+           phone_number, external_id, received_at, created_at)
+        VALUES (:id, :pref, :hid, :email, :device, :phone, :external_id,
+                :received_at, COALESCE(:created_at, now()))
     """), {"id": pref_id, "pref": preference, "hid": history_id,
-           "email": _encrypt(email), "device": _encrypt(device)})
+           "email": _encrypt(email), "device": _encrypt(device),
+           "phone": _encrypt(phone), "external_id": _encrypt(external_id),
+           "received_at": received_at, "created_at": created_at})
     return pref_id
+
+
+def _notice_that_gained_a_use(db, *, key="fuel_card", name="Fuel Card Marketing"):
+    """A notice with v1 -> v2 gaining `marketing.advertising.third_party`.
+    Returns (translation_id, v1_id, v2_id)."""
+    _, translation_id = make_notice(db, key=key, name=name)
+    v1 = make_version(
+        db, translation_id=translation_id, key=key, name=name,
+        version=1.0, data_uses=["marketing.advertising"],
+    )
+    v2 = make_version(
+        db, translation_id=translation_id, key=key, name=name,
+        version=2.0, data_uses=["marketing.advertising", "marketing.advertising.third_party"],
+    )
+    return translation_id, v1, v2
 
 
 def test_a_preference_against_a_version_that_later_gained_a_use_is_stale(db):
@@ -424,3 +452,35 @@ def test_a_notice_with_one_version_yields_nothing(db):
     make_preference(db, history_id=v1, preference="opt_in", email="alice@example.com")
 
     assert find_stale_consents(db) == []
+
+
+# ---------------------------------------------------------------------------
+# Final review, Finding 2: phone_number is Fides' fourth consent identity.
+# ---------------------------------------------------------------------------
+
+
+def test_a_subject_identified_only_by_phone_number_is_reported_by_phone(db):
+    # If consent is captured in a fuel-card or loyalty base, the identifier
+    # is an MSISDN — as it would be for essentially any Kenyan retailer.
+    # This used to come back as subject_kind "none" with nothing but a row
+    # id: uncontactable, and indistinguishable from the corrupt-data case
+    # "none" exists to flag.
+    _, v1, _v2 = _notice_that_gained_a_use(db)
+    make_preference(db, history_id=v1, preference="opt_in", phone="+254712345678")
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "+254712345678"
+    assert result[0].subject_kind == "phone_number"
+
+
+def test_a_subject_identified_only_by_external_id_is_still_reported(db):
+    _, v1, _v2 = _notice_that_gained_a_use(db)
+    make_preference(db, history_id=v1, preference="opt_in", external_id="loyalty-99")
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "loyalty-99"
+    assert result[0].subject_kind == "external_id"

@@ -34,26 +34,33 @@ fact that's actually true regardless of insertion order; `MAX(created_at)`
 or "last row inserted" is not.
 
 **Subject identity is resolved through the ORM, not through `_QUERY`.**
-`privacypreferencehistory.email` / `.fides_user_device` / `.external_id`
-are `StringEncryptedType` columns (AES-GCM; see `ConsentIdentitiesMixin` in
-`fides.api.models.privacy_preference`) — the encryption is a `TypeDecorator`
-that only fires when SQLAlchemy knows the column's type, which a raw
-`sqlalchemy.text()` SELECT never does. Reading those three columns via raw
-SQL returns ciphertext, not a usable identity, for any preference actually
-recorded through Fides' own consent flow (the ORM `create`/`persist_obj`
-path). So `_QUERY` finds the stale `privacynoticehistory`/version facts and
-the `privacypreferencehistory.id`s that are materially stale, and
-`find_stale_consents` then loads exactly those rows through the
-`PrivacyPreferenceHistory` model — still read-only, a `SELECT` via
-`db.query(...)`, no `add`/`commit`/`delete` — so the ORM's decrypting type
-decorator applies and `.email` etc. come back as plaintext.
+`privacypreferencehistory.email` / `.phone_number` / `.fides_user_device` /
+`.external_id` are `StringEncryptedType` columns (AES-GCM; see
+`ConsentIdentitiesMixin` in `fides.api.models.privacy_preference`) — the
+encryption is a `TypeDecorator` that only fires when SQLAlchemy knows the
+column's type, which a raw `sqlalchemy.text()` SELECT never does. Reading
+those four columns via raw SQL returns ciphertext, not a usable identity,
+for any preference actually recorded through Fides' own consent flow (the
+ORM `create`/`persist_obj` path). So `_QUERY` finds the stale
+`privacynoticehistory`/version facts and the `privacypreferencehistory.id`s
+that are materially stale, and `find_stale_consents` then loads exactly
+those rows through the `PrivacyPreferenceHistory` model — still read-only,
+a `SELECT` via `db.query(...)`, no `add`/`commit`/`delete` — so the ORM's
+decrypting type decorator applies and `.email` etc. come back as plaintext.
+
+That ORM load is narrowed with `load_only` to the id and the four identity
+columns and NOTHING else. `privacypreferencehistory` also holds
+`secondary_user_ids` (an encrypted blob of identities shared with third
+parties), `user_agent`, `url_recorded` and `anonymized_ip_address`; none of
+them appear in the report, so none of them are read or decrypted here.
+PrivacyCare reads only what the job requires.
 """
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
 import sqlalchemy
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from fides.api.models.privacy_preference import PrivacyPreferenceHistory
 from fides.api.privacycare.consent.materiality import active_rule, added_uses, is_materially_different
@@ -108,8 +115,8 @@ _QUERY = sqlalchemy.text(
 
 @dataclass(frozen=True)
 class StaleConsent:
-    subject: str  # email, device id, external id, or a "privacypreferencehistory:<id>" trace-back when the row has none of those
-    subject_kind: str  # "email" | "fides_user_device" | "external_id" | "none"
+    subject: str  # email, phone number, device id, external id, or a "privacypreferencehistory:<id>" trace-back when the row has none of those
+    subject_kind: str  # "email" | "phone_number" | "fides_user_device" | "external_id" | "none"
     notice_key: str
     notice_name: str
     consented_version: float
@@ -129,11 +136,26 @@ class StaleConsent:
 
 
 def _subject(row: Any) -> tuple[str, str]:
-    """Which identity a preference row carries, in the order Fides itself
-    prefers one identity type over another for consent reporting: email,
-    then the device id, then an external id. Exactly one of the three is
+    """Which identity a preference row carries.
+
+    All FOUR of Fides' consent identities are resolved here — `email`,
+    `phone_number`, `fides_user_device`, `external_id` — the four
+    `ConsentIdentitiesMixin` declares and the four
+    `CurrentPrivacyPreferenceV2` carries uniqueness constraints over.
+    `phone_number` was missing until the final review's Finding 2, which
+    mattered for exactly this customer: if consent is captured in a fuel
+    card or loyalty base, the identifier is an MSISDN, as it would be for
+    essentially any Kenyan retailer. Every such subject came back as
+    `subject_kind: "none"` with nothing but a row id — uncontactable, and
+    worse, indistinguishable from the corrupt-data case `"none"` exists to
+    flag, so a perfectly well-formed phone-identified record read as
+    something to go chase.
+
+    Directly contactable identities come first (email, then phone number:
+    Josephine has to be able to reach the person), then the opaque
+    technical identifiers (device id, then external id). Exactly one is
     expected to be set on any given row — `privacypreferencehistory` allows
-    all three to be NULL at the schema level.
+    all four to be NULL at the schema level.
 
     Coordinator ruling (Task 3, fix round 2): a preference recorded with no
     identity at all IS a Fides data-integrity problem, but it used to be
@@ -153,6 +175,8 @@ def _subject(row: Any) -> tuple[str, str]:
     the finding entirely."""
     if row.email is not None:
         return row.email, "email"
+    if row.phone_number is not None:
+        return row.phone_number, "phone_number"
     if row.fides_user_device is not None:
         return row.fides_user_device, "fides_user_device"
     if row.external_id is not None:
@@ -183,11 +207,23 @@ def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> lis
 
     # Identity only, and only for rows that are actually stale — see the
     # module docstring for why this can't be folded into `_QUERY`. A plain
-    # `SELECT ... WHERE id IN (...)` via the ORM: still read-only.
+    # `SELECT ... WHERE id IN (...)` via the ORM: still read-only, and
+    # narrowed with `load_only` to the id and the four identity columns so
+    # nothing else on the row — `secondary_user_ids`, `user_agent`,
+    # `url_recorded`, `anonymized_ip_address` — is read or decrypted.
     pref_ids = [row.pref_id for row in materially_stale]
     preferences_by_id = {
         preference.id: preference
         for preference in db.query(PrivacyPreferenceHistory)
+        .options(
+            load_only(
+                PrivacyPreferenceHistory.id,
+                PrivacyPreferenceHistory.email,
+                PrivacyPreferenceHistory.phone_number,
+                PrivacyPreferenceHistory.fides_user_device,
+                PrivacyPreferenceHistory.external_id,
+            )
+        )
         .filter(PrivacyPreferenceHistory.id.in_(pref_ids))
         .all()
     }
