@@ -111,6 +111,25 @@ def test_an_unseeded_rule_is_an_error_not_a_silent_default(db):
         active_rule(db)
 
 
+def test_a_second_row_is_rejected_rather_than_silently_picked(db):
+    # Two rows means the table's only sanctioned invariant (exactly one row)
+    # has already been violated by some writer other than seed_consent_rule
+    # (whose fixed id is the only thing that makes ON CONFLICT DO NOTHING
+    # idempotent). Picking one via ORDER BY/LIMIT would hide that violation
+    # behind whichever row was touched most recently — this is not a tie to
+    # break, it is a config state nobody should be able to reach silently.
+    _clear_rules(db)
+    seed_consent_rule(db)
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_consent_rule (id, rule) "
+            "VALUES ('some-other-writer-row', 'gained_data_use')"
+        )
+    )
+    with pytest.raises(ValueError, match="privacycare_consent_rule"):
+        active_rule(db)
+
+
 def test_an_unknown_rule_is_rejected():
     with pytest.raises(ValueError, match="vibes"):
         is_materially_different(["a"], ["b"], rule="vibes")

@@ -40,9 +40,7 @@ _SEED_SQL = sqlalchemy.text(
     "ON CONFLICT (id) DO NOTHING"
 )
 
-_SELECT_ACTIVE_RULE_SQL = sqlalchemy.text(
-    "SELECT rule FROM privacycare_consent_rule ORDER BY updated_at LIMIT 1"
-)
+_SELECT_ACTIVE_RULE_SQL = sqlalchemy.text("SELECT rule FROM privacycare_consent_rule")
 
 
 def added_uses(earlier: list[str], later: list[str]) -> list[str]:
@@ -76,16 +74,35 @@ def seed_consent_rule(db: Session) -> None:
 
 
 def active_rule(db: Session) -> str:
-    """The rule name Carol's row currently holds. An empty table means
-    nobody has run the seed CLI (Task 4) yet — the same trap the DSR
-    register hit: a NULL, or here an empty table, that means "not
-    configured" must not be readable as a meaningful default, so this
-    raises by name rather than returning one."""
-    result = db.execute(_SELECT_ACTIVE_RULE_SQL).scalar()
-    if result is None:
+    """The rule name Carol's row currently holds. Exactly one row is the
+    only state this table is allowed to be in — seed_consent_rule's fixed
+    id is what enforces that for its own writes, but the table carries no
+    uniqueness constraint of its own, so any other writer (a hand-written
+    insert, an ORM call, an admin tool) can land a second row with a fresh
+    random id and slip past that conflict target entirely.
+
+    Both zero rows and more than one row are the same underlying failure —
+    a config value nobody deliberately set (or nobody deliberately kept
+    singular) being read as if it were meaningful — so both raise by table
+    name instead of guessing. Zero means nobody has run the seed CLI (Task
+    4) yet, the same trap the DSR register hit. More than one means the
+    table's only sanctioned invariant (exactly one row) has already been
+    violated, and picking one of the rows via ORDER BY / LIMIT would hide
+    that violation behind whichever row happened to be touched most
+    recently — silently, which is worse than the empty-table case, since
+    the loud failure the empty check performs would not fire at all."""
+    rows = db.execute(_SELECT_ACTIVE_RULE_SQL).fetchall()
+    if len(rows) == 0:
         raise ValueError(
             "privacycare_consent_rule is empty — run the seed CLI "
             "(scripts/privacycare/seed_consent.py, Task 4) before reading "
             "the active materiality rule"
         )
-    return result
+    if len(rows) > 1:
+        raise ValueError(
+            f"privacycare_consent_rule holds {len(rows)} rows — exactly "
+            "one is expected. A second writer bypassed seed_consent_rule's "
+            "fixed id; resolve the ambiguity in the table before reading "
+            "the active materiality rule"
+        )
+    return rows[0][0]
