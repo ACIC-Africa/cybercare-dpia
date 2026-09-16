@@ -56,7 +56,12 @@ from importlib import resources
 from typing import TYPE_CHECKING
 from xml.sax.saxutils import escape as xml_escape
 
-from fides.api.privacycare.report import Report, ReportQuestion, ReportSection
+from fides.api.privacycare.report import (
+    ODPC_METADATA_LABEL,
+    Report,
+    ReportQuestion,
+    ReportSection,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from importlib.resources.abc import Traversable
@@ -375,7 +380,16 @@ def render_pdf(report: Report) -> bytes:
         # from report.odpc, so there is exactly one place this sentence is
         # composed (report.py's _odpc_metadata_value) even though it now
         # prints twice.
-        odpc_callout_text = dict(report.metadata).get("ODPC Prior Consultation")
+        #
+        # Final whole-branch review, minor finding: looked up by
+        # ODPC_METADATA_LABEL (imported from report.py), not a second
+        # "ODPC Prior Consultation" string literal here — the two used to
+        # be able to drift independently, silently dropping the callout
+        # the moment they did. Do NOT change this to report.odpc.reason:
+        # reason lacks the "REQUIRED —" verdict prefix and the driving-risk
+        # sentence _odpc_metadata_value appends, so reading it directly
+        # would weaken the callout, not just relocate it.
+        odpc_callout_text = dict(report.metadata).get(ODPC_METADATA_LABEL)
         if odpc_callout_text:
             story.append(
                 Paragraph(

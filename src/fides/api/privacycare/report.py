@@ -163,6 +163,43 @@ def _report_section(
     )
 
 
+# The metadata row label pdf.py's callout promotion (task 4 fix round 1,
+# important finding 1) uses to find the ODPC row inside report.metadata and
+# pull its already-composed text back out. Shared here rather than a second
+# string literal in pdf.py — final whole-branch review, minor finding: a
+# hardcoded "ODPC Prior Consultation" duplicated in pdf.py would silently
+# stop matching this row the moment either string drifted, and the callout
+# would just vanish from the PDF with no error. pdf.py imports this
+# constant instead of retyping it, or calls _odpc_metadata_value(report.odpc)
+# directly — never report.odpc.reason, which lacks the "REQUIRED —" verdict
+# prefix and the driving-risk sentence this function appends.
+ODPC_METADATA_LABEL = "ODPC Prior Consultation"
+
+
+# Final whole-branch review, minor finding: description is unconstrained
+# Text (models.py's dpia_risk_table) that a DPO can type any amount of
+# prose into, and _odpc_metadata_value below appends it whole into ONE
+# sentence, which pdf.py renders as ONE ReportLab Table cell — and a Table
+# does not split a single cell's content across pages, only whole rows.
+# Verified directly (rendered a Report with a 6,000-character description
+# through render_pdf): it does NOT crash uncaught — the broad `except
+# Exception` in render_pdf funnels ReportLab's LayoutError into
+# PDFRenderError as designed, so the route 503s rather than 500s. But it
+# still fails the export outright for a legitimate DPIA that happens to
+# have a verbose risk description, which is avoidable: the full text is
+# unaffected in the register and in the API response either way, so
+# nothing is lost by capping only this one composed sentence.
+_DRIVING_RISK_DESCRIPTION_CAP = 300
+
+
+def _capped(text: str, limit: int) -> str:
+    """text, unchanged if it already fits in `limit` characters; otherwise
+    truncated to `limit` characters with a trailing ellipsis."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
 def _odpc_metadata_value(finding: OdpcFinding) -> str:
     """The single metadata row's value: verdict, window and (when required)
     the driving risk, all in one place.
@@ -186,7 +223,8 @@ def _odpc_metadata_value(finding: OdpcFinding) -> str:
     if finding.required and finding.highest_risk is not None:
         risk = finding.highest_risk
         value += (
-            f" Driving risk: {risk.category} — {risk.description} "
+            f" Driving risk: {risk.category} — "
+            f"{_capped(risk.description, _DRIVING_RISK_DESCRIPTION_CAP)} "
             f"(score {risk.score}/25, {risk.band})."
         )
     return value
@@ -218,7 +256,7 @@ def _metadata_rows(
         ("Template", detail.template_name or ""),
         ("Status", detail.status or ""),
         ("Risk Level", detail.risk_level or ""),
-        ("ODPC Prior Consultation", _odpc_metadata_value(odpc)),
+        (ODPC_METADATA_LABEL, _odpc_metadata_value(odpc)),
         ("Created", detail.created_at or ""),
         ("Last Updated", detail.updated_at or ""),
     ]
