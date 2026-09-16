@@ -310,3 +310,27 @@ class DsrAlert:
     # occasionally is a smaller failure than a channel muted by a genuinely
     # repeating alert, which is what this table exists to prevent.
     __table__ = dsr_alert_table
+
+
+consent_rule_table = Table(
+    "privacycare_consent_rule",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column("rule", String(64), nullable=False),
+    Column("source_note", Text),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+)
+
+
+@mapper_registry.mapped
+class ConsentRule:
+    # What counts as a notice change material enough to invalidate consent
+    # already given. A table rather than a constant because the answer is an
+    # open question for the SME (OQ-CON-01), and answering it must not
+    # require a deploy — the same reason privacycare_dsr_timeline is a table.
+    __table__ = consent_rule_table
