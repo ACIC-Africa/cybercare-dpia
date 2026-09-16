@@ -76,6 +76,13 @@ PRIVACYCARE_DISCOVERY = "privacycare_discovery"
 # the execution of the three rights that move data — so it gets its own
 # scope name for the same reason PRIVACYCARE_DISCOVERY does.
 PRIVACYCARE_DSR = "privacycare_dsr"
+# PrivacyCare (spec 2026-09-13 D-CON-1): the stale-consent detector is ours
+# — Fides records which notice version a subject consented against but
+# never compares it to anything (consent/detector.py) — so it gets its own
+# scope name for the same reason PRIVACYCARE_DISCOVERY and PRIVACYCARE_DSR
+# do. Read only: the route it guards exposes no write, so no _UPDATE
+# variant exists for it (see api/consent.py).
+PRIVACYCARE_CONSENT = "privacycare_consent"
 SYSTEM_MANAGER = "system_manager"
 TAXONOMY = "taxonomy"
 TEST = "test"
@@ -258,6 +265,10 @@ PRIVACYCARE_DISCOVERY_UPDATE = f"{PRIVACYCARE_DISCOVERY}:{UPDATE}"
 PRIVACYCARE_DSR_READ = f"{PRIVACYCARE_DSR}:{READ}"
 PRIVACYCARE_DSR_UPDATE = f"{PRIVACYCARE_DSR}:{UPDATE}"
 
+# PrivacyCare (spec 2026-09-13 D-CON-1): read only, see PRIVACYCARE_CONSENT
+# above for why there is no _UPDATE.
+PRIVACYCARE_CONSENT_READ = f"{PRIVACYCARE_CONSENT}:{READ}"
+
 
 SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE = (
     f"{SYSTEM_INTEGRATION_LINK}:{CREATE_OR_UPDATE}"
@@ -407,6 +418,8 @@ SCOPE_DOCS = {
     # PrivacyCare (spec 2026-09-13 D-DSR-1)
     PRIVACYCARE_DSR_READ: "View DSR register requests and their status",
     PRIVACYCARE_DSR_UPDATE: "Record and update DSR register requests",
+    # PrivacyCare (spec 2026-09-13 D-CON-1)
+    PRIVACYCARE_CONSENT_READ: "View stale-consent detector results",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",
     SYSTEM_INTEGRATION_LINK_DELETE: "Delete system-integration links",
     SYSTEM_INTEGRATION_LINK_READ: "Read system-integration links",

@@ -143,6 +143,23 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # identities at all). PENDING A PRODUCT RULING: Owner and Contributor
     # still get PRIVACYCARE_DSR_READ (and PRIVACYCARE_DSR_UPDATE) by
     # registry derivation below — this omission narrows only Viewer.
+    #
+    # PrivacyCare (spec 2026-09-13 D-CON-1): PRIVACYCARE_CONSENT_READ is
+    # likewise intentionally NOT here, for the same reasoning as
+    # PRIVACYCARE_DSR_READ immediately above rather than the
+    # PRIVACYCARE_DISCOVERY_READ precedent it was modelled on further up —
+    # the stale-consent report names a data subject (email, device id, or
+    # external id) and what they consented to, the same kind of sensitive,
+    # subject-identifying content upstream withholds PRIVACY_REQUEST_READ
+    # from Viewer for. Owner and Contributor still get
+    # PRIVACYCARE_CONSENT_READ by registry derivation below (there is no
+    # PRIVACYCARE_CONSENT_UPDATE to omit — the route it guards exposes no
+    # write); this omission narrows only Viewer. Not imported into this
+    # module at all: unlike PRIVACYCARE_DISCOVERY_READ and
+    # PRIVACYCARE_DSR_READ (each named, even if only in a comment, next to
+    # an explicit list above), PRIVACYCARE_CONSENT_READ is referenced by
+    # name in no list here — Owner and Contributor pick it up purely
+    # through SCOPE_REGISTRY / not_contributor_scopes below.
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,

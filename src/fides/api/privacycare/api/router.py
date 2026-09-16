@@ -92,6 +92,21 @@ PRIVACYCARE_DSR_PREFIX = f"{V1_URL_PREFIX}/privacycare/dsr-requests"
 
 privacycare_dsr_router = APIRouter(prefix=PRIVACYCARE_DSR_PREFIX, tags=["PrivacyCare"])
 
+# The stale-consent detector's HTTP surface (plan 16, task 3): a SEVENTH,
+# separate prefix family, and — like privacycare_processes_router/
+# privacycare_chat_router/privacycare_grounds_router/privacycare_dsr_router,
+# and UNLIKE PRIVACYCARE_PREFIX/PRIVACYCARE_MONITORS_PREFIX — back in OUR
+# OWN namespace, not Ethyca's `plus`. Nothing in the shipped admin UI calls
+# this route (the detector is new, Kenyan-specific ground with no Plus
+# analogue), so taking a `plus` path here would only risk colliding with a
+# real Plus endpoint later. See api/consent.py's module docstring for the
+# fuller version of this argument.
+PRIVACYCARE_CONSENT_PREFIX = f"{V1_URL_PREFIX}/privacycare/consent"
+
+privacycare_consent_router = APIRouter(
+    prefix=PRIVACYCARE_CONSENT_PREFIX, tags=["PrivacyCare"]
+)
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -191,10 +206,17 @@ def register() -> None:
     # tasks-vs-assessments matching-order hazard either.
     importlib.import_module("fides.api.privacycare.api.dsr")
 
+    # consent.py (plan 16, task 3) decorates its OWN router
+    # (privacycare_consent_router, a distinct prefix), so — same as
+    # grounds.py, chat.py, monitors.py and dsr.py above — it carries none
+    # of the tasks-vs-assessments matching-order hazard either.
+    importlib.import_module("fides.api.privacycare.api.consent")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
     app_setup.ROUTERS.append(privacycare_grounds_router)
     app_setup.ROUTERS.append(privacycare_monitors_router)
     app_setup.ROUTERS.append(privacycare_dsr_router)
+    app_setup.ROUTERS.append(privacycare_consent_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

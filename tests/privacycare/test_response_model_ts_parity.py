@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from fides.api.privacycare.api.router import (
     PRIVACYCARE_CHAT_PREFIX,
+    PRIVACYCARE_CONSENT_PREFIX,
     PRIVACYCARE_DSR_PREFIX,
     PRIVACYCARE_GROUNDS_PREFIX,
     PRIVACYCARE_MONITORS_PREFIX,
@@ -301,6 +302,28 @@ ALLOWLIST: dict[str, dict] = {
             "there is nothing to be in parity with."
         ),
     },
+    # The stale-consent detector's HTTP surface (plan 16, task 3). Same
+    # pattern as the DSR register and business-process ROPA surfaces above:
+    # the detector is new, Kenyan-specific ground with no Plus analogue, so
+    # no shipped admin-UI screen calls this route and the response model
+    # has no TS counterpart to be in parity with.
+    "StaleConsentResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: the stale-consent detector is PrivacyCare's "
+            "own (spec D-CON-1/D-CON-2), and nothing in the shipped admin "
+            "UI has a screen for it — see api/consent.py's module "
+            "docstring."
+        ),
+    },
+    "Page[StaleConsentResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Generic pagination wrapper over a model that itself has no TS "
+            "counterpart, same as Page[DsrRequestResponse] above; there is "
+            "nothing to be in parity with."
+        ),
+    },
 }
 
 
@@ -332,6 +355,12 @@ ALLOWLIST: dict[str, dict] = {
 # real (a future router might not share a prefix by accident) and because a
 # reader should not have to notice the accidental substring match to know
 # DSR is covered.
+# PRIVACYCARE_CONSENT_PREFIX (plan 16, task 3): a SEVENTH router
+# (privacycare_consent_router). Its prefix, /api/v1/privacycare/consent,
+# happens to already start with PRIVACYCARE_GROUNDS_PREFIX
+# (/api/v1/privacycare), same accidental-substring situation
+# PRIVACYCARE_DSR_PREFIX's own comment above already names — listed
+# explicitly anyway for the same two reasons that comment gives.
 PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
@@ -339,6 +368,7 @@ PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_GROUNDS_PREFIX,
     PRIVACYCARE_MONITORS_PREFIX,
     PRIVACYCARE_DSR_PREFIX,
+    PRIVACYCARE_CONSENT_PREFIX,
 )
 
 
