@@ -21,6 +21,7 @@ import sys
 
 import pytest
 import sqlalchemy
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import Session
 
 from fides.api.privacycare.consent.detector import find_stale_consents
@@ -48,6 +49,63 @@ def _load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _target_identity(database_url: str) -> tuple:
+    """Which database a URL names — host, port, database, user. NOT the
+    password: this is an identity for comparison, never something printed."""
+    parsed = make_url(database_url)
+    return (parsed.host, parsed.port, parsed.database, parsed.username)
+
+
+# Memoised, because resolving it execs the CLI module (which imports
+# fides.api.db.base) and the answer cannot change inside one test run.
+_DATABASE_AGREEMENT: dict = {}
+
+
+def _database_disagreement():
+    """Final review, Finding 4. This suite deletes from ONE database and
+    restores into ANOTHER unless both halves agree on the target.
+
+    `_delete_live_demo_rows` and `_counts_by_table` use the hardcoded
+    module-level `DB_URL`, but `_restore_live_demo_seed` shells out to the
+    real CLI, and `seed_consent_demo._database_url()` PREFERS the
+    `PRIVACYCARE_DATABASE_URL` env var. With that variable exported, the
+    test issues a real, committed DELETE against the local database, runs
+    the dry run against the other one, and "restores" into the other one.
+    The final assertion fails loudly — good — but the local demo seed is
+    permanently gone, which is exactly the inert-deployment state this plan
+    exists to fix.
+
+    So both halves must target the same database or these tests must not
+    run at all. Returns the reason they must not, or None when they agree.
+    """
+    if "message" not in _DATABASE_AGREEMENT:
+        cli = _load_cli()
+        configured = cli._database_url()
+        if _target_identity(configured) == _target_identity(DB_URL):
+            _DATABASE_AGREEMENT["message"] = None
+        else:
+            # Rendered through the CLI's own _target_description, which
+            # never includes the password and never the raw URL.
+            _DATABASE_AGREEMENT["message"] = (
+                "this suite deletes demo rows from one database and restores "
+                "them through the real CLI, so both halves must name the same "
+                "target: the CLI resolves to "
+                f"{cli._target_description(configured)} while this module's "
+                f"DB_URL names {cli._target_description(DB_URL)}. Unset "
+                "PRIVACYCARE_DATABASE_URL (or point it at the same database) "
+                "before running these tests — running them as-is would delete "
+                "the local demo seed and restore it somewhere else."
+            )
+    return _DATABASE_AGREEMENT["message"]
+
+
+@pytest.fixture(autouse=True)
+def both_halves_target_the_same_database():
+    message = _database_disagreement()
+    if message:
+        pytest.skip(message)
 
 
 @pytest.fixture
