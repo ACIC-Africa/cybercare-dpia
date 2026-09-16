@@ -7,6 +7,7 @@ import uuid
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -334,3 +335,40 @@ class ConsentRule:
     # open question for the SME (OQ-CON-01), and answering it must not
     # require a deploy — the same reason privacycare_dsr_timeline is a table.
     __table__ = consent_rule_table
+
+
+dpia_risk_table = Table(
+    "privacycare_dpia_risk",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    # References privacy_assessment.id, an ETHYCA table. Deliberately NO
+    # ForeignKey: a constraint from our chain into theirs is the coupling
+    # that breaks an upstream merge. Existence is checked at write time.
+    Column("assessment_id", String(255), nullable=False, index=True),
+    Column("category", String(64), nullable=False),
+    Column("description", Text, nullable=False),
+    Column("likelihood", Integer, nullable=False),
+    Column("severity", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+    CheckConstraint("likelihood BETWEEN 1 AND 5", name="ck_dpia_risk_likelihood"),
+    CheckConstraint("severity BETWEEN 1 AND 5", name="ck_dpia_risk_severity"),
+)
+
+
+@mapper_registry.mapped
+class DpiaRisk:
+    # One entry in a DPIA's risk register. It exists because Fides has
+    # nowhere to put it: assessment_question carries no numeric column, so
+    # a likelihood and a severity cannot be modelled as questions. Same
+    # reason privacycare_business_process exists.
+    #
+    # score and band are NOT stored. They are computed from likelihood and
+    # severity on read, so a change to the banding rule cannot leave stale
+    # numbers behind in a compliance record.
+    __table__ = dpia_risk_table
