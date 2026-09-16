@@ -9,13 +9,14 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.risk.banding import CRITICAL, HIGH, LOW, band, score
+from fides.api.privacycare.risk.banding import CRITICAL, HIGH, LOW, MEDIUM, band, score
 from fides.api.privacycare.risk.register import (
     RiskEntry,
     add_risk,
     assessment_band,
     list_risks,
     remove_risk,
+    sync_projection,
 )
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
@@ -223,6 +224,125 @@ def test_add_risk_rejects_an_assessment_that_does_not_exist(db):
             likelihood=3,
             severity=3,
         )
+
+
+def _assessment_row(db, assessment_id: str) -> dict:
+    row = db.execute(
+        sqlalchemy.text("SELECT * FROM privacy_assessment WHERE id = :id"),
+        {"id": assessment_id},
+    ).mappings().first()
+    assert row is not None
+    return dict(row)
+
+
+def test_sync_projection_writes_only_risk_level_and_nothing_else_on_the_row(
+    db, assessment_id
+):
+    # add_risk already resyncs risk_level to the correct value, so to prove
+    # sync_projection actually *moves* the column (rather than this
+    # assertion vacuously passing because nothing changed), go stale by
+    # hand first — the same way a live row could end up wrong before a
+    # resync runs.
+    add_risk(db, assessment_id=assessment_id, category="confidentiality",
+              description="something", likelihood=3, severity=3)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment SET risk_level = 'low' WHERE id = :id"
+        ),
+        {"id": assessment_id},
+    )
+    before = _assessment_row(db, assessment_id)
+    assert before["risk_level"] == LOW
+
+    sync_projection(db, assessment_id)
+
+    after = _assessment_row(db, assessment_id)
+    changed = {k for k in before if before[k] != after[k]}
+    assert changed == {"risk_level"}
+    assert after["risk_level"] == MEDIUM
+
+
+def test_sync_projection_returns_our_unprojected_band_while_the_column_holds_the_projection(
+    db, assessment_id
+):
+    # A critical risk collapses to "high" on Ethyca's three-value column, but
+    # the caller (e.g. an ODPC-escalation decision in Task 4) must still be
+    # able to tell critical from high, so the return value must not collapse.
+    add_risk(db, assessment_id=assessment_id, category="integrity",
+              description="catastrophic", likelihood=5, severity=5)
+
+    returned = sync_projection(db, assessment_id)
+
+    assert returned == CRITICAL
+    row = _assessment_row(db, assessment_id)
+    assert row["risk_level"] == HIGH
+    assert returned != row["risk_level"]
+
+
+def test_sync_projection_on_an_empty_register_writes_low(db, assessment_id):
+    assert list_risks(db, assessment_id) == []
+
+    returned = sync_projection(db, assessment_id)
+
+    assert returned == LOW
+    row = _assessment_row(db, assessment_id)
+    assert row["risk_level"] == LOW
+
+
+def test_sync_projection_is_idempotent(db, assessment_id):
+    add_risk(db, assessment_id=assessment_id, category="physical_harm",
+              description="moderate", likelihood=3, severity=3)
+
+    first = sync_projection(db, assessment_id)
+    row_after_first = _assessment_row(db, assessment_id)
+    second = sync_projection(db, assessment_id)
+    row_after_second = _assessment_row(db, assessment_id)
+
+    assert first == second == MEDIUM
+    assert row_after_first == row_after_second
+
+
+def test_sync_projection_overwrites_a_hand_typed_value(db, assessment_id):
+    # Nothing of ours offers a band/risk-level setter, but Ethyca's own API
+    # still accepts risk_level directly (_UPDATABLE_ASSESSMENT_FIELDS). A
+    # value typed in by hand must not survive the next sync — that is what
+    # makes "computed, never entered" true rather than merely intended.
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment SET risk_level = 'high' WHERE id = :id"
+        ),
+        {"id": assessment_id},
+    )
+    assert _assessment_row(db, assessment_id)["risk_level"] == HIGH
+
+    sync_projection(db, assessment_id)
+
+    # No risks recorded, so the computed truth is LOW, overwriting the
+    # hand-typed HIGH.
+    assert _assessment_row(db, assessment_id)["risk_level"] == LOW
+
+
+def test_add_risk_moves_ethycas_risk_level_column(db, assessment_id):
+    assert _assessment_row(db, assessment_id)["risk_level"] is None
+
+    add_risk(db, assessment_id=assessment_id, category="confidentiality",
+              description="pushes the column", likelihood=5, severity=5)
+
+    assert _assessment_row(db, assessment_id)["risk_level"] == HIGH
+
+
+def test_remove_risk_moves_ethycas_risk_level_column(db, assessment_id):
+    stays = add_risk(db, assessment_id=assessment_id, category="availability",
+                       description="stays", likelihood=1, severity=1)
+    goes = add_risk(db, assessment_id=assessment_id, category="integrity",
+                      description="goes", likelihood=5, severity=5)
+    assert _assessment_row(db, assessment_id)["risk_level"] == HIGH
+
+    removed = remove_risk(db, goes.id)
+
+    assert removed is True
+    # Only the trivial risk remains: LOW.
+    assert _assessment_row(db, assessment_id)["risk_level"] == LOW
 
 
 # --- The migration itself. Statically parsed rather than imported and run:
