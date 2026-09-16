@@ -62,6 +62,20 @@ def db(monkeypatch):
         # the real row.
         session.execute(sqlalchemy.text("DELETE FROM privacycare_consent_rule"))
         seed_consent_rule(session)
+        # Task 4 committed one permanent demo notice/version/preference
+        # (privacycare_demo_fuel_card_marketing) so the detector has
+        # something true to find in the running system. Every test below
+        # asserts an EXACT count or an empty result from an unfiltered
+        # find_stale_consents(db) call, written when these tables were
+        # guaranteed empty — that guarantee no longer holds against the
+        # live database. Clearing the notice tables here, same idiom as
+        # the rule table just above, makes each test see only the rows it
+        # builds itself; rollback at teardown leaves Task 4's committed
+        # demo row untouched.
+        session.execute(sqlalchemy.text("DELETE FROM privacypreferencehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynoticehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM noticetranslation"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynotice"))
         yield session
         session.rollback()
 

@@ -63,6 +63,18 @@ def db(monkeypatch):
         # session makes every test independent of which.
         session.execute(sqlalchemy.text("DELETE FROM privacycare_consent_rule"))
         seed_consent_rule(session)
+        # Task 4 committed one permanent demo notice/version/preference
+        # (privacycare_demo_fuel_card_marketing). This module's tests
+        # assert exact counts and exact page contents from an unfiltered
+        # list_stale_consents call, written when these tables were
+        # guaranteed empty — no longer true against the live database.
+        # Clearing them here (same idiom as the rule table above) isolates
+        # each test to the rows it builds itself; rollback at teardown
+        # leaves Task 4's committed demo row untouched.
+        session.execute(sqlalchemy.text("DELETE FROM privacypreferencehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynoticehistory"))
+        session.execute(sqlalchemy.text("DELETE FROM noticetranslation"))
+        session.execute(sqlalchemy.text("DELETE FROM privacynotice"))
         yield session
         session.rollback()
 
