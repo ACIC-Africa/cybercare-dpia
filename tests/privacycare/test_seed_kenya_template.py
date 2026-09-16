@@ -193,8 +193,23 @@ def test_seeding_twice_does_not_duplicate(db):
     assert question_count == 24, "a second run duplicated the copied questions"
 
 
-def test_the_kenya_template_ends_with_exactly_24_questions_identical_to_the_gdpr_ones(db):
+def test_the_kenya_template_ends_with_exactly_24_questions_identical_to_the_gdpr_ones(
+    db, monkeypatch
+):
+    # Final whole-branch review, IMPORTANT-2: Task 6's real --commit seed
+    # left a Kenya template already sitting in this same live database, so
+    # an unpatched cli.seed_kenya_template(db) short-circuits at both
+    # _find_or_create_kenya_template (finds the existing row) and
+    # _copy_questions (sees it already has questions) — neither ever runs,
+    # and this test would read back the committed row regardless of what
+    # the code under test does. Patching KENYA_ASSESSMENT_TYPE to a value
+    # nothing carries forces the real create-and-copy path inside this
+    # test's own rolled-back transaction, the same fix already applied to
+    # test_seed_kenya_template_raises_if_the_gdpr_template_is_missing.
     cli = _load_cli()
+    monkeypatch.setattr(
+        cli, "KENYA_ASSESSMENT_TYPE", "kenya_dpa_2019_dpia__test_content_copy"
+    )
     cli.seed_kenya_template(db)
 
     template_id = db.execute(
@@ -233,8 +248,15 @@ def test_the_kenya_template_ends_with_exactly_24_questions_identical_to_the_gdpr
     ]
 
 
-def test_parent_template_id_points_at_the_gdpr_template(db):
+def test_parent_template_id_points_at_the_gdpr_template(db, monkeypatch):
+    # Same IMPORTANT-2 disarmament as the 24-questions test above: without
+    # this patch, seed_kenya_template(db) short-circuits on Task 6's
+    # already-committed row and never runs the code that sets
+    # parent_template_id at all.
     cli = _load_cli()
+    monkeypatch.setattr(
+        cli, "KENYA_ASSESSMENT_TYPE", "kenya_dpa_2019_dpia__test_parent_id"
+    )
     cli.seed_kenya_template(db)
 
     parent_id = db.execute(
@@ -246,8 +268,16 @@ def test_parent_template_id_points_at_the_gdpr_template(db):
     assert parent_id == cli.GDPR_TEMPLATE_ID
 
 
-def test_the_template_names_kenya_odpc_and_the_dpa_2019(db):
+def test_the_template_names_kenya_odpc_and_the_dpa_2019(db, monkeypatch):
+    # Same IMPORTANT-2 disarmament: without this patch, region/authority/
+    # legal_reference are read back from Task 6's already-committed row,
+    # not written by the code under test in this transaction — a typo in
+    # KENYA_REGION or KENYA_AUTHORITY in seed_kenya_template.py would go
+    # completely unnoticed by this test.
     cli = _load_cli()
+    monkeypatch.setattr(
+        cli, "KENYA_ASSESSMENT_TYPE", "kenya_dpa_2019_dpia__test_names"
+    )
     cli.seed_kenya_template(db)
 
     row = db.execute(
@@ -265,8 +295,16 @@ def test_the_template_names_kenya_odpc_and_the_dpa_2019(db):
     assert "2021" in row["legal_reference"]
 
 
-def test_no_kca_university_term_appears_anywhere_in_the_seeded_rows(db):
+def test_no_kca_university_term_appears_anywhere_in_the_seeded_rows(db, monkeypatch):
+    # Same IMPORTANT-2 disarmament, and the highest-stakes one of the four:
+    # this is the acceptance-item proof that no KCA University term ever
+    # gets seeded. Unpatched, it only re-reads Task 6's already-clean
+    # committed row and would pass even if _copy_questions or the KENYA_*
+    # constants regressed to inject one of the five forbidden terms.
     cli = _load_cli()
+    monkeypatch.setattr(
+        cli, "KENYA_ASSESSMENT_TYPE", "kenya_dpa_2019_dpia__test_no_kca_terms"
+    )
     cli.seed_kenya_template(db)
 
     template_id = db.execute(
