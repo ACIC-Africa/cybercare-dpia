@@ -96,6 +96,13 @@ def evaluate(db: Session, assessment_id: str) -> OdpcFinding:
     # says "not required" would misleadingly suggest that risk was still a
     # live concern.
     risks = list_risks(db, assessment_id)
+    # list_risks orders by (-score, id) (register.py), so a tie at the top
+    # score is broken by the smaller uuid — an accident of insertion order,
+    # not a judgement that one tied risk "drives" the finding more than the
+    # other. Two risks tied at 25/25 will name whichever happens to sort
+    # first as "the driving risk" in the reason/report text; both are
+    # equally the reason consultation is required either way, so this is a
+    # presentation choice, not a wrong answer.
     highest_risk = risks[0] if risks else None
 
     if required:

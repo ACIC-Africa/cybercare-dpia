@@ -163,10 +163,18 @@ _INSERT_TEMPLATE_SQL = sqlalchemy.text(
        legal_reference, description, is_active, fides_revision,
        is_managed, parent_template_id)
     VALUES (:id, :version, :name, :assessment_type, :region, :authority,
-            :legal_reference, :description, true, 1, true,
+            :legal_reference, :description, true, 1, false,
             :parent_template_id)
     """
 )
+# is_managed=false: final whole-branch review, minor finding. is_managed is
+# the one column on this table that names OWNERSHIP — whether Ethyca's own
+# tooling considers itself responsible for a template's lifecycle. Nothing
+# reads this column today, but true here would be a lie: this row is
+# entirely PrivacyCare-authored (this script created it; this script is the
+# only thing that will ever touch it again), not something Ethyca manages.
+# false is the honest value, and the natural key any future Ethyca
+# reconciliation job would use to leave this row alone.
 
 _COUNT_QUESTIONS_SQL = sqlalchemy.text(
     "SELECT count(*) FROM assessment_question WHERE template_id = :template_id"

@@ -177,6 +177,16 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # here and is not imported into this module at all: Owner and
     # Contributor still get it by registry derivation below, same as every
     # other write scope this list omits.
+    #
+    # Final whole-branch review, minor finding: "never names a data
+    # subject" is a CONVENTION, not a guarantee — description is
+    # unconstrained Text (models.py's dpia_risk_table) that a DPO types
+    # prose into, unlike a DSR row's structurally-typed identifier, and
+    # nothing stops someone from pasting a name into it. No escalation
+    # exists today because of this (the PDF route that exposes the same
+    # description text is separately gated behind SYSTEM_READ, which
+    # Viewer already holds via this same list), but this grant should not
+    # be read as a stronger promise than the data model actually enforces.
     PRIVACYCARE_RISK_READ,
     RULE_READ,
     SCOPE_READ,
