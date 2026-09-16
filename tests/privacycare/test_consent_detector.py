@@ -13,6 +13,7 @@ the `db` fixture below, the same way `test_consent_materiality.py`'s
 `_clear_rules` does, because `active_rule` (Task 1) raises on an empty
 table and the live DB does not carry a committed rule row yet.
 """
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -597,3 +598,186 @@ def test_the_reported_notice_key_is_the_live_one_not_the_consented_one(db):
 
     assert len(find_stale_consents(db, notice_key="fuel_card_renamed")) == 1
     assert find_stale_consents(db, notice_key="fuel_card_old") == []
+
+
+# ---------------------------------------------------------------------------
+# Final review, Finding 1: a subject, not a row.
+#
+# privacypreferencehistory is APPEND-ONLY evidence. The detector used to
+# report one finding per stale row, which meant a subject who had since
+# re-consented stayed on Josephine's list forever (she could not tell who
+# she had already handled), and a subject who had since WITHDRAWN was asked
+# to re-agree to processing they had turned down. These tests pin the
+# per-subject reduction that fixes both.
+# ---------------------------------------------------------------------------
+
+
+def test_a_subject_who_re_consented_against_the_live_version_is_not_reported(db):
+    # Alice opts in at v1 and is reported. Josephine contacts her; Alice
+    # re-consents at v2. Both rows live in the append-only table forever.
+    # Alice's CURRENT position is v2, so she is done — the list has to
+    # shrink or Josephine cannot tell who she has already handled.
+    _, v1, v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v2, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+
+    assert find_stale_consents(db) == []
+
+
+def test_a_subject_who_opted_out_after_a_stale_opt_in_is_never_re_solicited(db):
+    # Bob opts in at v1, then OPTS OUT at v2. Re-soliciting somebody who
+    # withdrew is a data-protection problem, not merely wasted effort: he
+    # declined the processing outright, so there is nothing to re-consent
+    # to. The old row-at-a-time query could not see this at all — it
+    # filtered to `preference = 'opt_in'` in SQL, which threw the
+    # withdrawal away before anything could notice it superseded the
+    # earlier opt-in.
+    _, v1, v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="bob@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v2, preference="opt_out", email="bob@example.com",
+        received_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+
+    assert find_stale_consents(db) == []
+
+
+def test_a_stale_opt_in_with_no_later_row_is_still_reported(db):
+    # The regression guard for the two tests above: the reduction must not
+    # swallow the case the feature exists for.
+    _, v1, _v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "alice@example.com"
+    assert result[0].consented_version == 1.0
+    assert result[0].live_version == 2.0
+
+
+def test_of_two_subjects_only_the_one_who_has_not_re_consented_is_reported(db):
+    # The list Josephine actually works: it names the people still
+    # outstanding, and only them.
+    _, v1, v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v2, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="bob@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "bob@example.com"
+
+
+def test_a_later_row_with_a_null_received_at_still_resolves_the_current_position(db):
+    # received_at is nullable with no default, so a genuinely-collected row
+    # can carry none. When neither row has one, created_at breaks the tie —
+    # and the rows are inserted in reverse order here so nothing can pass
+    # by accidentally trusting the order Postgres returns them in.
+    _, v1, v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v2, preference="opt_in", email="alice@example.com",
+        received_at=None, created_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="alice@example.com",
+        received_at=None, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    # Alice's latest row is the v2 one: she is current, not stale.
+    assert find_stale_consents(db) == []
+
+
+def test_a_row_that_records_when_the_subject_answered_outranks_one_that_does_not(db):
+    # The NULLS LAST half of the ordering rule, pinned deliberately: a row
+    # carrying a real received_at is treated as later than one carrying
+    # none, whatever created_at says. The consequence is that a re-consent
+    # recorded with no received_at does not clear a stale opt-in that has
+    # one — the subject is asked again. That errs toward re-asking, which
+    # is the safe direction for a consent report: a redundant re-consent
+    # request is a nuisance, a missed one is processing without a lawful
+    # basis.
+    _, v1, v2 = _notice_that_gained_a_use(db)
+    make_preference(
+        db, history_id=v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=v2, preference="opt_in", email="alice@example.com",
+        received_at=None, created_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "alice@example.com"
+    assert result[0].consented_version == 1.0
+
+
+def test_consent_is_reduced_per_notice_not_across_notices(db):
+    # The same person can be current on one notice and stale on another —
+    # the grouping key is (subject, notice), not the subject alone.
+    _, fuel_v1, fuel_v2 = _notice_that_gained_a_use(db)
+    _, loyalty_v1, _ = _notice_that_gained_a_use(
+        db, key="loyalty", name="Loyalty Programme"
+    )
+    make_preference(
+        db, history_id=fuel_v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=fuel_v2, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    make_preference(
+        db, history_id=loyalty_v1, preference="opt_in", email="alice@example.com",
+        received_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+    )
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "alice@example.com"
+    assert result[0].notice_key == "loyalty"
+
+
+def test_identity_less_rows_are_each_reported_individually(db):
+    # A row with no identity at all cannot be grouped with anything —
+    # nothing about two such rows says they are the same person — so each
+    # stays its own group and is still reported. Deliberate behaviour that
+    # had to survive the per-subject reduction.
+    _, v1, _v2 = _notice_that_gained_a_use(db)
+    first = make_preference(db, history_id=v1, preference="opt_in")
+    second = make_preference(db, history_id=v1, preference="opt_in")
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 2
+    assert {item.subject_kind for item in result} == {"none"}
+    assert {item.subject for item in result} == {
+        f"privacypreferencehistory:{first}",
+        f"privacypreferencehistory:{second}",
+    }

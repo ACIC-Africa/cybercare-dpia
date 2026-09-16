@@ -15,6 +15,46 @@ regulator's copy of what a subject did must not change because our
 materiality rule changed later (spec D-CON-3) — so this module has no
 write path to change it with.
 
+**A SUBJECT, NOT A ROW (final review, Finding 1).** `privacy
+preferencehistory` is append-only evidence: every time a subject answers,
+Fides writes another row and leaves the old ones standing. An earlier
+version of this module reported one finding per stale ROW, which made the
+report both wrong and unusable:
+
+* Alice opts in at v1, is reported, Josephine contacts her, Alice
+  re-consents at v2. Both rows live in the table forever, so Alice was
+  reported forever. The list never shrank and Josephine could not tell
+  who she had already handled.
+* Bob opts in at v1 and later opts OUT at v2. He was reported as needing
+  re-consent — the exact thing `_AFFIRMATIVE_PREFERENCE`'s comment below
+  forbids. Re-soliciting somebody who withdrew is a data-protection
+  problem, not merely wasted effort.
+
+So this module now reduces each subject to their CURRENT POSITION before
+judging staleness: every preference row in scope is grouped by
+`(subject, subject_kind, notice)`, only the subject's latest row in each
+group survives, and the affirmative-consent filter and the materiality
+rule are applied to THAT row alone. A latest row of `opt_out` or
+`acknowledge` yields nothing; a latest row of `opt_in` against a
+materially older version is the finding.
+
+"Latest" is `received_at` descending with NULLs LAST, then `created_at`
+descending, then the row id for a total, deterministic order. `received_at`
+is the authoritative "when the subject actually answered" and is nullable
+with no default, so a row that carries one outranks a row that does not;
+`created_at` (defaulted `now()`) breaks the tie when neither does.
+
+**Reduction happens in Python, not in SQL**, because the grouping key is
+the subject's identity and that identity is encrypted at rest — see
+"Subject identity" below. The identities therefore have to be resolved for
+every CANDIDATE row, before the reduction, not only for the matched subset.
+
+`subject_kind == "none"` rows (no identity at all — a Fides data-integrity
+problem, see `_subject`) cannot be grouped with anything, because nothing
+about them says whether two such rows are the same person. Each one stays
+its own group and is still reported individually; that behaviour is
+deliberate and survives the reduction.
+
 **Reaching the notice (final review, Finding 3).** A `privacynoticehistory`
 row carries `.version` and `.data_uses` for the moment it was created,
 plus `.translation_id`, which points at the `noticetranslation` it was
@@ -73,13 +113,12 @@ who need re-consent. Both now name the live version.
 `ConsentIdentitiesMixin` in `fides.api.models.privacy_preference`) — the
 encryption is a `TypeDecorator` that only fires when SQLAlchemy knows the
 column's type, which a raw `sqlalchemy.text()` SELECT never does. Reading
-those four columns via raw SQL returns ciphertext, not a usable identity,
-for any preference actually recorded through Fides' own consent flow (the
-ORM `create`/`persist_obj` path). So `_QUERY` finds the stale
-`privacynoticehistory`/version facts and the `privacypreferencehistory.id`s
-that are materially stale, and `find_stale_consents` then loads exactly
-those rows through the `PrivacyPreferenceHistory` model — still read-only,
-a `SELECT` via `db.query(...)`, no `add`/`commit`/`delete` — so the ORM's
+those columns via raw SQL returns ciphertext, not a usable identity, for
+any preference actually recorded through Fides' own consent flow (the ORM
+`create`/`persist_obj` path). So `_QUERY` finds the version facts and the
+`privacypreferencehistory.id`s, and `find_stale_consents` then loads those
+rows through the `PrivacyPreferenceHistory` model — still read-only, a
+`SELECT` via `db.query(...)`, no `add`/`commit`/`delete` — so the ORM's
 decrypting type decorator applies and `.email` etc. come back as plaintext.
 
 That ORM load is narrowed with `load_only` to the id and the four identity
@@ -90,7 +129,7 @@ them appear in the report, so none of them are read or decrypted here.
 PrivacyCare reads only what the job requires.
 """
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import sqlalchemy
@@ -99,15 +138,28 @@ from sqlalchemy.orm import Session, load_only
 from fides.api.models.privacy_preference import PrivacyPreferenceHistory
 from fides.api.privacycare.consent.materiality import active_rule, added_uses, is_materially_different
 
-# Only an affirmative opt-in can be stale. `opt_out` means the subject
-# declined the processing outright — there is nothing to re-consent to, and
-# reporting them would ask them to re-agree to something they already
-# turned down. `acknowledge` belongs to `notice_only` notices, where the
-# mechanism never asked for a yes/no in the first place — it records that
-# the notice was shown, not that the subject agreed to anything — so there
-# is no consent there to invalidate either. Only `opt_in` names an
-# affirmative agreement that a later, broader notice can outrun.
-_STALE_ELIGIBLE_PREFERENCE = "opt_in"
+# Only an affirmative opt-in can be stale, and it is the subject's LATEST
+# row that has to carry it. `opt_out` means the subject declined the
+# processing outright — there is nothing to re-consent to, and reporting
+# them would ask them to re-agree to something they already turned down.
+# `acknowledge` belongs to `notice_only` notices, where the mechanism never
+# asked for a yes/no in the first place — it records that the notice was
+# shown, not that the subject agreed to anything — so there is no consent
+# there to invalidate either. Only `opt_in` names an affirmative agreement
+# that a later, broader notice can outrun.
+#
+# This is checked AFTER the per-subject reduction, never before it. Checking
+# it in the SQL (as this module used to) cannot see a withdrawal at all: the
+# `opt_out` row is filtered away before anything has a chance to notice that
+# it supersedes the subject's earlier `opt_in`.
+_AFFIRMATIVE_PREFERENCE = "opt_in"
+
+# `_ORDER_FLOOR` only ever stands in for a NULL timestamp inside `_position`
+# below, and only ever gets compared against another NULL's floor, because
+# the "is it set at all" flag sorts first. Timezone-aware because Postgres
+# hands back `timestamp with time zone`, and a naive/aware comparison
+# raises.
+_ORDER_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
 
 _QUERY = sqlalchemy.text(
     """
@@ -146,6 +198,8 @@ _QUERY = sqlalchemy.text(
         pph.id                AS pref_id,
         pph.preference        AS preference,
         pph.received_at       AS received_at,
+        pph.created_at        AS created_at,
+        lv.notice_ref         AS notice_ref,
         lv.live_notice_key    AS notice_key,
         cv.version            AS consented_version,
         cv.data_uses          AS consented_data_uses,
@@ -155,8 +209,7 @@ _QUERY = sqlalchemy.text(
     FROM privacypreferencehistory pph
     JOIN history cv      ON cv.id = pph.privacy_notice_history_id
     JOIN live_version lv ON lv.notice_ref = cv.notice_ref
-    WHERE pph.preference = :stale_eligible
-      AND (:notice_key IS NULL OR lv.live_notice_key = :notice_key)
+    WHERE (:notice_key IS NULL OR lv.live_notice_key = :notice_key)
     """
 )
 
@@ -232,36 +285,37 @@ def _subject(row: Any) -> tuple[str, str]:
     return f"privacypreferencehistory:{row.id}", "none"
 
 
-def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> list[StaleConsent]:
-    """Every affirmative consent recorded against a notice version that has
-    since gained a data use, per the currently active materiality rule
-    (Task 1's `active_rule` — raises if nobody has configured one yet).
+def _position(row: Any) -> tuple:
+    """Where a preference row sits in its subject's timeline. Bigger is
+    later; the maximum is the subject's current position.
 
-    Pass `notice_key` to narrow the report to one notice — matched
-    against the notice's LIVE key, the one Josephine sees today. Omit it
-    for every notice at once. Read-only: see the module docstring.
-    """
-    rule = active_rule(db)
-    rows = db.execute(
-        _QUERY, {"stale_eligible": _STALE_ELIGIBLE_PREFERENCE, "notice_key": notice_key}
-    ).fetchall()
+    `received_at` first, NULLs LAST — the leading boolean is what puts a
+    row that records when the subject actually answered ahead of one that
+    does not. `created_at` (defaulted `now()`) breaks the tie when neither
+    carries a `received_at`, under the same NULLs-last treatment, and the
+    row id makes the order total so the reduction is deterministic
+    regardless of the order Postgres happens to return rows in."""
+    return (
+        row.received_at is not None,
+        row.received_at or _ORDER_FLOOR,
+        row.created_at is not None,
+        row.created_at or _ORDER_FLOOR,
+        row.pref_id,
+    )
 
-    materially_stale = [
-        row
-        for row in rows
-        if is_materially_different(row.consented_data_uses, row.live_data_uses, rule=rule)
-    ]
-    if not materially_stale:
-        return []
 
-    # Identity only, and only for rows that are actually stale — see the
-    # module docstring for why this can't be folded into `_QUERY`. A plain
-    # `SELECT ... WHERE id IN (...)` via the ORM: still read-only, and
-    # narrowed with `load_only` to the id and the four identity columns so
-    # nothing else on the row — `secondary_user_ids`, `user_agent`,
-    # `url_recorded`, `anonymized_ip_address` — is read or decrypted.
-    pref_ids = [row.pref_id for row in materially_stale]
-    preferences_by_id = {
+def _identities_by_id(db: Session, pref_ids: list[str]) -> dict:
+    """The four identity columns for `pref_ids`, decrypted, keyed by row id.
+
+    Read-only: a plain `SELECT ... WHERE id IN (...)` through the ORM, which
+    is the only way the encrypted columns come back as plaintext (see the
+    module docstring). `load_only` narrows it to the id and the four
+    identity columns so nothing else on the row — `secondary_user_ids`,
+    `user_agent`, `url_recorded`, `anonymized_ip_address` — is read or
+    decrypted; the report uses none of them."""
+    if not pref_ids:
+        return {}
+    return {
         preference.id: preference
         for preference in db.query(PrivacyPreferenceHistory)
         .options(
@@ -277,9 +331,58 @@ def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> lis
         .all()
     }
 
+
+def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> list[StaleConsent]:
+    """Every data subject whose CURRENT consent position is an affirmative
+    opt-in against a notice version that has since gained a data use, per
+    the currently active materiality rule (Task 1's `active_rule` — raises
+    if nobody has configured one yet).
+
+    One finding per subject per notice, never one per row: a subject who
+    has since re-consented against the live version, or who has since
+    opted out, is not reported at all. See the module docstring for the
+    reduction and its ordering rule.
+
+    Pass `notice_key` to narrow the report to one notice — matched against
+    the notice's LIVE key, the one Josephine sees today. Omit it for every
+    notice at once. Read-only: see the module docstring.
+    """
+    rule = active_rule(db)
+    # Every preference row for the notices in scope, at every preference
+    # value — NOT just `opt_in`. The withdrawals have to come back or the
+    # reduction below cannot see that one supersedes an earlier opt-in.
+    rows = db.execute(_QUERY, {"notice_key": notice_key}).fetchall()
+    if not rows:
+        return []
+
+    identities = _identities_by_id(db, [row.pref_id for row in rows])
+
+    # Reduce each subject to their current position. The grouping key is
+    # the subject plus `notice_ref` — the notice itself, which the live
+    # `notice_key` names; consent is per notice, so the same person can be
+    # current on one notice and stale on another.
+    latest: dict[Any, tuple[Any, str, str]] = {}
+    for row in rows:
+        subject, subject_kind = _subject(identities[row.pref_id])
+        if subject_kind == "none":
+            # No identity means nothing says whether two such rows are the
+            # same person, so each is its own group and is still reported
+            # individually — deliberate, see `_subject`.
+            group: Any = ("none", row.pref_id)
+        else:
+            group = (subject_kind, subject, row.notice_ref)
+        held = latest.get(group)
+        if held is None or _position(row) > _position(held[0]):
+            latest[group] = (row, subject, subject_kind)
+
     stale: list[StaleConsent] = []
-    for row in materially_stale:
-        subject, subject_kind = _subject(preferences_by_id[row.pref_id])
+    for row, subject, subject_kind in latest.values():
+        if row.preference != _AFFIRMATIVE_PREFERENCE:
+            continue
+        if not is_materially_different(
+            row.consented_data_uses, row.live_data_uses, rule=rule
+        ):
+            continue
         stale.append(
             StaleConsent(
                 subject=subject,
