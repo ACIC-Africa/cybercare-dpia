@@ -38,6 +38,7 @@ from fides.api.privacycare.api.router import (
     PRIVACYCARE_MONITORS_PREFIX,
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
+    PRIVACYCARE_RISK_PREFIX,
 )
 from fides.api.privacycare.asgi import app
 
@@ -324,6 +325,45 @@ ALLOWLIST: dict[str, dict] = {
             "nothing to be in parity with."
         ),
     },
+    # The DPIA risk register's HTTP surface (plan 17, task 5). Same pattern
+    # as the DSR register, business-process ROPA surface, and stale-consent
+    # detector above: the risk register is new, Kenyan-specific ground with
+    # no Plus analogue, so no shipped admin-UI screen calls any of these
+    # four routes and none of their response models have a TS counterpart
+    # to be in parity with.
+    "RiskResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: the DPIA risk register is PrivacyCare's own "
+            "(spec 2026-09-16 D-W2-2), and nothing in the shipped admin UI "
+            "has a screen for it — see api/risk.py's module docstring."
+        ),
+    },
+    "Page[RiskResponse]": {
+        "ts_name": None,
+        "reason": (
+            "Generic pagination wrapper over a model that itself has no TS "
+            "counterpart, same as Page[DsrRequestResponse] and "
+            "Page[StaleConsentResponse] above; there is nothing to be in "
+            "parity with."
+        ),
+    },
+    "RemoveRiskResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as RiskResponse above — DELETE "
+            "/api/v1/privacycare/risk/{risk_id} has no shipped admin-UI "
+            "caller either."
+        ),
+    },
+    "OdpcFindingResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as RiskResponse above. Also "
+            "recurses into RiskResponse (highest_risk), already covered by "
+            "its own entry — no separate discovery happens for it here."
+        ),
+    },
 }
 
 
@@ -361,6 +401,12 @@ ALLOWLIST: dict[str, dict] = {
 # (/api/v1/privacycare), same accidental-substring situation
 # PRIVACYCARE_DSR_PREFIX's own comment above already names — listed
 # explicitly anyway for the same two reasons that comment gives.
+#
+# PRIVACYCARE_RISK_PREFIX (plan 17, task 5): an EIGHTH router
+# (privacycare_risk_router). Its prefix, /api/v1/privacycare/risk, happens
+# to already start with PRIVACYCARE_GROUNDS_PREFIX (/api/v1/privacycare),
+# same accidental-substring situation named above — listed explicitly
+# anyway for the same two reasons.
 PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
@@ -369,6 +415,7 @@ PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_MONITORS_PREFIX,
     PRIVACYCARE_DSR_PREFIX,
     PRIVACYCARE_CONSENT_PREFIX,
+    PRIVACYCARE_RISK_PREFIX,
 )
 
 

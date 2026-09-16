@@ -83,6 +83,12 @@ PRIVACYCARE_DSR = "privacycare_dsr"
 # do. Read only: the route it guards exposes no write, so no _UPDATE
 # variant exists for it (see api/consent.py).
 PRIVACYCARE_CONSENT = "privacycare_consent"
+# PrivacyCare (spec 2026-09-16 D-W2-2): the DPIA risk register is ours —
+# risk/register.py computes and stores each identified risk against a DPIA,
+# something Fides has no concept of — so it gets its own scope name for the
+# same reason PRIVACYCARE_DISCOVERY, PRIVACYCARE_DSR and PRIVACYCARE_CONSENT
+# do.
+PRIVACYCARE_RISK = "privacycare_risk"
 SYSTEM_MANAGER = "system_manager"
 TAXONOMY = "taxonomy"
 TEST = "test"
@@ -269,6 +275,15 @@ PRIVACYCARE_DSR_UPDATE = f"{PRIVACYCARE_DSR}:{UPDATE}"
 # above for why there is no _UPDATE.
 PRIVACYCARE_CONSENT_READ = f"{PRIVACYCARE_CONSENT}:{READ}"
 
+# PrivacyCare (spec 2026-09-16 D-W2-2). _CREATE, not _UPDATE — matches the
+# brief's naming exactly; it guards BOTH write routes (add a risk, remove a
+# risk), the same one-write-scope-for-every-write-verb shape
+# PRIVACYCARE_DSR_UPDATE already uses for create/decision/notification. See
+# roles.py's viewer_scopes for why PRIVACYCARE_RISK_READ — unlike
+# PRIVACYCARE_DSR_READ and PRIVACYCARE_CONSENT_READ — IS granted to Viewer.
+PRIVACYCARE_RISK_READ = f"{PRIVACYCARE_RISK}:{READ}"
+PRIVACYCARE_RISK_CREATE = f"{PRIVACYCARE_RISK}:{CREATE}"
+
 
 SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE = (
     f"{SYSTEM_INTEGRATION_LINK}:{CREATE_OR_UPDATE}"
@@ -420,6 +435,9 @@ SCOPE_DOCS = {
     PRIVACYCARE_DSR_UPDATE: "Record and update DSR register requests",
     # PrivacyCare (spec 2026-09-13 D-CON-1)
     PRIVACYCARE_CONSENT_READ: "View stale-consent detector results",
+    # PrivacyCare (spec 2026-09-16 D-W2-2)
+    PRIVACYCARE_RISK_READ: "View a DPIA's risk register and its ODPC prior-consultation finding",
+    PRIVACYCARE_RISK_CREATE: "Add and remove risks in a DPIA's risk register",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",
     SYSTEM_INTEGRATION_LINK_DELETE: "Delete system-integration links",
     SYSTEM_INTEGRATION_LINK_READ: "Read system-integration links",

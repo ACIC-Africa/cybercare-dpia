@@ -40,6 +40,7 @@ from fides.common.scope_registry import (
     PRIVACY_REQUEST_UPLOAD_DATA,
     PRIVACY_REQUEST_VIEW_DATA,
     PRIVACYCARE_DISCOVERY_READ,
+    PRIVACYCARE_RISK_READ,
     RULE_READ,
     SAAS_CONFIG_READ,
     SCOPE_READ,
@@ -160,6 +161,23 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # an explicit list above), PRIVACYCARE_CONSENT_READ is referenced by
     # name in no list here — Owner and Contributor pick it up purely
     # through SCOPE_REGISTRY / not_contributor_scopes below.
+    #
+    # PrivacyCare (spec 2026-09-16 D-W2-2): PRIVACYCARE_RISK_READ IS granted
+    # to Viewer here, deliberately UNLIKE PRIVACYCARE_DSR_READ and
+    # PRIVACYCARE_CONSENT_READ immediately above — this is the
+    # PRIVACYCARE_DISCOVERY_READ precedent, not theirs. A DPIA risk register
+    # row (risk/register.py's RiskEntry) carries a category, a free-text
+    # description of the risk, a likelihood and a severity; it never names a
+    # data subject, unlike a DSR register row (a subject_identifier and a
+    # DPO's own refusal reasoning) or a stale-consent finding (an email,
+    # device id or external id). There is nothing subject-identifying here
+    # for Viewer to be withheld from, so — same as PRIVACYCARE_DISCOVERY_READ
+    # further up — it is granted outright rather than left to registry
+    # derivation. The WRITE scope, PRIVACYCARE_RISK_CREATE, is not listed
+    # here and is not imported into this module at all: Owner and
+    # Contributor still get it by registry derivation below, same as every
+    # other write scope this list omits.
+    PRIVACYCARE_RISK_READ,
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,

@@ -107,6 +107,20 @@ privacycare_consent_router = APIRouter(
     prefix=PRIVACYCARE_CONSENT_PREFIX, tags=["PrivacyCare"]
 )
 
+# The DPIA risk register's HTTP surface (plan 17, task 5): an EIGHTH,
+# separate prefix family, and — like privacycare_processes_router/
+# privacycare_chat_router/privacycare_grounds_router/privacycare_dsr_router/
+# privacycare_consent_router, and UNLIKE PRIVACYCARE_PREFIX/
+# PRIVACYCARE_MONITORS_PREFIX — back in OUR OWN namespace, not Ethyca's
+# `plus`. Nothing in the shipped admin UI calls these routes (the risk
+# register is new, Kenyan-specific ground with no Plus analogue), so taking
+# a `plus` path here would only risk colliding with a real Plus endpoint
+# later. See api/risk.py's module docstring for the fuller version of this
+# argument.
+PRIVACYCARE_RISK_PREFIX = f"{V1_URL_PREFIX}/privacycare/risk"
+
+privacycare_risk_router = APIRouter(prefix=PRIVACYCARE_RISK_PREFIX, tags=["PrivacyCare"])
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -212,6 +226,12 @@ def register() -> None:
     # of the tasks-vs-assessments matching-order hazard either.
     importlib.import_module("fides.api.privacycare.api.consent")
 
+    # risk.py (plan 17, task 5) decorates its OWN router
+    # (privacycare_risk_router, a distinct prefix), so — same as grounds.py,
+    # chat.py, monitors.py, dsr.py and consent.py above — it carries none of
+    # the tasks-vs-assessments matching-order hazard either.
+    importlib.import_module("fides.api.privacycare.api.risk")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
@@ -219,4 +239,5 @@ def register() -> None:
     app_setup.ROUTERS.append(privacycare_monitors_router)
     app_setup.ROUTERS.append(privacycare_dsr_router)
     app_setup.ROUTERS.append(privacycare_consent_router)
+    app_setup.ROUTERS.append(privacycare_risk_router)
     setattr(app_setup, _REGISTERED_FLAG, True)
