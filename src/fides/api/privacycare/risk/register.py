@@ -70,12 +70,44 @@ _DELETE_RISK_SQL = sqlalchemy.text(
 
 # The one sanctioned write to an Ethyca table in this plan. risk_level is an
 # UPDATE of a single column Ethyca already treats as hand-editable — it is
-# in their own _UPDATABLE_ASSESSMENT_FIELDS (api/assessments.py) — so this
-# is a data write, not a schema change, and needs no migration. Only this
-# one column is ever named on the right-hand side; every other column on
-# the row is left untouched.
+# in their own _UPDATABLE_ASSESSMENT_FIELDS (privacycare/api/assessments.py)
+# — so this is a data write, not a schema change, and needs no migration.
+# Only this one column is ever named on the right-hand side; every other
+# column on the row is left untouched.
+#
+# Deliberately does NOT bump updated_at, unlike Ethyca's own
+# _update_assessment (privacycare/api/assessments.py) which does
+# `, updated_at = now()` alongside its writes. That column means "a human
+# last touched this row" to anyone reading the DPIA's history; a projection
+# recomputed automatically every time the register changes is not a human
+# edit, and bumping updated_at here would make an automatic recomputation
+# look like someone edited the DPIA — corrupting the audit trail in a way
+# that is worse than the timestamp being merely stale. Kept as-is on
+# purpose, not an oversight.
 _SYNC_PROJECTION_SQL = sqlalchemy.text(
     "UPDATE privacy_assessment SET risk_level = :risk_level WHERE id = :id"
+)
+
+# Same FOR UPDATE-on-the-parent-row discipline api/answers.py's
+# _LOCK_ASSESSMENT_SQL and api/assessments.py's _LOCK_ASSESSMENT_ROW_SQL
+# already use for every other write/recompute against privacy_assessment:
+# take the lock BEFORE the read that decides what to write, not just before
+# the write itself. sync_projection used to read the register (list_risks,
+# inside assessment_band) with no lock at all, at READ COMMITTED. A plain
+# UPDATE still takes an implicit row lock, but only at the UPDATE
+# statement — by then the value being written was already computed from a
+# snapshot that could predate a concurrent committer's insert. Two DPOs
+# adding risks to the same DPIA at once could then lose the higher band:
+# transaction A inserts a critical risk and updates risk_level to "high",
+# holding the row locked (via its own UPDATE) until it commits; transaction
+# B, whose list_risks snapshot ran before A's commit, computes "low" from
+# its own smaller risk, blocks on A's implicit lock, and once A commits and
+# releases it, B proceeds to write its stale "low" straight over A's
+# "high" — durably wrong until the next mutation. Locking first forces B to
+# block BEFORE it reads, so once unblocked it re-reads the post-commit
+# state and recomputes the correct band.
+_LOCK_ASSESSMENT_ROW_SQL = sqlalchemy.text(
+    "SELECT id FROM privacy_assessment WHERE id = :id FOR UPDATE"
 )
 
 
@@ -217,7 +249,15 @@ def sync_projection(db: Session, assessment_id: str) -> str:
 
     Idempotent: calling it again with no change to the register writes the
     same value and leaves the row otherwise untouched.
+
+    Takes a FOR UPDATE lock on the privacy_assessment row BEFORE reading the
+    register (assessment_band -> list_risks), not just before the write —
+    see _LOCK_ASSESSMENT_ROW_SQL's comment for the lost-update this closes.
+    A row that does not exist locks nothing (the SELECT returns no rows)
+    and the UPDATE below is then the same no-op it always was for an
+    unknown assessment_id.
     """
+    db.execute(_LOCK_ASSESSMENT_ROW_SQL, {"id": assessment_id})
     our_band = assessment_band(db, assessment_id)
     db.execute(
         _SYNC_PROJECTION_SQL,

@@ -3,6 +3,8 @@
 # banding) rather than a second copy of the arithmetic. score and band are
 # never stored — see models.py's dpia_risk_table comment — so every
 # assertion here reads them back computed, not persisted.
+import threading
+import time
 import uuid
 
 import pytest
@@ -343,6 +345,157 @@ def test_remove_risk_moves_ethycas_risk_level_column(db, assessment_id):
     assert removed is True
     # Only the trivial risk remains: LOW.
     assert _assessment_row(db, assessment_id)["risk_level"] == LOW
+
+
+# --- IMPORTANT-1 (final whole-branch review): the lost-update race in
+# sync_projection. Every test above shares the module-level `db` fixture,
+# which is ONE Session per test with commit monkeypatched to flush and a
+# rollback on teardown — deliberately, so tests never pollute the live
+# database. That fixture cannot exercise a cross-transaction race: a single
+# session has no "other transaction" to race against, and READ COMMITTED
+# visibility only diverges across separate connections. Reproducing the
+# race for real needs two independent engines/sessions that actually
+# commit, so this one small section uses its own fixture and cleans up by
+# hand (DELETE, not rollback) rather than borrowing `db`/`assessment_id`.
+@pytest.fixture
+def committed_assessment_id():
+    """A template + assessment that are REALLY committed, not just flushed
+    within one still-open session — required so two independent sessions
+    opened in the test below can each see the row via their own READ
+    COMMITTED snapshot. Cleaned up by hand on teardown since nothing here
+    is going to roll back."""
+    engine = sqlalchemy.create_engine(DB_URL)
+    with Session(engine) as session:
+        template_id = _seed_template(session)
+        assessment_id = _seed_assessment(session, template_id)
+        session.commit()
+
+    yield assessment_id
+
+    with Session(sqlalchemy.create_engine(DB_URL)) as session:
+        session.execute(
+            sqlalchemy.text(
+                "DELETE FROM privacycare_dpia_risk WHERE assessment_id = :id"
+            ),
+            {"id": assessment_id},
+        )
+        session.execute(
+            sqlalchemy.text("DELETE FROM privacy_assessment WHERE id = :id"),
+            {"id": assessment_id},
+        )
+        session.execute(
+            sqlalchemy.text(
+                "DELETE FROM assessment_template WHERE id = :tid"
+            ),
+            {"tid": template_id},
+        )
+        session.commit()
+
+
+def test_concurrent_add_risk_does_not_lose_the_higher_band(committed_assessment_id):
+    """Reproduces IMPORTANT-1's scenario with two real sessions on two real
+    connections, forced into the exact interleaving the finding describes,
+    rather than asserting anything about the SQL text sync_projection
+    issues.
+
+    Thread A adds a 5x5 (critical) risk via add_risk and, deliberately,
+    does NOT commit yet — its transaction (and, with the fix, the FOR
+    UPDATE lock sync_projection now takes on the privacy_assessment row)
+    stays open. Thread B is only started once A has finished its own
+    add_risk call (INSERT + locked read + UPDATE, all uncommitted), so B's
+    add_risk necessarily blocks trying to acquire the same lock. Only after
+    B has had time to actually reach and block on that call does the test
+    let A commit, unblocking B.
+
+    With the fix (lock taken before the register is read), B's block
+    happens BEFORE it reads the register, so once unblocked it re-reads
+    post-A's-commit state and correctly recomputes "critical" (-> "high")
+    from both risks. Without the fix, B's list_risks runs before it ever
+    blocks (the old code's only lock is the UPDATE statement's own implicit
+    row lock), so B computes "low" from its own risk alone, blocks on
+    A's UPDATE, and once unblocked overwrites A's correct "high" with its
+    stale "low". This test asserts the final column is "high", not "low" —
+    exactly the durable-wrong-projection failure IMPORTANT-1 describes.
+    """
+    assessment_id = committed_assessment_id
+
+    a_ready = threading.Event()
+    release_a = threading.Event()
+    errors: list[BaseException] = []
+
+    def txn_a():
+        try:
+            engine_a = sqlalchemy.create_engine(DB_URL)
+            with Session(engine_a) as session_a:
+                add_risk(
+                    session_a,
+                    assessment_id=assessment_id,
+                    category="integrity",
+                    description="Fuel depot SCADA control-plane takeover.",
+                    likelihood=5,
+                    severity=5,
+                )
+                # Transaction intentionally left open here: the row lock
+                # sync_projection took (fixed code) or the UPDATE's own
+                # implicit lock (either way) is still held.
+                a_ready.set()
+                held = release_a.wait(timeout=10)
+                if not held:
+                    raise AssertionError("txn_a: release_a was never set")
+                session_a.commit()
+        except BaseException as exc:  # noqa: BLE001 - surfaced via errors list
+            errors.append(exc)
+
+    def txn_b():
+        try:
+            a_ready.wait(timeout=10)
+            engine_b = sqlalchemy.create_engine(DB_URL)
+            with Session(engine_b) as session_b:
+                # This call blocks inside sync_projection until txn_a
+                # commits and releases the row lock.
+                add_risk(
+                    session_b,
+                    assessment_id=assessment_id,
+                    category="availability",
+                    description="Backup generator fuel gauge under-reports by 2%.",
+                    likelihood=1,
+                    severity=2,
+                )
+                session_b.commit()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=txn_a)
+    thread_b = threading.Thread(target=txn_b)
+
+    thread_a.start()
+    assert a_ready.wait(timeout=10), "txn_a never reached its held-open point"
+    thread_b.start()
+    # Give txn_b time to actually issue add_risk and block on txn_a's lock
+    # before txn_a is allowed to commit. Generous relative to local
+    # Postgres round-trip latency; the interleaving this proves does not
+    # depend on the exact duration, only on B attempting its lock/update
+    # before A releases it.
+    time.sleep(0.5)
+    release_a.set()
+
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+
+    assert not thread_a.is_alive(), "txn_a did not finish"
+    assert not thread_b.is_alive(), "txn_b did not finish"
+    assert not errors, f"background transaction(s) raised: {errors}"
+
+    with Session(sqlalchemy.create_engine(DB_URL)) as verify:
+        final = _assessment_row(verify, assessment_id)
+
+    # The critical risk (score 25) must still win the projection even
+    # though the low risk (score 2) was the one whose UPDATE committed
+    # last in wall-clock time.
+    assert final["risk_level"] == HIGH, (
+        "lost update: the register's critical risk was overwritten by the "
+        f"low risk's stale read (got risk_level={final['risk_level']!r})"
+    )
 
 
 # --- The migration itself. Statically parsed rather than imported and run:
