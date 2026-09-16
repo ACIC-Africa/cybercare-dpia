@@ -22,13 +22,22 @@ _database_url() and _target_description() are copied verbatim from those
 scripts rather than imported — see load_taxonomy.py's module docstring for
 why importing env.py isn't safe here.
 
-Unlike test_seed_consent_demo.py, this suite never commits to the live
-database (no "authorized Step 4 run" happened for this task — see the
-Task 5 report), so there is no live demo row to protect and no
-delete-then-restore dance: `test_dry_run_writes_nothing` only needs to
-confirm the live database does not already carry a Kenya template before
-it runs, the same "setup: ..." guard idea, simplified because there is
-nothing to put back.
+UPDATE (Task 6, spec 2026-09-16 D-W2-2, Step 1): the authorized
+`--commit` run has now happened against this same live database, and the
+Kenya template is meant to stay there permanently (Step 6: "Leave the
+Kenya template in place — it is the deliverable") — unlike
+test_seed_consent_demo.py's demo row, there is no delete-then-restore
+dance here because nothing about this row is meant to be temporary.
+`test_dry_run_writes_nothing` no longer assumes the live database starts
+Kenya-template-free (it can't, now); it instead only proves a dry run
+changes nothing, by comparing the count before and after regardless of
+what it started at.
+`test_seed_kenya_template_raises_if_the_gdpr_template_is_missing`
+similarly can no longer rely on "no existing Kenya template" to reach its
+create-path assertion — it now also patches KENYA_ASSESSMENT_TYPE to a
+value nothing in the table carries, so `_find_or_create_kenya_template`
+attempts a fresh create (and hits the patched-missing GDPR_TEMPLATE_ID)
+instead of short-circuiting on the row Task 6 committed.
 """
 import importlib.util
 import os
@@ -97,11 +106,15 @@ def _kenya_template_count() -> int:
 
 
 def test_dry_run_writes_nothing():
+    # Task 6 (spec 2026-09-16 D-W2-2) ran the authorized `--commit` seed
+    # against this same live database, so `before` is no longer guaranteed
+    # to be 0 — the Kenya template is meant to stay (Step 6: "Leave the
+    # Kenya template in place — it is the deliverable"). What this test
+    # actually needs to prove is narrower and still holds regardless of
+    # starting state: a dry run changes nothing. Comparing before/after
+    # counts proves that whether the template already exists (today, and
+    # from now on) or not (a from-empty environment, e.g. CI).
     before = _kenya_template_count()
-    assert before == 0, (
-        "a Kenya template already exists in the live database — this test "
-        "cannot prove a dry run writes nothing against a pre-populated row"
-    )
 
     result = subprocess.run(
         [sys.executable, str(_SCRIPT_PATH)],
@@ -109,7 +122,7 @@ def test_dry_run_writes_nothing():
     )
 
     assert "DRY RUN — nothing written" in result.stdout
-    assert _kenya_template_count() == before == 0
+    assert _kenya_template_count() == before
 
 
 def test_the_run_names_its_target_and_never_the_password():
@@ -304,9 +317,24 @@ def test_seed_kenya_template_raises_if_the_gdpr_template_is_missing(db, monkeypa
     # GDPR_TEMPLATE_ID constant to an id that names no row proves the same
     # "cannot find the template to copy from" path without touching a row
     # something else in the live database depends on.
+    #
+    # Task 6 (spec 2026-09-16 D-W2-2) committed the real Kenya template to
+    # this same live database and it is meant to stay (Step 6: "Leave the
+    # Kenya template in place"). _find_or_create_kenya_template short-
+    # circuits to `found, not created` the moment a row with
+    # KENYA_ASSESSMENT_TYPE already exists — see seed_kenya_template's own
+    # docstring, "an already-existing Kenya template short-circuits before
+    # [the GDPR check] is checked again" — so exercising the "GDPR source
+    # missing" path now also needs KENYA_ASSESSMENT_TYPE patched to a value
+    # nothing in the table carries, or the real committed row is found
+    # first and the code under test (the GDPR-missing check) is never
+    # reached at all.
     cli = _load_cli()
     fake_id = "ast_00000000-0000-0000-0000-000000000000"
     monkeypatch.setattr(cli, "GDPR_TEMPLATE_ID", fake_id)
+    monkeypatch.setattr(
+        cli, "KENYA_ASSESSMENT_TYPE", "kenya_dpa_2019_dpia__test_missing_gdpr_source"
+    )
 
     with pytest.raises(ValueError, match=fake_id):
         cli.seed_kenya_template(db)
