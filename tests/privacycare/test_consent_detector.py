@@ -17,10 +17,26 @@ from uuid import uuid4
 
 import pytest
 import sqlalchemy
+from sqlalchemy import String
 from sqlalchemy.orm import Session
 
+from fides.api.db.encryption_utils import encrypted_type
+from fides.api.models.privacy_preference import PrivacyPreferenceHistory
 from fides.api.privacycare.consent.detector import StaleConsent, find_stale_consents
 from fides.api.privacycare.consent.materiality import seed_consent_rule
+
+# privacypreferencehistory.email / .fides_user_device are StringEncryptedType
+# (AES-GCM) columns: the detector now resolves subject identity through the
+# ORM specifically so it gets the decrypting side of this type (see
+# detector.py's module docstring for why raw SQL can't). Fixture rows built
+# by a raw INSERT therefore have to write real ciphertext too, using this
+# same type's encrypt side, or the ORM's decrypt side chokes on plain text
+# that isn't valid AES-GCM ciphertext.
+_IDENTITY_TYPE = encrypted_type(type_in=String())
+
+
+def _encrypt(value):
+    return None if value is None else _IDENTITY_TYPE.process_bind_param(value, dialect=None)
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -93,7 +109,7 @@ def make_preference(db, *, history_id, preference="opt_in", email=None,
           (id, preference, privacy_notice_history_id, email, fides_user_device)
         VALUES (:id, :pref, :hid, :email, :device)
     """), {"id": pref_id, "pref": preference, "hid": history_id,
-           "email": email, "device": device})
+           "email": _encrypt(email), "device": _encrypt(device)})
     return pref_id
 
 
@@ -286,6 +302,45 @@ def test_a_subject_with_no_email_is_reported_by_device_id(db):
     assert len(result) == 1
     assert result[0].subject == "device-abc-123"
     assert result[0].subject_kind == "fides_user_device"
+
+
+def test_a_preference_recorded_through_the_orm_decrypts_to_its_plaintext_identity(db):
+    # The fix-round test. Every other test's make_preference() writes email
+    # via a raw INSERT, so it round-trips as plain text regardless of
+    # whether the detector reads it correctly through the ORM's decrypting
+    # type or incorrectly through raw SQL -- that's self-consistent and
+    # proves nothing about real data. `email` is a StringEncryptedType
+    # (AES-GCM) column: writing it through the ORM's own create/persist_obj
+    # path is what actually encrypts it at rest, so this is the one
+    # fixture in the file where a raw-SQL read of `email` would come back
+    # as ciphertext instead of "carol@example.com".
+    _, translation_id = make_notice(db, key="fuel_card", name="Fuel Card Marketing")
+    v1 = make_version(
+        db, translation_id=translation_id, key="fuel_card", name="Fuel Card Marketing",
+        version=1.0, data_uses=["marketing.advertising"],
+    )
+    make_version(
+        db, translation_id=translation_id, key="fuel_card", name="Fuel Card Marketing",
+        version=2.0, data_uses=["marketing.advertising", "marketing.advertising.third_party"],
+    )
+    # PrivacyPreferenceHistory.create -> persist_obj does add/commit/refresh
+    # unconditionally; the `db` fixture's commit->flush patch is what keeps
+    # this rolled back at teardown instead of actually committing.
+    PrivacyPreferenceHistory.create(
+        db,
+        data={
+            "preference": "opt_in",
+            "privacy_notice_history_id": v1,
+            "email": "carol@example.com",
+        },
+        check_name=False,
+    )
+
+    result = find_stale_consents(db)
+
+    assert len(result) == 1
+    assert result[0].subject == "carol@example.com"
+    assert result[0].subject_kind == "email"
 
 
 def test_the_detector_writes_nothing(db):

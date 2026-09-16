@@ -32,6 +32,21 @@ from landing in the table after a higher-numbered one (a slow write racing
 an earlier one, or a backfill). `MAX(version)` is the only version-numbering
 fact that's actually true regardless of insertion order; `MAX(created_at)`
 or "last row inserted" is not.
+
+**Subject identity is resolved through the ORM, not through `_QUERY`.**
+`privacypreferencehistory.email` / `.fides_user_device` / `.external_id`
+are `StringEncryptedType` columns (AES-GCM; see `ConsentIdentitiesMixin` in
+`fides.api.models.privacy_preference`) — the encryption is a `TypeDecorator`
+that only fires when SQLAlchemy knows the column's type, which a raw
+`sqlalchemy.text()` SELECT never does. Reading those three columns via raw
+SQL returns ciphertext, not a usable identity, for any preference actually
+recorded through Fides' own consent flow (the ORM `create`/`persist_obj`
+path). So `_QUERY` finds the stale `privacynoticehistory`/version facts and
+the `privacypreferencehistory.id`s that are materially stale, and
+`find_stale_consents` then loads exactly those rows through the
+`PrivacyPreferenceHistory` model — still read-only, a `SELECT` via
+`db.query(...)`, no `add`/`commit`/`delete` — so the ORM's decrypting type
+decorator applies and `.email` etc. come back as plaintext.
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +55,7 @@ from typing import Any, Optional
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+from fides.api.models.privacy_preference import PrivacyPreferenceHistory
 from fides.api.privacycare.consent.materiality import active_rule, added_uses, is_materially_different
 
 # Only an affirmative opt-in can be stale. `opt_out` means the subject
@@ -71,9 +87,7 @@ _QUERY = sqlalchemy.text(
         ORDER BY nt.privacy_notice_id, pnh.version DESC
     )
     SELECT
-        pph.email             AS email,
-        pph.fides_user_device AS fides_user_device,
-        pph.external_id       AS external_id,
+        pph.id                AS pref_id,
         pph.preference        AS preference,
         pph.received_at       AS received_at,
         cv.notice_key         AS notice_key,
@@ -139,11 +153,28 @@ def find_stale_consents(db: Session, *, notice_key: Optional[str] = None) -> lis
         _QUERY, {"stale_eligible": _STALE_ELIGIBLE_PREFERENCE, "notice_key": notice_key}
     ).fetchall()
 
+    materially_stale = [
+        row
+        for row in rows
+        if is_materially_different(row.consented_data_uses, row.live_data_uses, rule=rule)
+    ]
+    if not materially_stale:
+        return []
+
+    # Identity only, and only for rows that are actually stale — see the
+    # module docstring for why this can't be folded into `_QUERY`. A plain
+    # `SELECT ... WHERE id IN (...)` via the ORM: still read-only.
+    pref_ids = [row.pref_id for row in materially_stale]
+    preferences_by_id = {
+        preference.id: preference
+        for preference in db.query(PrivacyPreferenceHistory)
+        .filter(PrivacyPreferenceHistory.id.in_(pref_ids))
+        .all()
+    }
+
     stale: list[StaleConsent] = []
-    for row in rows:
-        if not is_materially_different(row.consented_data_uses, row.live_data_uses, rule=rule):
-            continue
-        subject, subject_kind = _subject(row)
+    for row in materially_stale:
+        subject, subject_kind = _subject(preferences_by_id[row.pref_id])
         stale.append(
             StaleConsent(
                 subject=subject,
