@@ -116,7 +116,16 @@ class StaleConsent:
     live_version: float
     added_uses: list[str]
     preference: str
-    received_at: datetime
+    # Coordinator ruling (Task 3, fix round 1): Optional, not `datetime`.
+    # `privacypreferencehistory.received_at` is nullable with no default —
+    # the only NOT NULL columns without a default on that table are `id`
+    # and `preference` — so a genuinely-collected preference row can carry
+    # a NULL `received_at` today. A report that says "we do not know when
+    # this consent was given" is strictly better than one that crashes:
+    # the subject's identity and the version gap are what make this report
+    # actionable under spec D-CON-4, and the timestamp is supporting
+    # detail, not load-bearing for that judgement.
+    received_at: Optional[datetime]
 
 
 def _subject(row: Any) -> tuple[str, str]:

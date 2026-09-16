@@ -79,11 +79,14 @@ def _make_stale_pair(db, *, key="fuel_card", name="Fuel Card Marketing", email="
     """One notice that gained a use between v1 and v2, plus a v1 opt_in —
     exactly the shape test_consent_detector.py proves is stale.
 
-    test_consent_detector.py's own make_preference leaves received_at NULL
-    (that module never asserts on it), but the response schema types it as
-    a required datetime, matching consent/detector.py's StaleConsent
-    dataclass exactly — so this sets it explicitly here rather than
-    relaxing the schema to paper over an untested fixture gap.
+    test_consent_detector.py's own make_preference leaves received_at NULL.
+    received_at is Optional on both StaleConsent and StaleConsentResponse
+    (coordinator ruling, Task 3 fix round 1 — see
+    test_a_stale_preference_with_a_null_received_at_is_a_200_with_a_null_
+    timestamp below for that case specifically), but every OTHER test in
+    this file that isn't about received_at itself wants a concrete,
+    assertable timestamp, so this sets one explicitly rather than leaving
+    every ordinary test to incidentally exercise the null path too.
     """
     _, translation_id = make_notice(db, key=key, name=name)
     v1 = make_version(
@@ -146,6 +149,38 @@ def test_an_empty_result_is_a_200_with_an_empty_list_not_a_404(db):
 
     assert page.items == []
     assert page.total == 0
+
+
+def test_a_stale_preference_with_a_null_received_at_is_a_200_with_a_null_timestamp(db):
+    # Coordinator ruling (Task 3, fix round 1): received_at is Optional on
+    # both StaleConsent (detector.py) and StaleConsentResponse — a
+    # genuinely-collected privacypreferencehistory row can carry a NULL
+    # received_at (it is nullable with no default; the only NOT NULL
+    # columns without a default on that table are id and preference).
+    # Before this ruling, the response schema typed received_at as a
+    # required datetime, so a real row like this one would have raised a
+    # Pydantic ValidationError inside the route — an uncaught 500 the
+    # first time a real customer's data hit it, not a 404 or anything
+    # else recognisable as "handled". This proves the fix: the route
+    # still returns 200 with the entry present, timestamp null.
+    _, translation_id = make_notice(db, key="fuel_card", name="Fuel Card Marketing")
+    v1 = make_version(
+        db, translation_id=translation_id, key="fuel_card", name="Fuel Card Marketing",
+        version=1.0, data_uses=["marketing.advertising"],
+    )
+    make_version(
+        db, translation_id=translation_id, key="fuel_card", name="Fuel Card Marketing",
+        version=2.0, data_uses=["marketing.advertising", "marketing.advertising.third_party"],
+    )
+    # make_preference (test_consent_detector.py) never sets received_at —
+    # it is left NULL here deliberately, unlike _make_stale_pair above.
+    make_preference(db, history_id=v1, preference="opt_in", email="alice@example.com")
+
+    page = list_stale_consents(notice_key=None, params=Params(page=1, size=50), db=db)
+
+    assert len(page.items) == 1
+    assert page.items[0].received_at is None
+    assert page.items[0].subject == "alice@example.com"
 
 
 def test_the_route_writes_nothing(db):

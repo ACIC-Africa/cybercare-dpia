@@ -3,14 +3,22 @@ Task 3). No detection logic here — see consent/detector.py for that; this
 module only shapes what goes over the wire.
 """
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel
 
 
 class StaleConsentResponse(BaseModel):
     # Every field of consent/detector.py's StaleConsent dataclass, verbatim
-    # — none of them are optional there and none are made optional here,
-    # and this schema adds no computed field of its own.
+    # — this schema adds no computed field of its own.
+    #
+    # received_at is Optional (coordinator ruling, Task 3 fix round 1):
+    # `privacypreferencehistory.received_at` is nullable with no default,
+    # so a genuinely-collected preference row can carry a NULL value —
+    # matching StaleConsent's own field here, not widening past it. A
+    # report with a null timestamp is strictly better than one that
+    # crashes: the subject and the version gap are what make this report
+    # actionable under spec D-CON-4; the timestamp is supporting detail.
     #
     # No TypeScript counterpart: the detector is new, Kenyan-specific
     # ground with no Plus analogue, so no shipped admin-UI screen calls
@@ -24,4 +32,4 @@ class StaleConsentResponse(BaseModel):
     live_version: float
     added_uses: list[str]
     preference: str
-    received_at: datetime
+    received_at: Optional[datetime]
