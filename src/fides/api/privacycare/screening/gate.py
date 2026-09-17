@@ -17,10 +17,18 @@
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import sqlalchemy
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:
+    # sqlalchemy-stubs (the mypy plugin pinned in pyproject.toml) still
+    # models 1.4's raw row type as RowProxy, not the runtime sqlalchemy
+    # package's own Row — so this import is type-checking-only. Importing
+    # RowProxy unconditionally would fail at runtime: this repo's installed
+    # sqlalchemy no longer exports that name at all.
+    from sqlalchemy.engine import RowProxy
 
 _LIST_TRIGGERS_SQL = sqlalchemy.text(
     "SELECT id, trigger_key, label, description, display_order "
@@ -77,7 +85,7 @@ class ScreeningVerdict:
     decided_at: datetime
 
 
-def _to_verdict(row) -> ScreeningVerdict:
+def _to_verdict(row: "RowProxy") -> ScreeningVerdict:
     # triggered_keys comes back from the ARRAY column already sorted (see
     # record_decision: it is sorted before the INSERT), so no re-sort
     # happens here — this is a straight read of what was written, not a
@@ -122,8 +130,8 @@ def record_decision(
     (ck_screening_screenout_has_a_reason) covers only dpia_required vs.
     justification; it does NOT relate dpia_required to triggered_keys, so a
     hand-written INSERT could still violate that comment. This function is
-    the one and only write path the application offers onto this table, and
-    by never accepting dpia_required as input — only ever computing it from
+    the only write path this codebase uses onto this table, and by never
+    accepting dpia_required as input — only ever computing it from
     triggered_keys, right here — it is the thing that makes that comment
     true rather than aspirational.
     """
