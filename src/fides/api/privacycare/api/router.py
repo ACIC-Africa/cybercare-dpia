@@ -121,6 +121,22 @@ PRIVACYCARE_RISK_PREFIX = f"{V1_URL_PREFIX}/privacycare/risk"
 
 privacycare_risk_router = APIRouter(prefix=PRIVACYCARE_RISK_PREFIX, tags=["PrivacyCare"])
 
+# The screening gate's HTTP surface (plan 18, task 4): a NINTH, separate
+# prefix family, and — like privacycare_processes_router/
+# privacycare_chat_router/privacycare_grounds_router/privacycare_dsr_router/
+# privacycare_consent_router/privacycare_risk_router, and UNLIKE
+# PRIVACYCARE_PREFIX/PRIVACYCARE_MONITORS_PREFIX — back in OUR OWN
+# namespace, not Ethyca's `plus`. Nothing in the shipped admin UI calls
+# these routes (the screening gate is new, Kenyan-specific ground with no
+# Plus analogue), so taking a `plus` path here would only risk colliding
+# with a real Plus endpoint later. See api/screening.py's module docstring
+# for the fuller version of this argument.
+PRIVACYCARE_SCREENING_PREFIX = f"{V1_URL_PREFIX}/privacycare/screening"
+
+privacycare_screening_router = APIRouter(
+    prefix=PRIVACYCARE_SCREENING_PREFIX, tags=["PrivacyCare"]
+)
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -232,6 +248,15 @@ def register() -> None:
     # the tasks-vs-assessments matching-order hazard either.
     importlib.import_module("fides.api.privacycare.api.risk")
 
+    # screening.py (plan 18, task 4) decorates its OWN router
+    # (privacycare_screening_router, a distinct prefix), so — same as
+    # grounds.py, chat.py, monitors.py, dsr.py, consent.py and risk.py
+    # above — it carries none of the tasks-vs-assessments matching-order
+    # hazard either. screening.py's OWN internal ordering hazard (GET
+    # "/triggers" must be registered ahead of GET "/{declaration_id}" on
+    # ITS router) is local to that one file and documented there instead.
+    importlib.import_module("fides.api.privacycare.api.screening")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
@@ -240,4 +265,5 @@ def register() -> None:
     app_setup.ROUTERS.append(privacycare_dsr_router)
     app_setup.ROUTERS.append(privacycare_consent_router)
     app_setup.ROUTERS.append(privacycare_risk_router)
+    app_setup.ROUTERS.append(privacycare_screening_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

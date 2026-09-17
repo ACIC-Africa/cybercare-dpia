@@ -39,6 +39,7 @@ from fides.api.privacycare.api.router import (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
     PRIVACYCARE_RISK_PREFIX,
+    PRIVACYCARE_SCREENING_PREFIX,
 )
 from fides.api.privacycare.asgi import app
 
@@ -364,6 +365,48 @@ ALLOWLIST: dict[str, dict] = {
             "its own entry — no separate discovery happens for it here."
         ),
     },
+    # The screening gate's HTTP surface (plan 18, task 4). Same pattern as
+    # the DSR register, business-process ROPA surface, stale-consent
+    # detector, and DPIA risk register above: the screening gate is new,
+    # Kenyan-specific ground with no Plus analogue, so no shipped admin-UI
+    # screen calls any of these four routes and none of their response
+    # models have a TS counterpart to be in parity with.
+    "TriggerResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: the screening gate is PrivacyCare's own "
+            "(spec 2026-09-16 D-W2-7), and nothing in the shipped admin UI "
+            "has a screen for it — see api/screening.py's module "
+            "docstring."
+        ),
+    },
+    "TriggerListResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above."
+        ),
+    },
+    "ScreeningVerdictResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above. Also "
+            "recursed into from CurrentScreeningResponse.verdict and "
+            "ScreeningHistoryResponse.decisions, both covered by their own "
+            "entries below — no separate discovery happens for it there."
+        ),
+    },
+    "CurrentScreeningResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above."
+        ),
+    },
+    "ScreeningHistoryResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above."
+        ),
+    },
 }
 
 
@@ -407,6 +450,13 @@ ALLOWLIST: dict[str, dict] = {
 # to already start with PRIVACYCARE_GROUNDS_PREFIX (/api/v1/privacycare),
 # same accidental-substring situation named above — listed explicitly
 # anyway for the same two reasons.
+#
+# PRIVACYCARE_SCREENING_PREFIX (plan 18, task 4): a NINTH router
+# (privacycare_screening_router). Its prefix,
+# /api/v1/privacycare/screening, happens to already start with
+# PRIVACYCARE_GROUNDS_PREFIX (/api/v1/privacycare), same
+# accidental-substring situation named above — listed explicitly anyway
+# for the same two reasons.
 PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_PREFIX,
     PRIVACYCARE_PROCESSES_PREFIX,
@@ -416,6 +466,7 @@ PRIVACYCARE_PATH_PREFIXES = (
     PRIVACYCARE_DSR_PREFIX,
     PRIVACYCARE_CONSENT_PREFIX,
     PRIVACYCARE_RISK_PREFIX,
+    PRIVACYCARE_SCREENING_PREFIX,
 )
 
 

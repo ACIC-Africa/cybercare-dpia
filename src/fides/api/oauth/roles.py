@@ -41,6 +41,7 @@ from fides.common.scope_registry import (
     PRIVACY_REQUEST_VIEW_DATA,
     PRIVACYCARE_DISCOVERY_READ,
     PRIVACYCARE_RISK_READ,
+    PRIVACYCARE_SCREENING_READ,
     RULE_READ,
     SAAS_CONFIG_READ,
     SCOPE_READ,
@@ -188,6 +189,19 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # Viewer already holds via this same list), but this grant should not
     # be read as a stronger promise than the data model actually enforces.
     PRIVACYCARE_RISK_READ,
+    # PrivacyCare (spec 2026-09-17 D-W2-7): PRIVACYCARE_SCREENING_READ IS
+    # granted to Viewer here, the same PRIVACYCARE_DISCOVERY_READ/
+    # PRIVACYCARE_RISK_READ precedent immediately above rather than the
+    # PRIVACYCARE_DSR_READ/PRIVACYCARE_CONSENT_READ one further up. A
+    # screening decision (gate.py's ScreeningVerdict) names an activity —
+    # which triggers were ticked, and a free-text justification for a
+    # screen-out — never a data subject, the same distinction
+    # PRIVACYCARE_RISK_READ's own comment above draws for a risk-register
+    # row. The WRITE scope, PRIVACYCARE_SCREENING_CREATE, is not listed
+    # here and is not imported into this module at all: Owner and
+    # Contributor still get it by registry derivation below, same as every
+    # other write scope this list omits.
+    PRIVACYCARE_SCREENING_READ,
     RULE_READ,
     SCOPE_READ,
     STORAGE_READ,
