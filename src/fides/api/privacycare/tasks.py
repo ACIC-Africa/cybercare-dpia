@@ -23,6 +23,7 @@ from fides.api.privacycare.context import (
     unresolvable_roots,
 )
 from fides.api.privacycare.generator import GENERATOR_AUTHOR, answer_questions
+from fides.api.privacycare.screening.gate import is_screened_out
 from fides.api.privacycare.settings import resolve_assessment_model
 from fides.api.tasks import (
     PRIVACY_ASSESSMENTS_QUEUE_NAME,
@@ -234,6 +235,16 @@ def run_generation(db: Session, task_id: str) -> None:
     One failing target does not fail the run (see the failure handling
     below): a single system's gateway refusal must not discard the other
     forty-nine. The run reports `error` only when it produced nothing.
+
+    Before any of that, a target whose declaration is screened OUT
+    (screening/gate.py's is_screened_out) is skipped entirely: no
+    assessment row, no LLM call, no completeness computation. In Fides
+    today "prior consultation" is asked six times inside GDPR question
+    text and enforced nowhere; a screening verdict this task recorded but
+    never acted on would be the same defect wearing our own badge. A skip
+    is not a failure — it is counted and reported on its own terms (see
+    the `skipped` handling below and _finish's message), and the gate is
+    opt-in: a declaration that has never been screened is never blocked.
     """
     task = db.execute(_LOAD_TASK_SQL, {"task_id": task_id}).mappings().first()
     if task is None:
@@ -283,8 +294,28 @@ def run_generation(db: Session, task_id: str) -> None:
     model = resolve_assessment_model(db, task["llm_model"])
 
     completed = 0
+    skipped = 0
     failures: list[str] = []
     for target in targets:
+        # The gate check comes before build_context, not inside its
+        # try/except: a screen-out is not a failure mode of context
+        # building, it is a decision that was already made about this
+        # declaration, and it must pre-empt every downstream step — no
+        # _create_assessment row, no LLM call, no recompute_completeness —
+        # for every assessment_type this target would otherwise have
+        # produced. Counted against `skipped`, not `failures`: reporting a
+        # screen-out as an error would tell whoever ran this task something
+        # false about their own estate.
+        if is_screened_out(db, target.declaration_id):
+            skipped += len(templates)
+            logger.info(
+                "PrivacyCare generation skipping {} ({}): screened out, no "
+                "DPIA required",
+                target.system_fides_key,
+                target.declaration_id,
+            )
+            continue
+
         # Fix round 1 (coordinator review, MAJOR finding): build_context used
         # to sit OUTSIDE this loop's try/except, so a single target's
         # exception (a malformed declaration, a query timeout) aborted the
@@ -353,11 +384,24 @@ def run_generation(db: Session, task_id: str) -> None:
                 )
 
     if completed == 0:
-        message = f"All {total} assessments failed. First: {failures[0]}"
-        _finish(db, task_id, "error", total, 0, message)
+        if failures:
+            message = f"All {total} assessments failed. First: {failures[0]}"
+            _finish(db, task_id, "error", total, 0, message)
+        else:
+            # Every target was screened out — skipped == total, no
+            # failures at all. That is the gate doing exactly its job, not
+            # a run with nothing to show for itself, so it is reported as
+            # `complete`, not `error`.
+            message = (
+                f"All {total} assessments were screened out; none required "
+                "a DPIA."
+            )
+            _finish(db, task_id, "complete", total, 0, message)
         return
 
     message = f"Generated {completed} of {total} assessments."
+    if skipped:
+        message += f" {skipped} screened out (no DPIA required)."
     if failures:
         message += f" {len(failures)} failed: {failures[0]}"
     _finish(db, task_id, "complete", total, completed, message)
