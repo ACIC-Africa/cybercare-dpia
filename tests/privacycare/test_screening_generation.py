@@ -10,6 +10,23 @@
 # completeness computation happens for it — and that the gate is opt-in
 # (an unscreened declaration is never blocked).
 #
+# UPDATE (Task 2, plan 20, spec 2026-09-17-privacycare-20-screening-rekey):
+# Task 1 re-keyed the screening decision from a processing activity
+# (privacydeclaration) to a business process, because this customer runs 86
+# real business processes and only 2 declarations exist system-wide — the
+# privacy SME confirmed screening belongs on the actual operational unit,
+# not an invented stand-in. is_screened_out() now takes a
+# business_process_id. This file's job widens accordingly: it pins that
+# run_generation resolves a GenerationTarget's declaration_id through
+# privacycare_process_declaration to find the business process(es) that
+# process it, reads THEIR verdict, and stays opt-in at the new boundary too
+# — a declaration with no row in that link table at all is never blocked.
+# Only one such link exists in the whole system as of this task (Task 4 of
+# this plan is what populates the rest), so every test here that needs the
+# gate to see a process at all seeds its own business process and its own
+# link, rather than depending on live data that would make the test pass
+# vacuously.
+#
 # run_generation commits repeatedly by design (see tasks.py's own
 # docstring), so this file reuses test_tasks.py's savepoint-based `db`
 # fixture rather than the plain rollback-only fixture test_screening_gate.py
@@ -66,17 +83,57 @@ def _seed_trigger(db, key: str = "large_scale") -> None:  # noqa: F811
     )
 
 
-def _screen_out(db, declaration_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
+def _seed_business_process(db, name: str, business_cycle: str) -> str:  # noqa: F811
+    """Seeds one of the customer's own business processes (her register,
+    not a generic fixture name) — Task 1 re-pointed the screening decision
+    at privacycare_business_process, not privacydeclaration, so this is the
+    table a decision needs a real row in. Same helper, same reasoning, as
+    test_screening_gate.py's own _seed_business_process."""
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, business_cycle) "
+            "VALUES (:id, :name, :cycle)"
+        ),
+        {"id": process_id, "name": name, "cycle": business_cycle},
+    )
+    return process_id
+
+
+def _link(db, process_id: str, declaration_id: str) -> None:  # noqa: F811
+    """Seeds one privacycare_process_declaration row: this business process
+    processes data under this declaration. This is the join run_generation's
+    gate now resolves an activity's declaration_id through to find its
+    business process(es) — see tasks.py's _is_activity_screened_out. Only
+    one such link exists in the whole system as of this task (Task 4 of
+    this plan is what populates the rest), so a test that wants the gate to
+    see a process at all must seed this itself rather than rely on live
+    data, which would make the test pass vacuously."""
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_process_declaration "
+            "(id, business_process_id, privacy_declaration_id) "
+            "VALUES (:id, :process_id, :declaration_id)"
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "process_id": process_id,
+            "declaration_id": declaration_id,
+        },
+    )
+
+
+def _screen_out(db, business_process_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
     record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=[],
         justification="No processing risk identified.",
         decided_by=decided_by,
     )
 
 
-def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int) -> None:  # noqa: F811
+def _backdate(db, business_process_id: str, triggered_keys: list[str], *, hours: int) -> None:  # noqa: F811
     """Pushes one decision's decided_at into the past by hand. Postgres'
     now() (this column's server_default) is the TRANSACTION's start time,
     not the statement's, and this test's session shares one transaction
@@ -89,17 +146,17 @@ def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int)
         sqlalchemy.text(
             "UPDATE privacycare_screening_decision "
             "SET decided_at = decided_at - (:hours || ' hours')::interval "
-            "WHERE declaration_id = :decl_id AND triggered_keys = :keys"
+            "WHERE business_process_id = :process_id AND triggered_keys = :keys"
         ),
-        {"hours": hours, "decl_id": declaration_id, "keys": triggered_keys},
+        {"hours": hours, "process_id": business_process_id, "keys": triggered_keys},
     )
 
 
-def _screen_in(db, declaration_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
+def _screen_in(db, business_process_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
     _seed_trigger(db, "large_scale")
     record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=["large_scale"],
         justification=None,
         decided_by=decided_by,
@@ -110,7 +167,9 @@ def test_a_screened_out_declaration_produces_no_assessment(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
-    _screen_out(db, decl_id)
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _link(db, process_id, decl_id)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -137,7 +196,9 @@ def test_a_screened_in_declaration_generates_exactly_as_before(db):  # noqa: F81
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
-    _screen_in(db, decl_id)
+    process_id = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, process_id, decl_id)
+    _screen_in(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -156,9 +217,10 @@ def test_a_screened_in_declaration_generates_exactly_as_before(db):  # noqa: F81
 
 
 def test_an_unscreened_declaration_is_not_blocked(db):  # noqa: F811
-    # The gate is opt-in: a declaration that has never been screened at all
-    # must generate exactly as if the gate did not exist. Getting this
-    # backwards would silently halt every existing workflow.
+    # The gate is opt-in: a declaration that has never been screened at all,
+    # and that has no link to any business process either, must generate
+    # exactly as if the gate did not exist. Getting this backwards would
+    # silently halt every existing workflow.
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
@@ -178,12 +240,50 @@ def test_an_unscreened_declaration_is_not_blocked(db):  # noqa: F811
     assert row["completed_count"] == 1
 
 
+def test_a_declaration_with_no_process_link_is_not_blocked_even_when_a_process_is_screened_out(
+    db,  # noqa: F811
+):
+    # The gate is opt-in at the NEW boundary too (Task 2, plan 20): the
+    # verdict now lives on a business process, reached through
+    # privacycare_process_declaration. A business process being screened
+    # out must never reach past its own linked declarations and block an
+    # UNLINKED one — that is the same "an unscreened activity is not
+    # blocked" contract as the test above, but this is the one that would
+    # actually fail if run_generation's join leaked across declarations
+    # (e.g. by screening every declaration on the same system, or by
+    # forgetting the join entirely and matching everything).
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    unlinked_decl = _seed_declaration(db, sid, "marketing.advertising")
+    linked_decl = _seed_declaration(db, sid, "essential.service.payment_processing")
+    process_id = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    _link(db, process_id, linked_decl)
+    _screen_out(db, process_id)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assessments = _assessments_for_task(db, task_id)
+    assert len(assessments) == 1
+    assert assessments[0]["declaration_id"] == unlinked_decl
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["total_count"] == 2
+    assert row["completed_count"] == 1
+
+
 def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     in_decl = _seed_declaration(db, sid, "marketing.advertising")
     out_decl = _seed_declaration(db, sid, "essential.service.payment_processing")
-    _screen_out(db, out_decl)
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _link(db, process_id, out_decl)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -219,7 +319,9 @@ def test_a_screened_out_target_is_not_reported_as_a_failure(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
-    _screen_out(db, decl_id)
+    process_id = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, process_id, decl_id)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -264,7 +366,9 @@ def test_a_run_with_zero_completions_from_both_skips_and_failures_names_both(
     sid = _seed_system(db, key)
     out_decl = _seed_declaration(db, sid, "marketing.advertising")
     fail_decl = _seed_declaration(db, sid, "essential.service.payment_processing")
-    _screen_out(db, out_decl)
+    process_id = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    _link(db, process_id, out_decl)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -297,8 +401,10 @@ def test_re_screening_a_declaration_back_in_lets_the_next_run_generate(db):  # n
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
-    _screen_out(db, decl_id)
-    _backdate(db, decl_id, [], hours=1)
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _link(db, process_id, decl_id)
+    _screen_out(db, process_id)
+    _backdate(db, process_id, [], hours=1)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -308,7 +414,7 @@ def test_re_screening_a_declaration_back_in_lets_the_next_run_generate(db):  # n
     run_generation(db, first_task)
     assert _assessments_for_task(db, first_task) == []
 
-    _screen_in(db, decl_id, decided_by="michael@example.com")
+    _screen_in(db, process_id, decided_by="michael@example.com")
 
     second_task = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
     db.flush()
@@ -335,8 +441,10 @@ def test_a_run_that_skips_two_targets_records_two(db):  # noqa: F811
     _seed_declaration(db, sid, "marketing.advertising")  # kept, unscreened
     out_decl_1 = _seed_declaration(db, sid, "essential.service.payment_processing")
     out_decl_2 = _seed_declaration(db, sid, "essential.service")
-    _screen_out(db, out_decl_1)
-    _screen_out(db, out_decl_2)
+    process_id = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, process_id, out_decl_1)
+    _link(db, process_id, out_decl_2)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -384,8 +492,10 @@ def test_the_persisted_count_matches_the_task_message(db):  # noqa: F811
     _seed_declaration(db, sid, "marketing.advertising")
     out_decl_1 = _seed_declaration(db, sid, "essential.service.payment_processing")
     out_decl_2 = _seed_declaration(db, sid, "essential.service")
-    _screen_out(db, out_decl_1)
-    _screen_out(db, out_decl_2)
+    process_id = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    _link(db, process_id, out_decl_1)
+    _link(db, process_id, out_decl_2)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -406,7 +516,9 @@ def test_re_running_generation_for_the_same_task_does_not_duplicate_the_skip_row
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
-    _screen_out(db, decl_id)
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _link(db, process_id, decl_id)
+    _screen_out(db, process_id)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     db.flush()
@@ -480,11 +592,14 @@ def test_a_crash_after_real_skips_does_not_report_zero_skipped(
     # (_run_wrapper, same helper test_tasks.py's own wrapper tests use) so
     # both the accrual and the failure path are exercised as they actually
     # run in production, not reimplemented by hand. Two declarations are
-    # screened out for real; a third's is_screened_out lookup is made to
-    # raise, simulating exactly the "transient database error mid-loop"
-    # scenario the finding describes — is_screened_out is called directly
-    # in the for loop, outside every per-target try/except, so this
-    # exception escapes run_generation entirely.
+    # screened out for real (each linked to its own business process,
+    # since Task 2 resolves the verdict through
+    # privacycare_process_declaration now, not off the declaration
+    # directly); a third's gate resolution is made to raise, simulating
+    # exactly the "transient database error mid-loop" scenario the finding
+    # describes — the gate check (now _is_activity_screened_out) is called
+    # directly in the for loop, outside every per-target try/except, so
+    # this exception escapes run_generation entirely.
     from fides.api.privacycare import tasks as tasks_module
 
     key = f"sys-{uuid.uuid4().hex[:6]}"
@@ -492,8 +607,12 @@ def test_a_crash_after_real_skips_does_not_report_zero_skipped(
     out_decl_1 = _seed_declaration(db, sid, "a.screened.one")
     out_decl_2 = _seed_declaration(db, sid, "b.screened.two")
     crash_decl = _seed_declaration(db, sid, "c.crashes")
-    _screen_out(db, out_decl_1)
-    _screen_out(db, out_decl_2)
+    process_1 = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    process_2 = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, process_1, out_decl_1)
+    _link(db, process_2, out_decl_2)
+    _screen_out(db, process_1)
+    _screen_out(db, process_2)
     atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
     _full_coverage_template(db, atype)
     task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
@@ -503,14 +622,16 @@ def test_a_crash_after_real_skips_does_not_report_zero_skipped(
     # and an uncommitted seed would vanish with it.
     db.commit()
 
-    real_is_screened_out = tasks_module.is_screened_out
+    real_is_activity_screened_out = tasks_module._is_activity_screened_out
 
     def _screened_out_then_boom(db_, declaration_id):
         if declaration_id == crash_decl:
             raise RuntimeError("transient database error")
-        return real_is_screened_out(db_, declaration_id)
+        return real_is_activity_screened_out(db_, declaration_id)
 
-    monkeypatch.setattr(tasks_module, "is_screened_out", _screened_out_then_boom)
+    monkeypatch.setattr(
+        tasks_module, "_is_activity_screened_out", _screened_out_then_boom
+    )
 
     with pytest.raises(RuntimeError, match="transient database error"):
         _run_wrapper(db, task_id)

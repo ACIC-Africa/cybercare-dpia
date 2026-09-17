@@ -140,6 +140,70 @@ _SKIPPED_FOR_TASK_SQL = sqlalchemy.text(
     "SELECT skipped_count FROM privacycare_generation_skip WHERE task_id = :task_id"
 )
 
+# Task 1 (plan 20, spec 2026-09-17-privacycare-20-screening-rekey) re-keyed
+# privacycare_screening_decision, and so is_screened_out(), from a
+# processing activity (privacydeclaration) to a business process: this
+# customer runs 86 real business processes and only 2 declarations exist
+# system-wide, and the privacy SME confirmed screening belongs on the
+# actual operational unit. This is the join _is_activity_screened_out below
+# uses to resolve a GenerationTarget's declaration_id to the process(es)
+# that process it.
+_BUSINESS_PROCESSES_FOR_DECLARATION_SQL = sqlalchemy.text(
+    "SELECT business_process_id FROM privacycare_process_declaration "
+    "WHERE privacy_declaration_id = :declaration_id"
+)
+
+
+def _is_activity_screened_out(db: Session, declaration_id: str) -> bool:
+    """Whether the activity behind this generation target should be
+    skipped, resolved through privacycare_process_declaration.
+
+    Before Task 2 of this plan, this call site passed a declaration_id
+    straight into is_screened_out(), which Task 1 had already re-keyed to
+    expect a business_process_id. That mismatch never crashed —
+    is_screened_out() has no existence check, it just finds zero decision
+    rows for an id that matches nothing and returns False — so it silently
+    evaluated to "not screened out" for every activity, no error, no log,
+    no signal. Every activity would have generated, including ones an
+    officer had explicitly marked not applicable, and nobody would have
+    gone looking, because a silent wrong answer never complains. This
+    function is what closes that: it resolves the declaration to the real
+    business process(es) linked to it (privacycare_process_declaration,
+    written by link_process_declarations in api/processes.py) and asks
+    is_screened_out() about THOSE, which is what it has always actually
+    needed.
+
+    The gate stays opt-in at this new boundary, exactly as it already is at
+    is_screened_out()'s own: a declaration with NO row in
+    privacycare_process_declaration at all is not screened — it generates
+    exactly as if the gate did not exist. Today only one such link exists
+    in the whole system (Task 4 of this plan is what populates the rest),
+    so almost every activity is in this state, and getting this backwards
+    would silently halt nearly every existing workflow.
+
+    A declaration CAN, in principle, be linked to more than one business
+    process — the link table's unique constraint is on the (process,
+    declaration) pair, not on the declaration alone, so two different
+    processes are free to name the same underlying activity. Skipping
+    generation is the stronger claim ("no DPIA needed for this activity at
+    all"), so it is only made when EVERY linked process currently screens
+    out; one linked process that has not been screened out (or has never
+    been screened) is enough to let the activity generate. That keeps the
+    same error direction plan 18's opt-in default already chose:
+    generating an assessment nobody strictly needed is recoverable, a
+    missing one is not.
+    """
+    process_ids = [
+        row[0]
+        for row in db.execute(
+            _BUSINESS_PROCESSES_FOR_DECLARATION_SQL,
+            {"declaration_id": declaration_id},
+        ).all()
+    ]
+    if not process_ids:
+        return False
+    return all(is_screened_out(db, process_id) for process_id in process_ids)
+
 
 def _assessment_name(target: GenerationTarget) -> str:
     """What the DPO sees on the assessment card.
@@ -250,15 +314,20 @@ def run_generation(db: Session, task_id: str) -> None:
     below): a single system's gateway refusal must not discard the other
     forty-nine. The run reports `error` only when it produced nothing.
 
-    Before any of that, a target whose declaration is screened OUT
-    (screening/gate.py's is_screened_out) is skipped entirely: no
-    assessment row, no LLM call, no completeness computation. In Fides
-    today "prior consultation" is asked six times inside GDPR question
-    text and enforced nowhere; a screening verdict this task recorded but
-    never acted on would be the same defect wearing our own badge. A skip
-    is not a failure — it is counted and reported on its own terms (see
-    the `skipped` handling below and _finish's message), and the gate is
-    opt-in: a declaration that has never been screened is never blocked.
+    Before any of that, a target whose ACTIVITY is screened OUT is skipped
+    entirely: no assessment row, no LLM call, no completeness computation.
+    The verdict itself lives on a business process (screening/gate.py's
+    is_screened_out, re-keyed by Task 1 of plan 20), reached from this
+    target's declaration_id through privacycare_process_declaration — see
+    _is_activity_screened_out for that resolution and why it stays opt-in
+    at the new boundary. In Fides today "prior consultation" is asked six
+    times inside GDPR question text and enforced nowhere; a screening
+    verdict this task recorded but never acted on would be the same defect
+    wearing our own badge. A skip is not a failure — it is counted and
+    reported on its own terms (see the `skipped` handling below and
+    _finish's message), and the gate is opt-in: an activity with no linked
+    business process, or a business process that has never been screened,
+    is never blocked.
     """
     task = db.execute(_LOAD_TASK_SQL, {"task_id": task_id}).mappings().first()
     if task is None:
@@ -320,12 +389,12 @@ def run_generation(db: Session, task_id: str) -> None:
         # produced. Counted against `skipped`, not `failures`: reporting a
         # screen-out as an error would tell whoever ran this task something
         # false about their own estate.
-        if is_screened_out(db, target.declaration_id):
+        if _is_activity_screened_out(db, target.declaration_id):
             skipped += len(templates)
             # Fix round 1 (coordinator review, Important finding): persisted
             # and committed HERE, immediately — not only at the run's final
-            # _finish call. is_screened_out() above sits outside every
-            # per-target try/except (see this loop's own comment), so an
+            # _finish call. _is_activity_screened_out() above sits outside
+            # every per-target try/except (see this loop's own comment), so an
             # exception on the very NEXT target, or anywhere else between
             # iterations, escapes run_generation entirely and _finish's
             # final call — the one call site that used to write this row —
