@@ -31,7 +31,7 @@ from tests.privacycare.test_tasks import (
 )
 
 
-def _seed_trigger(db, key: str = "large_scale") -> None:
+def _seed_trigger(db, key: str = "large_scale") -> None:  # noqa: F811
     """The one trigger row needed to record a screen-IN decision. A
     screen-OUT needs no trigger row at all: record_decision's unknown-key
     check is only ever run against a non-empty triggered_keys list.
@@ -61,7 +61,7 @@ def _seed_trigger(db, key: str = "large_scale") -> None:
     )
 
 
-def _screen_out(db, declaration_id: str, *, decided_by="carol@example.com") -> None:
+def _screen_out(db, declaration_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
     record_decision(
         db,
         declaration_id=declaration_id,
@@ -71,7 +71,7 @@ def _screen_out(db, declaration_id: str, *, decided_by="carol@example.com") -> N
     )
 
 
-def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int) -> None:
+def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int) -> None:  # noqa: F811
     """Pushes one decision's decided_at into the past by hand. Postgres'
     now() (this column's server_default) is the TRANSACTION's start time,
     not the statement's, and this test's session shares one transaction
@@ -90,7 +90,7 @@ def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int)
     )
 
 
-def _screen_in(db, declaration_id: str, *, decided_by="carol@example.com") -> None:
+def _screen_in(db, declaration_id: str, *, decided_by="carol@example.com") -> None:  # noqa: F811
     _seed_trigger(db, "large_scale")
     record_decision(
         db,
@@ -101,7 +101,7 @@ def _screen_in(db, declaration_id: str, *, decided_by="carol@example.com") -> No
     )
 
 
-def test_a_screened_out_declaration_produces_no_assessment(db):
+def test_a_screened_out_declaration_produces_no_assessment(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
@@ -128,7 +128,7 @@ def test_a_screened_out_declaration_produces_no_assessment(db):
     assert "screen" in row["message"].lower()
 
 
-def test_a_screened_in_declaration_generates_exactly_as_before(db):
+def test_a_screened_in_declaration_generates_exactly_as_before(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
@@ -150,7 +150,7 @@ def test_a_screened_in_declaration_generates_exactly_as_before(db):
     assert row["completed_count"] == 1
 
 
-def test_an_unscreened_declaration_is_not_blocked(db):
+def test_an_unscreened_declaration_is_not_blocked(db):  # noqa: F811
     # The gate is opt-in: a declaration that has never been screened at all
     # must generate exactly as if the gate did not exist. Getting this
     # backwards would silently halt every existing workflow.
@@ -173,7 +173,7 @@ def test_an_unscreened_declaration_is_not_blocked(db):
     assert row["completed_count"] == 1
 
 
-def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):
+def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     in_decl = _seed_declaration(db, sid, "marketing.advertising")
@@ -203,7 +203,7 @@ def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):
     assert "fail" not in row["message"].lower()
 
 
-def test_a_screened_out_target_is_not_reported_as_a_failure(db):
+def test_a_screened_out_target_is_not_reported_as_a_failure(db):  # noqa: F811
     # Fix round 1 (Finding 2, minor): this test used to assert only
     # status/message and never that the target was actually skipped — it
     # would have kept passing even if the gate check were deleted entirely,
@@ -236,7 +236,7 @@ def test_a_screened_out_target_is_not_reported_as_a_failure(db):
 
 
 def test_a_run_with_zero_completions_from_both_skips_and_failures_names_both(
-    db, monkeypatch
+    db, monkeypatch  # noqa: F811
 ):
     # Fix round 1 (Finding 1, important): with completed==0, the old
     # completed==0 branch fell straight into `if failures:` and wrote "All
@@ -284,7 +284,7 @@ def test_a_run_with_zero_completions_from_both_skips_and_failures_names_both(
     )
 
 
-def test_re_screening_a_declaration_back_in_lets_the_next_run_generate(db):
+def test_re_screening_a_declaration_back_in_lets_the_next_run_generate(db):  # noqa: F811
     # The append-only rule doing real work: the old screen-out row still
     # exists (record_decision never updates), and current_verdict reads the
     # newest — so re-screening in must let a LATER run proceed even though
