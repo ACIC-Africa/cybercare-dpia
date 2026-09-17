@@ -276,6 +276,49 @@ describe("MappingStepForm — pickers speak her language, not fides-key (C1)", (
       await screen.findByText("Analytics for Advertising Performance"),
     ).toBeInTheDocument();
   });
+
+  it("shows the purpose's human name on reopen, not the raw fides_key, with no interaction (fix wave round 2)", async () => {
+    // The exact bug the review caught in a live browser: reopening Fuel
+    // Card Issuance's mapping rendered the Purpose field as the literal
+    // string "essential.legal_obligation". DataCategorySelect and
+    // DataSubjectSelect both set an option `label`; DataUseSelect never
+    // did, so its OPEN dropdown (rendered via TaxonomySelect's own
+    // optionRender, which reads name/primaryName directly) looked fixed
+    // while its CLOSED/selected display — which AntD renders from
+    // `option.label` — fell back to the bare value. A value loaded via
+    // prefill and never re-picked in this session is exactly the case
+    // that only shows up on reopen, which is why the three "search finds
+    // it" tests above never caught this.
+    mockGetDataMappingQuery.mockReturnValue({
+      data: {
+        business_process_id: "bp_94d5439ced86",
+        mapping: {
+          business_process_id: "bp_94d5439ced86",
+          privacy_declaration_id: "pri_3",
+          system_id: "sys_1",
+          name: "Fuel Card Issuance",
+          data_subjects: ["customer"],
+          data_categories: ["user.financial"],
+          ground: null,
+          fides_legal_basis: null,
+          purpose: "essential.legal_obligation",
+          retention_period: null,
+          third_parties: null,
+          processes_special_category_data: false,
+          created: false,
+        },
+      },
+      isLoading: false,
+      isError: false,
+      refetch: jest.fn(),
+    });
+
+    renderForm();
+
+    const picker = await screen.findByTestId("input-purpose");
+    expect(picker).toHaveTextContent("Legal Obligation");
+    expect(picker).not.toHaveTextContent("essential.legal_obligation");
+  });
 });
 
 describe("MappingStepForm — the lawful basis she recorded prefills (I1)", () => {
