@@ -219,10 +219,20 @@ def test_seeding_twice_does_not_duplicate(db, monkeypatch):
     written_second_time = cli.seed_screening_triggers(db)
 
     assert written_second_time == 0
-    assert _trigger_count(db) == 12, (
-        "6 real (Task 5's committed rows) + 6 test-suffixed rows this test "
-        "itself inserted"
-    )
+    # Counting only this test's own __test_content_copy-suffixed rows
+    # (rather than the table's total) keeps this DB-state-independent, same
+    # discipline as every sibling fix in this commit: on a from-empty
+    # database (CI, or a fresh dev box before Task 5's --commit seed has
+    # run) there are no real rows at all, and asserting a hardcoded 12
+    # would fail there even though seeding-twice-does-not-duplicate still
+    # holds.
+    test_row_count = db.execute(
+        sqlalchemy.text(
+            f"SELECT count(*) FROM privacycare_screening_trigger "
+            f"WHERE trigger_key LIKE '%{_TEST_KEY_SUFFIX}'"
+        )
+    ).scalar()
+    assert test_row_count == 6
 
 
 def test_exactly_six_triggers_are_seeded(db, monkeypatch):
