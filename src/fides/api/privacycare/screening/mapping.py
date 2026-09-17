@@ -67,9 +67,11 @@ otherwise.
 
 SPECIAL-CATEGORY DATA IS DERIVED, NOT TICKED. `processes_special_category_
 data` is computed from the chosen `data_categories` against the SAME
-ancestor-prefix walk over `ctl_data_categories.tags` that
-special_category.py's `derive_special_category` already uses for the read
-path (SPECIAL_TAG = "dpa2019:special_category") — reused here rather than
+ancestor-prefix walk over `ctl_data_categories.tags` that the TOP-LEVEL
+`privacycare/special_category.py` module's `derive_special_category`
+already uses for the read path (SPECIAL_TAG = "dpa2019:special_category") —
+that module lives directly under `privacycare/`, a sibling of this
+`screening/` package, not inside it — reused here rather than
 re-implemented, parameterised on the categories the caller is about to
 write rather than on an already-persisted declaration's row, because the
 flag has to be set atomically as part of the same INSERT/UPDATE.
@@ -202,8 +204,28 @@ class MappingResult:
     created: bool  # True the first time this route maps this process
 
 
+# FOR UPDATE (fix round 2, item I-2): the same lock-the-parent-row-before-
+# the-decision-that-follows-it discipline risk/register.py's sync_projection
+# already uses (api/answers.py's _LOCK_ASSESSMENT_SQL, api/assessments.py's
+# _LOCK_ASSESSMENT_ROW_SQL) — take the lock BEFORE the read that decides
+# create-vs-update, not just before a write. Without it, two concurrent
+# calls for the SAME business_process_id (a double-click, a UI retry) both
+# run _EXISTING_ROUTE_ACTIVITY_SQL under READ COMMITTED, both find no
+# marked activity, and both take the create branch: the process ends up
+# with two marker-carrying activities, and every later resubmit updates
+# only the earliest (_EXISTING_ROUTE_ACTIVITY_SQL's own created_at/id
+# tie-break), leaving the second permanently stranded — still a real
+# generation target, still capable of producing a spurious DPIA. This
+# SELECT is the first statement save_mapping runs (it also IS the existence
+# check), so the lock is held for the rest of the transaction: a second
+# transaction's own SELECT ... FOR UPDATE against the same row blocks here
+# until the first commits or rolls back, and once unblocked it re-reads
+# (via its own _EXISTING_ROUTE_ACTIVITY_SQL, run only after this lock is
+# acquired) the post-commit state — including the first transaction's own
+# newly-marked activity — rather than a stale pre-commit snapshot. No
+# migration: this locks an existing row, it does not touch schema.
 _BUSINESS_PROCESS_NAME_SQL = sqlalchemy.text(
-    "SELECT name FROM privacycare_business_process WHERE id = :id"
+    "SELECT name FROM privacycare_business_process WHERE id = :id FOR UPDATE"
 )
 
 _VALID_SUBJECTS_SQL = sqlalchemy.text(
@@ -219,8 +241,9 @@ _GROUND_SQL = sqlalchemy.text(
     "WHERE ground = :ground"
 )
 
-# Mirrors special_category.py's _TRIGGERING_KEYS_SQL exactly (same ancestor-
-# prefix walk, same tag), parameterised on the categories about to be
+# Mirrors the top-level privacycare/special_category.py module's
+# _TRIGGERING_KEYS_SQL exactly (same ancestor-prefix walk, same tag),
+# parameterised on the categories about to be
 # WRITTEN rather than on an already-persisted declaration's own
 # data_categories column, because this runs BEFORE the row exists (on
 # create) or as part of the same statement's value computation (on update)
@@ -354,10 +377,21 @@ def _is_special_category(db: Session, data_categories: List[str]) -> bool:
     return row is not None
 
 
-def _system_id_for_process(db: Session, business_process_id: str, process_name: str) -> str:
-    existing = db.execute(
+def existing_system_id_for_process(db: Session, business_process_id: str) -> Optional[str]:
+    """The system id ANY existing activity linked to this process already
+    uses, or None if the process has none yet. PUBLIC (no leading
+    underscore) — api/screening.py's own system-write authorisation
+    dependency (fix round 2, item I-3) calls this to resolve which
+    ctl_systems row a caller would need SYSTEM_UPDATE rights on, using the
+    EXACT SAME query _system_id_for_process itself reads from, so the two
+    can never disagree about which system a mapping call is about to touch."""
+    return db.execute(
         _ANY_SYSTEM_FOR_PROCESS_SQL, {"business_process_id": business_process_id}
     ).scalar()
+
+
+def _system_id_for_process(db: Session, business_process_id: str, process_name: str) -> str:
+    existing = existing_system_id_for_process(db, business_process_id)
     if existing is not None:
         return existing
 

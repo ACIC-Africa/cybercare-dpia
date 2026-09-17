@@ -66,12 +66,25 @@ has no check to defer to at all — the list route (below) has nothing to
 """
 from fastapi import Depends, HTTPException, Security
 from fastapi import status as status_codes
+from fastapi.security import SecurityScopes
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from fides.api.deps import get_db
 from fides.api.models.client import ClientDetail
-from fides.api.oauth.utils import verify_oauth_client
+from fides.api.models.sql_models import System  # type: ignore[attr-defined]
+from fides.api.oauth.system_manager_oauth_util import (
+    SystemAuthContainer,
+    has_system_permissions,
+)
+from fides.api.oauth.utils import (
+    PermissionCheckerCallback,
+    _resolve_depends,
+    extract_token_and_load_client,
+    get_permission_checker,
+    oauth2_scheme,
+    verify_oauth_client,
+)
 from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_screening_router
 from fides.api.privacycare.api.screening_schemas import (
@@ -93,10 +106,15 @@ from fides.api.privacycare.screening.gate import (
     list_triggers,
     record_decision,
 )
-from fides.api.privacycare.screening.mapping import MappingResult, save_mapping
+from fides.api.privacycare.screening.mapping import (
+    MappingResult,
+    existing_system_id_for_process,
+    save_mapping,
+)
 from fides.common.scope_registry import (
     PRIVACYCARE_SCREENING_CREATE,
     PRIVACYCARE_SCREENING_READ,
+    SYSTEM_UPDATE,
 )
 
 # A local copy of gate.py's own private _BUSINESS_PROCESS_EXISTS_SQL — see
@@ -387,9 +405,75 @@ def record_screening_decision(
     return _response_from_verdict(verdict)
 
 
+# fix round 2, item I-3 (SECURITY). This route writes ctl_systems and
+# privacydeclaration — an Ethyca table, the customer's own Fides system
+# inventory and processing activities — but was authorised behind
+# PRIVACYCARE_SCREENING_CREATE alone. grounds.py deliberately does the
+# opposite for a write to the SAME privacycare_declaration_ground table
+# (see its own verify_oauth_client_for_declaration_system): it also
+# requires Fides' own system-write authorisation — global SYSTEM_UPDATE,
+# OR system-manager rights on the specific system, via has_system_
+# permissions. Left as PRIVACYCARE_SCREENING_CREATE alone, an M2M client
+# minted with only that one scope could create systems and processing
+# activities in the customer's Fides estate through this route, which no
+# Ethyca endpoint would let it do. Role-based callers are unaffected —
+# Owner and Contributor already hold both scopes — so requiring this
+# costs real users nothing.
+#
+# _system_for_business_process_mapping mirrors grounds.py's own
+# _system_for_declaration exactly, keyed to business_process_id (this
+# route's own path parameter) instead of declaration_id, and resolved
+# through mapping.existing_system_id_for_process — the SAME query
+# mapping.py's own _system_id_for_process reads, so this dependency and
+# the write path it is gating can never disagree about which system a
+# call is about to touch. A process with NO existing system yet (84 of
+# 86 today) resolves system=None, which has_system_permissions reads as
+# "not a manager of it" — so provisioning a BRAND NEW system requires the
+# GLOBAL scope, never a per-system grant that could not possibly have been
+# made for a system that does not exist yet. Same "unknown/absent ->
+# system=None -> global scope only" order grounds.py's own docstring
+# already documents and accepts for the identical situation.
+def _system_for_business_process_mapping(
+    business_process_id: str, db: Session = Depends(get_db)
+) -> SystemAuthContainer:
+    system_id = existing_system_id_for_process(db, business_process_id)
+    system = (
+        db.query(System).filter(System.id == system_id).first()
+        if system_id is not None
+        else None
+    )
+    return SystemAuthContainer(original_data=business_process_id, system=system)
+
+
+async def verify_oauth_client_for_business_process_mapping(
+    security_scopes: SecurityScopes,
+    authorization: str = Security(oauth2_scheme),
+    db: Session = Depends(get_db),
+    system_auth_data: SystemAuthContainer = Depends(_system_for_business_process_mapping),
+    permission_checker: PermissionCheckerCallback = Depends(get_permission_checker),
+) -> ClientDetail:
+    """Authorise this write the way Fides authorises its own system writes
+    — see the module-level comment just above for why. Reuses has_system_
+    permissions (Fides' own helper) rather than restating its rules, same
+    reasoning grounds.py's identically-shaped dependency gives."""
+    permission_checker = _resolve_depends(permission_checker, get_permission_checker)
+    has_system_permissions(
+        system_auth_data=system_auth_data,
+        authorization=authorization,
+        security_scopes=security_scopes,
+        db=db,
+        permission_checker=permission_checker,
+    )
+    _, client = extract_token_and_load_client(authorization, db)
+    return client
+
+
 @privacycare_screening_router.post(
     "/{business_process_id}/mapping",
-    dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_SCREENING_CREATE])],
+    dependencies=[
+        Security(verify_oauth_client, scopes=[PRIVACYCARE_SCREENING_CREATE]),
+        Security(verify_oauth_client_for_business_process_mapping, scopes=[SYSTEM_UPDATE]),
+    ],
     response_model=DataMappingResponse,
     status_code=status_codes.HTTP_201_CREATED,
 )
@@ -409,11 +493,11 @@ def save_data_mapping(
     created for it (see mapping.py's own module docstring for why
     idempotency is keyed to the activity, never to the process).
 
-    Reuses PRIVACYCARE_SCREENING_CREATE — the one write scope this whole
-    surface already has — rather than introducing a second write scope for
-    what is still, structurally, one more way of recording facts about a
-    business process's screening/assessability. No new scope was named in
-    this task's brief.
+    Requires BOTH PRIVACYCARE_SCREENING_CREATE (this whole surface's one
+    write scope) AND Fides' own system-write authorisation (fix round 2,
+    item I-3 — see the two dependency functions just above this route).
+    Role-based callers are unaffected: Owner and Contributor already hold
+    both PRIVACYCARE_SCREENING_CREATE and SYSTEM_UPDATE.
 
     Same ValueError-to-status-code split as record_screening_decision just
     above: save_mapping's own existence check raises "no such business
@@ -451,5 +535,35 @@ def save_data_mapping(
             else status_codes.HTTP_400_BAD_REQUEST
         )
         raise HTTPException(status_code=status_code, detail=detail) from exc
+    except LookupError as exc:
+        # fix round 2, item M-6: defense in depth. save_mapping only ever
+        # reaches grounds.py's _record_declaration_ground after validating
+        # the SAME declaration_id/ground_id itself, so this branch is
+        # unreachable by construction today — but if it ever did fire
+        # (only conceivable under a genuine invariant break, e.g. a row
+        # vanishing mid-transaction), it must roll back and return a real
+        # HTTPException rather than an unhandled 500 with no rollback on
+        # the way out, same as every other failure path on this route.
+        db.rollback()
+        raise HTTPException(
+            status_code=status_codes.HTTP_404_NOT_FOUND,
+            detail=f"ground provenance could not be recorded: no such {exc}",
+        ) from exc
+    except PermissionError as exc:
+        # Same defense-in-depth reasoning as the LookupError branch above —
+        # save_mapping writes legal_basis_for_processing from this SAME
+        # ground immediately before calling _record_declaration_ground, so
+        # its own consistency check passes by construction; this exists
+        # only so an invariant break surfaces as a real HTTPException, not
+        # a bare 500.
+        db.rollback()
+        raise HTTPException(
+            status_code=status_codes.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "the derived legal basis does not agree with the ground's "
+                f"class ({exc.args[0]!r}); this should not happen — please "
+                "retry the mapping"
+            ),
+        ) from exc
     db.commit()
     return _response_from_mapping(result)
