@@ -210,6 +210,29 @@ mapped" and must not be confused with it (see api/screening.py's own
 `_response_from_mapping`-adjacent handling for how the route surfaces that
 distinction as 200-with-null rather than 404).
 
+THE GROUND IS RESOLVED ON READ, NOT JUST ON WRITE (fix wave, item I1). The
+first cut of `get_mapping` passed `ground=None` unconditionally into
+`_result_from_row`, on the theory that "a read never names a ground" — true,
+but it confused "this call did not SUPPLY a ground" (correct for a read)
+with "no ground is known" (false whenever a previous `save_mapping` call
+already recorded one). The practical effect: reopening a saved mapping
+always showed an empty Lawful basis picker, even for an activity whose
+provenance — "why is this on Legitimate interests?" — is sitting right there
+in `privacycare_declaration_ground`, recorded for exactly this reason (see
+"THE PROVENANCE IS WRITTEN, NOT JUST THE DERIVED VALUE" above). `get_mapping`
+now resolves the ground's own TEXT for the read path by joining through
+`privacycare_declaration_ground` to `privacycare_processing_ground.ground`
+(`_DECLARATION_GROUND_TEXT_SQL` below) — the same two tables
+grounds.py's own `_SELECT_DECLARATION_GROUND_SQL` joins, for the same
+reason: `privacycare_declaration_ground` carries no FK to
+`privacydeclaration` (an ordinary edit re-creates a declaration under a new
+id and strands the ground row behind it), so the join to `privacydeclaration`
+is load-bearing, not decoration — a stranded provenance row must resolve to
+"no ground recorded" (NULL from the join), not to a ground that no longer
+describes this activity. `save_mapping`'s own `ground=ground` echo (what
+THIS call supplied) is unchanged — only the read path changes, because only
+the read path had a stored answer it was throwing away.
+
 All raw SQL, all bound parameters, never a commit — the caller's session
 boundary decides, same rule as gate.py, risk/register.py and grounds.py.
 """
@@ -462,6 +485,24 @@ _SELECT_DECLARATION_SQL = sqlalchemy.text(
     "FROM privacydeclaration WHERE id = :id"
 )
 
+# fix wave, item I1: resolves the ground's own TEXT for get_mapping's read
+# path — the column that lets "why is this on Legitimate interests?" have an
+# answer, which save_mapping writes (via grounds.py's own
+# _record_declaration_ground) but the read path never consulted until now.
+# The join to privacydeclaration is load-bearing, not decoration, for the
+# SAME reason grounds.py's own _SELECT_DECLARATION_GROUND_SQL carries it:
+# privacycare_declaration_ground has no FK to privacydeclaration (Fides
+# matches declarations on the logical id data_use:name and deletes/recreates
+# on an ordinary edit), so a stranded provenance row must resolve to no
+# ground here, not to a ground that no longer describes this activity.
+_DECLARATION_GROUND_TEXT_SQL = sqlalchemy.text(
+    "SELECT pg.ground "
+    "FROM privacycare_declaration_ground dg "
+    "JOIN privacycare_processing_ground pg ON pg.id = dg.processing_ground_id "
+    "JOIN privacydeclaration pd ON pd.id = dg.privacy_declaration_id "
+    "WHERE dg.privacy_declaration_id = :declaration_id"
+)
+
 
 def _unknown_values(db: Session, sql, keys: List[str]) -> List[str]:
     valid = {row[0] for row in db.execute(sql, {"keys": keys}).all()}
@@ -701,13 +742,16 @@ def _result_from_row(
         name=row["name"],
         data_subjects=list(row["data_subjects"] or []),
         data_categories=list(row["data_categories"] or []),
-        # The ground's own TEXT is not stored anywhere on privacydeclaration
-        # — only its derived fides_legal_basis is. This echoes what THIS
-        # call was given (None when this call did not name one, even if an
-        # earlier call already set the legal basis, or — on the get_mapping
-        # read path — always, since a read never "names" a ground at all);
-        # fides_legal_basis below always reflects the current persisted,
-        # derived value.
+        # The ground's own TEXT is not stored as a plain column anywhere on
+        # privacydeclaration — only its derived fides_legal_basis is.
+        # save_mapping passes what THIS call was given (None when this call
+        # did not name one, even if an earlier call already set the legal
+        # basis). get_mapping (fix wave, item I1) instead passes the ground
+        # RESOLVED from privacycare_declaration_ground — the persisted
+        # provenance, not "what this call supplied", because a read never
+        # supplies anything but must still be able to show what was already
+        # recorded. fides_legal_basis below always reflects the current
+        # persisted, derived value either way.
         ground=ground,
         fides_legal_basis=row["legal_basis_for_processing"],
         purpose=persisted_purpose,
@@ -745,6 +789,16 @@ def get_mapping(db: Session, business_process_id: str) -> Optional[MappingResult
     able to deadlock against each other, and a GET is not the caller who
     gets to decide create-vs-update, so it has nothing to protect by
     locking.
+
+    The returned `ground` (fix wave, item I1) is RESOLVED from
+    `privacycare_declaration_ground` — the persisted provenance a previous
+    `save_mapping` call may have written — not left None. Before this fix,
+    reopening a saved mapping always showed an empty lawful-basis picker,
+    even when the activity's own ground was recorded and its
+    `fides_legal_basis` (returned regardless, always) was sitting right
+    there beside it. `_DECLARATION_GROUND_TEXT_SQL`'s own comment carries
+    the full reasoning for why the join to `privacydeclaration` matters
+    here.
     """
     exists = db.execute(
         _BUSINESS_PROCESS_EXISTS_SQL, {"id": business_process_id}
@@ -761,7 +815,8 @@ def get_mapping(db: Session, business_process_id: str) -> Optional[MappingResult
 
     declaration_id = existing["declaration_id"]
     row = db.execute(_SELECT_DECLARATION_SQL, {"id": declaration_id}).mappings().first()
-    # ground=None: a read never "names" a ground this call — see
-    # _result_from_row's own comment on this field. created=False: a read
-    # never creates or updates anything.
-    return _result_from_row(business_process_id, declaration_id, row, ground=None, created=False)
+    ground = db.execute(
+        _DECLARATION_GROUND_TEXT_SQL, {"declaration_id": declaration_id}
+    ).scalar()
+    # created=False: a read never creates or updates anything.
+    return _result_from_row(business_process_id, declaration_id, row, ground=ground, created=False)

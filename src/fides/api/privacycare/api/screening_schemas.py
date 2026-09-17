@@ -168,14 +168,29 @@ class DataMappingRequest(BaseModel):
 
 
 class DataMappingResponse(BaseModel):
-    # Mirrors screening/mapping.MappingResult field-for-field. `ground` here
-    # echoes what THIS call was given (None if this call did not name one,
-    # even when an earlier call already derived and persisted a legal
-    # basis) — the ground's own text is not a stored column anywhere on
-    # privacydeclaration, only its DERIVED fides_legal_basis is, and
-    # fides_legal_basis always reflects the current persisted value
-    # regardless of what this particular call supplied. See
-    # screening/mapping.py's save_mapping docstring.
+    # Mirrors screening/mapping.MappingResult field-for-field. `ground`
+    # means something different depending on which route returned this
+    # model (fix wave, item I1 — the previous comment here documented only
+    # the POST behaviour, which is what let a GET's always-null ground go
+    # unnoticed as "working as designed" instead of as a bug):
+    #
+    # - POST .../mapping (save_mapping): echoes what THIS call was given —
+    #   None if this call did not name a ground, even when an earlier call
+    #   already derived and persisted a legal basis.
+    # - GET .../mapping (get_mapping): RESOLVED from the persisted
+    #   provenance in privacycare_declaration_ground — the ground a
+    #   previous save actually recorded, or None if none was ever recorded
+    #   (or the provenance row is stranded — see
+    #   screening/mapping.py's _DECLARATION_GROUND_TEXT_SQL). A read never
+    #   "supplies" a ground, but it must still be able to show what was
+    #   already chosen, which is the whole point of a mapping being
+    #   "saved and returned to".
+    #
+    # Either way, the ground's own text is not a stored column anywhere on
+    # privacydeclaration — only its DERIVED fides_legal_basis is, and
+    # fides_legal_basis below always reflects the current persisted value
+    # regardless of which route returned this response. See
+    # screening/mapping.py's save_mapping and get_mapping docstrings.
     #
     # `created` distinguishes "this call made the activity" from "this call
     # updated the one the route already owns for this process" — the

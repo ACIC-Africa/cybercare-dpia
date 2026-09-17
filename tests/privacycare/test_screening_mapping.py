@@ -38,7 +38,7 @@ from fides.api.privacycare.api.router import (
     PRIVACYCARE_SCREENING_PREFIX,
     privacycare_screening_router,
 )
-from fides.api.privacycare.api.screening import save_data_mapping
+from fides.api.privacycare.api.screening import get_data_mapping, save_data_mapping
 from fides.api.privacycare.api.screening_schemas import DataMappingRequest
 from fides.api.privacycare.context import select_targets
 from fides.api.privacycare.screening.gate import record_decision
@@ -881,6 +881,87 @@ def test_no_provenance_is_written_when_no_ground_is_given(db, business_process_i
         client=_fake_client("carol@example.com"),
     )
     assert _declaration_ground_row(db, response.privacy_declaration_id) is None
+
+
+def test_a_saved_grounds_round_trips_through_get_mapping(db, business_process_id):
+    # Fix wave, item I1: before this fix, get_mapping always passed
+    # ground=None into its response regardless of what was persisted — the
+    # UI's own Lawful basis picker then always reopened empty, even though
+    # the derived fides_legal_basis it was supposed to explain WAS being
+    # returned correctly. Save a mapping naming a real ground, then read it
+    # back through the same GET route the screen calls, and prove the
+    # ground's own text — not just its derived legal basis — comes back.
+    saved = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification",
+            data_categories=[REAL_CATEGORY],
+            ground=REAL_GROUND,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    assert saved.ground == REAL_GROUND
+    assert saved.fides_legal_basis == REAL_GROUND_LEGAL_BASIS
+
+    read_back = get_data_mapping(business_process_id, db=db)
+
+    assert read_back.mapping is not None
+    assert read_back.mapping.ground == REAL_GROUND, (
+        "get_mapping must resolve the ground through "
+        "privacycare_declaration_ground -> privacycare_processing_ground, "
+        "not echo None the way a POST with no ground argument would"
+    )
+    assert read_back.mapping.fides_legal_basis == REAL_GROUND_LEGAL_BASIS
+    assert read_back.mapping.privacy_declaration_id == saved.privacy_declaration_id
+
+
+def test_a_resubmit_that_changes_the_ground_is_reflected_on_the_next_read(
+    db, business_process_id
+):
+    # The provenance row is an upsert keyed on privacy_declaration_id (see
+    # test_resubmitting_with_a_different_ground_updates_the_provenance_not_
+    # duplicates_it above) — the read side must follow that same update,
+    # not keep echoing whichever ground was recorded first.
+    save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification", data_categories=[REAL_CATEGORY], ground=REAL_GROUND,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    other_ground = "Customer Relationship Administration"  # real row, also "Legitimate interests"
+    save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification", data_categories=[REAL_CATEGORY], ground=other_ground,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    read_back = get_data_mapping(business_process_id, db=db)
+    assert read_back.mapping.ground == other_ground
+
+
+def test_a_mapping_with_no_ground_reads_back_with_ground_none(db, business_process_id):
+    # The mirror image of the round-trip test above: a mapping that never
+    # named a ground must read back as None, not as a leftover or invented
+    # value — proving get_mapping's resolution is a real LEFT-JOIN-shaped
+    # lookup (no row -> None) rather than something that only happens to
+    # work when a ground exists.
+    saved = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    assert saved.ground is None
+
+    read_back = get_data_mapping(business_process_id, db=db)
+    assert read_back.mapping.ground is None
+    assert read_back.mapping.fides_legal_basis is None
 
 
 def test_resubmitting_with_a_different_ground_updates_the_provenance_not_duplicates_it(
