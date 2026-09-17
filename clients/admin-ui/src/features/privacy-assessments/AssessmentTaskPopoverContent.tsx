@@ -1,6 +1,7 @@
 import { Descriptions, Flex, Progress, Space, Spin, Tag, Text } from "fidesui";
 
 import { useRelativeTime } from "~/features/common/hooks/useRelativeTime";
+import { pluralize } from "~/features/common/utils";
 
 import { AssessmentTaskResponse, TaskStatus } from "./types";
 import { formatSystems, formatTypes } from "./utils";
@@ -16,7 +17,10 @@ type TaskWithSkips = AssessmentTaskResponse & { skipped_count?: number };
 // decision ("no DPIA needed"), not an error or a skip-because-broken — say
 // nothing when there is nothing to say (skipped_count is 0/undefined), and
 // otherwise use the same "screened out" wording the backend and the spec
-// use, never a synonym.
+// use, never a synonym. The backend's twin of this string lives in
+// src/fides/api/privacycare/tasks.py (the `message` built in
+// run_generation) — the two are not shared code, so a re-wording here
+// needs the same edit made there.
 const screenedOutSuffix = (skippedCount?: number): string =>
   skippedCount ? `, ${skippedCount} screened out (no DPIA required)` : "";
 
@@ -105,7 +109,13 @@ export const AssessmentTaskPopoverContent = ({
             screening gate decided didn't need one. */}
         <Descriptions.Item label="Outcome">
           <Text size="sm">
-            {lastCompletedTask.completed_count} assessments produced
+            {lastCompletedTask.completed_count}{" "}
+            {pluralize(
+              lastCompletedTask.completed_count,
+              "assessment",
+              "assessments",
+            )}{" "}
+            produced
             {screenedOutSuffix(lastCompletedTask.skipped_count)}
           </Text>
         </Descriptions.Item>

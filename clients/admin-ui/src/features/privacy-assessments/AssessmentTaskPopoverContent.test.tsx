@@ -75,6 +75,22 @@ describe("AssessmentTaskPopoverContent — in progress", () => {
     expect(screen.getByText(/60 of 87 assessments/)).toBeInTheDocument();
     expect(screen.queryByText(/screened out/)).not.toBeInTheDocument();
   });
+
+  it("reads correctly when the completed count is 1 ('X of Y assessments' is invariant, never singularized)", () => {
+    render(
+      <AssessmentTaskPopoverContent
+        activeTask={makeTask({
+          completed_count: 1,
+          total_count: 2,
+          skipped_count: 1,
+        })}
+        lastCompletedTask={null}
+      />,
+    );
+
+    expect(screen.getByText(/1 of 2 assessments/)).toBeInTheDocument();
+    expect(screen.getByText(/1 screened out/)).toBeInTheDocument();
+  });
 });
 
 describe("AssessmentTaskPopoverContent — completed", () => {
@@ -111,6 +127,24 @@ describe("AssessmentTaskPopoverContent — completed", () => {
 
     expect(screen.getByText(/87 assessments produced/)).toBeInTheDocument();
     expect(screen.queryByText(/screened out/)).not.toBeInTheDocument();
+  });
+
+  it("singularizes 'assessment produced' when exactly one was produced (the plan's own total=2/completed=1/skipped=1 demo run)", () => {
+    render(
+      <AssessmentTaskPopoverContent
+        activeTask={null}
+        lastCompletedTask={makeTask({
+          status: TaskStatus.COMPLETE,
+          completed_count: 1,
+          total_count: 2,
+          skipped_count: 1,
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/1 assessment produced/)).toBeInTheDocument();
+    expect(screen.queryByText(/1 assessments produced/)).not.toBeInTheDocument();
+    expect(screen.getByText(/1 screened out/)).toBeInTheDocument();
   });
 
   it("does not read as a failure when every activity was screened out", () => {

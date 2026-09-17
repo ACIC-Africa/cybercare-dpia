@@ -642,6 +642,20 @@ def test_assessment_task_response_keeps_high_risk_only_the_feature_override_omit
     assert "high_risk_only" not in _feature_interface_fields("AssessmentTaskResponse")
 
 
+def test_assessment_task_response_keeps_skipped_count_the_feature_override_omits():
+    # Mirrors test_assessment_task_response_keeps_high_risk_only_the_feature_override_omits
+    # immediately above: skipped_count (spec 2026-09-16 D-W2-7g) is present
+    # in the generated contract but the hand-written feature-folder
+    # AssessmentTaskResponse interface omits it too — the component widens
+    # it back in locally via the TaskWithSkips intersection instead
+    # (AssessmentTaskPopoverContent.tsx). That was previously recorded only
+    # in a code comment there; this test makes the same decision visible on
+    # the schema-parity side.
+    assert "skipped_count" in AssessmentTaskResponse.model_fields
+    assert "skipped_count" in _ts_fields("AssessmentTaskResponse")
+    assert "skipped_count" not in _feature_interface_fields("AssessmentTaskResponse")
+
+
 def test_the_assessment_task_response_contract_was_actually_read():
     # PrivacyCare (spec 2026-09-16 D-W2-7g): 17 -> 18 when skipped_count was
     # added to the generated TS contract alongside the Python model.
