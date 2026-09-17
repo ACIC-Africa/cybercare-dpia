@@ -398,6 +398,9 @@ def save_data_mapping(
     request: DataMappingRequest,
     *,
     db: Session = Depends(get_db),
+    client: ClientDetail = Security(
+        verify_oauth_client, scopes=[PRIVACYCARE_SCREENING_CREATE]
+    ),
 ) -> DataMappingResponse:
     """Captures the data mapping behind an applicable business process
     (screening/mapping.save_mapping) — the route that gets 85 of her 86
@@ -418,13 +421,21 @@ def save_data_mapping(
     rejection (an unknown data subject, category or ground; a ground with
     no determined legal basis; a missing name or empty data_categories) is
     otherwise-valid-resource, bad input, and becomes 400.
+
+    `client` is back (fix round 1, item 2) purely to name WHO recorded a
+    ground's provenance — `_created_by_from_client` feeds
+    save_mapping's `recorded_by`, written to `privacycare_declaration_
+    ground.recorded_by` exactly as grounds.py's own route already does for
+    the same column.
     """
+    recorded_by = _created_by_from_client(client)
     try:
         result = save_mapping(
             db,
             business_process_id=business_process_id,
             name=request.name,
             data_categories=request.data_categories,
+            recorded_by=recorded_by,
             data_subjects=request.data_subjects,
             ground=request.ground,
             purpose=request.purpose,

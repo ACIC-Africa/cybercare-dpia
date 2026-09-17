@@ -31,10 +31,8 @@ from fides.api.privacycare.api.screening import save_data_mapping
 from fides.api.privacycare.api.screening_schemas import DataMappingRequest
 from fides.api.privacycare.context import select_targets
 from fides.api.privacycare.screening.gate import record_decision
-from fides.api.privacycare.screening.mapping import (
-    MAPPING_ROUTE_FEATURE_MARKER,
-    save_mapping,
-)
+from fides.api.privacycare.screening.mapping import MAPPING_ROUTE_FEATURE_MARKER
+from tests.privacycare.test_api_assessments import _fake_client
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -52,10 +50,12 @@ TRIGGER_KEYS = (
 
 # Her own vocabulary, measured live: exactly the values used in this file
 # are real rows in ctl_data_subjects/ctl_data_categories/
-# privacycare_processing_ground (is_default = false for the first two; all
-# 23 for the ground table), never invented for this test.
-REAL_SUBJECT = "auditor"
-REAL_SUBJECT_2 = "dependant"
+# privacycare_processing_ground. Validation is against the FULL active
+# taxonomy (fix round 1, item 1) — is_default = false rows (her own loaded
+# additions) AND is_default = true rows (fideslang's own shipped defaults,
+# which is what BOTH real live activities on bp_94d5439ced86 actually use)
+# both count; only a fides_key absent from the table altogether is rejected.
+REAL_SUBJECT = "auditor"  # her own loaded addition (is_default = false)
 REAL_CATEGORY = "user.financial.income"
 REAL_SPECIAL_CATEGORY = "user.health_and_medical.hiv_status"
 REAL_GROUND = "KYC Requirements"
@@ -201,7 +201,10 @@ def business_process_id(db) -> str:
 def _save(db, business_process_id, **overrides):
     body = dict(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY])
     body.update(overrides)
-    return save_data_mapping(business_process_id, DataMappingRequest(**body), db=db)
+    return save_data_mapping(
+        business_process_id, DataMappingRequest(**body), db=db,
+        client=_fake_client("carol@example.com"),
+    )
 
 
 # --- A complete mapping ----------------------------------------------------
@@ -220,6 +223,7 @@ def test_a_complete_mapping_creates_an_activity_and_the_link(db, business_proces
             third_parties="Credit reference bureau",
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     assert response.created is True
@@ -270,7 +274,10 @@ def test_the_legal_basis_is_derived_from_the_ground_and_cannot_be_set_by_the_cli
     assert not hasattr(request, "legal_basis_for_processing")
     assert not hasattr(request, "fides_legal_basis")
 
-    response = save_data_mapping(business_process_id, request, db=db)
+    response = save_data_mapping(
+        business_process_id, request, db=db,
+        client=_fake_client("carol@example.com"),
+    )
 
     # The ground is "Legitimate interests" — if the client's smuggled
     # "Consent" had been honoured, this would read "Consent" instead.
@@ -301,17 +308,28 @@ def test_an_unknown_data_category_is_rejected_by_name(db, business_process_id):
     assert "not.a.real.category" in caught.value.detail
 
 
-def test_a_default_fides_data_subject_not_in_her_33_is_rejected_by_name(
-    db, business_process_id
-):
-    # "customer" is a real ctl_data_subjects row, but is_default=true — a
-    # Fides-shipped default, not one of HER 33 loaded rows (measured: 33
-    # is_default=false subjects). Proves the vocabulary check is scoped to
-    # her own loaded rows, not "any row that happens to exist".
-    with pytest.raises(HTTPException) as caught:
-        _save(db, business_process_id, data_subjects=["customer"])
-    assert caught.value.status_code == 400
-    assert "customer" in caught.value.detail
+def test_a_mapping_using_only_default_fideslang_values_succeeds(db, business_process_id):
+    # Fix round 1, item 1: "customer" (ctl_data_subjects, is_default=true)
+    # and "user.contact.email" (ctl_data_categories, is_default=true) are
+    # BOTH real Fides-shipped defaults, not one of her loaded-for-her rows —
+    # and are EXACTLY what both real live activities on bp_94d5439ced86
+    # actually use. The first cut of this route rejected this by name,
+    # which rejected the only data mapping the customer actually has.
+    # Validation is now against the full active taxonomy, defaults
+    # included; this must succeed.
+    response = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card account administration",
+            data_categories=["user.contact.email"],
+            data_subjects=["customer"],
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    assert response.created is True
+    assert response.data_subjects == ["customer"]
+    assert response.data_categories == ["user.contact.email"]
 
 
 def test_an_unknown_ground_is_rejected_by_name(db, business_process_id):
@@ -350,6 +368,7 @@ def test_a_partial_mapping_saves_with_only_a_name_and_a_category(db, business_pr
         business_process_id,
         DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     assert response.created is True
@@ -387,6 +406,7 @@ def test_resubmitting_a_mapping_updates_the_same_activity_not_a_second_one(
         business_process_id,
         DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
     assert first.created is True
 
@@ -400,6 +420,7 @@ def test_resubmitting_a_mapping_updates_the_same_activity_not_a_second_one(
             retention_period="7 years",
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     assert second.created is False
@@ -420,6 +441,7 @@ def test_fields_left_unanswered_on_a_resubmit_are_not_erased(db, business_proces
             third_parties="Credit reference bureau",
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     # Resubmit naming only name/data_categories (the two always-required
@@ -431,6 +453,7 @@ def test_fields_left_unanswered_on_a_resubmit_are_not_erased(db, business_proces
             data_categories=[REAL_CATEGORY, REAL_SPECIAL_CATEGORY],
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     assert second.name == "Fuel card KYC verification — updated"
@@ -458,6 +481,7 @@ def test_a_resubmit_never_touches_a_route_unrelated_activity_on_the_same_process
         business_process_id,
         DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
     assert first.created is True
     assert first.privacy_declaration_id not in (marketing_id, admin_id)
@@ -471,6 +495,7 @@ def test_a_resubmit_never_touches_a_route_unrelated_activity_on_the_same_process
             ground=REAL_GROUND,
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
     assert second.created is False
     assert second.privacy_declaration_id == first.privacy_declaration_id
@@ -511,6 +536,7 @@ def test_the_created_activity_is_immediately_assessable_proving_the_loop_closes(
             ground=REAL_GROUND,
         ),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     # Step 3: the activity the mapping just created shows up as a
@@ -543,6 +569,197 @@ def test_an_unmapped_but_screened_out_process_would_still_be_skipped(
         business_process_id,
         DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
         db=db,
+        client=_fake_client("carol@example.com"),
     )
 
     assert tasks_module._is_activity_screened_out(db, mapping.privacy_declaration_id) is True
+
+
+# --- Ground provenance is written, not just the derived value --------------
+
+
+def _declaration_ground_row(db, declaration_id: str) -> dict | None:
+    row = db.execute(
+        sqlalchemy.text(
+            "SELECT processing_ground_id, recorded_by "
+            "FROM privacycare_declaration_ground WHERE privacy_declaration_id = :id"
+        ),
+        {"id": declaration_id},
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def test_the_ground_provenance_is_recorded_alongside_the_derived_legal_basis(
+    db, business_process_id
+):
+    response = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification",
+            data_categories=[REAL_CATEGORY],
+            ground=REAL_GROUND,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    ground_id = db.execute(
+        sqlalchemy.text("SELECT id FROM privacycare_processing_ground WHERE ground = :g"),
+        {"g": REAL_GROUND},
+    ).scalar()
+    row = _declaration_ground_row(db, response.privacy_declaration_id)
+    assert row is not None, "no privacycare_declaration_ground row was written"
+    assert row["processing_ground_id"] == ground_id
+    assert row["recorded_by"] == "carol@example.com"
+
+
+def test_no_provenance_is_written_when_no_ground_is_given(db, business_process_id):
+    response = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    assert _declaration_ground_row(db, response.privacy_declaration_id) is None
+
+
+def test_resubmitting_with_a_different_ground_updates_the_provenance_not_duplicates_it(
+    db, business_process_id
+):
+    # Two real grounds sharing the same legal-basis class, so a plain
+    # equality check on fides_legal_basis alone could not tell them apart —
+    # only the recorded processing_ground_id can.
+    first = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification", data_categories=[REAL_CATEGORY], ground=REAL_GROUND,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    first_ground_id = db.execute(
+        sqlalchemy.text("SELECT id FROM privacycare_processing_ground WHERE ground = :g"),
+        {"g": REAL_GROUND},
+    ).scalar()
+    assert _declaration_ground_row(db, first.privacy_declaration_id)["processing_ground_id"] == first_ground_id
+
+    other_ground = "Customer Relationship Administration"  # real row, also "Legitimate interests"
+    second = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(
+            name="Fuel card KYC verification", data_categories=[REAL_CATEGORY], ground=other_ground,
+        ),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+    assert second.privacy_declaration_id == first.privacy_declaration_id
+
+    other_ground_id = db.execute(
+        sqlalchemy.text("SELECT id FROM privacycare_processing_ground WHERE ground = :g"),
+        {"g": other_ground},
+    ).scalar()
+    rows = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM privacycare_declaration_ground "
+            "WHERE privacy_declaration_id = :id"
+        ),
+        {"id": first.privacy_declaration_id},
+    ).scalar()
+    assert rows == 1, "resubmitting with a different ground must update, not duplicate"
+    updated_row = _declaration_ground_row(db, first.privacy_declaration_id)
+    assert updated_row["processing_ground_id"] == other_ground_id
+
+
+# --- System provisioning: lazy, per-process, marked and removable ----------
+
+
+def _system_row(db, system_id: str) -> dict:
+    row = db.execute(
+        sqlalchemy.text("SELECT fides_key, tags FROM ctl_systems WHERE id = :id"),
+        {"id": system_id},
+    ).mappings().first()
+    return dict(row)
+
+
+def test_a_provisioned_system_is_tagged_identifiable_and_removable(db, business_process_id):
+    response = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    system = _system_row(db, response.system_id)
+    assert system["fides_key"] == f"privacycare_process_{business_process_id}"
+    assert MAPPING_ROUTE_FEATURE_MARKER in (system["tags"] or [])
+
+
+def test_a_reused_real_system_is_never_tagged_as_route_provisioned(db, business_process_id):
+    # Seed a REAL, pre-existing system for this process (mirrors the two
+    # live activities sharing ctl_ef9cadb3-...) — this route must reuse it,
+    # not provision a second one, and must never retroactively tag someone
+    # else's real system as if this route had created it.
+    real_system_id = f"sys_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        sqlalchemy.text("INSERT INTO ctl_systems (id, fides_key, name) VALUES (:id, :key, :name)"),
+        {"id": real_system_id, "key": real_system_id, "name": "Fuel Card Platform"},
+    )
+    _seed_unrelated_activity(
+        db, business_process_id, "Fuel card marketing campaigns", "marketing.advertising"
+    )
+    # Point that unrelated activity's system at the REAL system, replacing
+    # the one _seed_unrelated_activity provisioned for itself, so this
+    # process now genuinely has exactly one real, pre-existing system.
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacydeclaration SET system_id = :sid "
+            "WHERE id IN (SELECT privacy_declaration_id FROM privacycare_process_declaration "
+            "WHERE business_process_id = :pid)"
+        ),
+        {"sid": real_system_id, "pid": business_process_id},
+    )
+
+    response = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(name="Fuel card KYC verification", data_categories=[REAL_CATEGORY]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    assert response.system_id == real_system_id
+    system = _system_row(db, real_system_id)
+    assert MAPPING_ROUTE_FEATURE_MARKER not in (system["tags"] or [])
+
+
+def test_provisioning_is_lazy_never_eager_for_every_process(db):
+    # Two freshly seeded, never-mapped processes: provisioning must not
+    # have happened for either until save_data_mapping is actually called
+    # on one of them.
+    untouched = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    mapped = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+
+    before = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM ctl_systems WHERE fides_key = :key"
+        ),
+        {"key": f"privacycare_process_{untouched}"},
+    ).scalar()
+    assert before == 0
+
+    save_data_mapping(
+        mapped,
+        DataMappingRequest(name="Fraud review", data_categories=[REAL_CATEGORY]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    still_none_for_untouched = db.execute(
+        sqlalchemy.text(
+            "SELECT count(*) FROM ctl_systems WHERE fides_key = :key"
+        ),
+        {"key": f"privacycare_process_{untouched}"},
+    ).scalar()
+    assert still_none_for_untouched == 0, (
+        "provisioning must be lazy — mapping one process must never "
+        "provision a system for a different, unmapped process"
+    )

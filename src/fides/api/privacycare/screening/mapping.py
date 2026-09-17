@@ -10,14 +10,25 @@ business process through `privacycare_process_declaration` — the same link
 table tasks.py's `_is_activity_screened_out` already reads to resolve an
 activity back to its process's screening verdict.
 
-VOCABULARIES, NOT FREE TEXT. Every data subject, data category and lawful-
-basis ground offered to her was already loaded by taxonomy/loader.py from
-her own workbook (D-KT-1..8). "Her 33 data subjects" and "her 29 data
-categories" are exactly `ctl_data_subjects`/`ctl_data_categories` WHERE
-`is_default = false` — the rows created specifically for her, as opposed to
-a handful of her terms that reuse a Fides-shipped default key (e.g.
-"Customer/Client" -> the shipped `customer`), which are NOT offered here.
-An unknown value in either list is rejected BY NAME (_unknown_values below)
+VOCABULARIES, NOT FREE TEXT (fix round 1, item 1). Every data subject and
+data category offered to her lives in `ctl_data_subjects`/
+`ctl_data_categories` — her 33/29 loaded-for-her rows (`is_default =
+false`) SIDE BY SIDE with fideslang's own shipped defaults (15/85 more),
+never instead of them (taxonomy/loader.py loaded her additions ALONGSIDE
+fideslang, per plan 09). The first cut of this module validated against
+`is_default = false` only, which rejected the ONLY data mapping the
+customer actually has today: both real live activities on
+`bp_94d5439ced86` use exclusively default-valued rows (`data_subjects =
+{customer}`, categories `user.contact.email`/`user.contact.phone_number`/
+`user.financial`/`user.behavior.purchase_history` — all `is_default =
+true`). Validation is now against the FULL active taxonomy — existence in
+`ctl_data_subjects`/`ctl_data_categories` at all, defaults included; no
+`is_default` filter, and no `active` filter either, because no other
+PrivacyCare code filters on that column and every row in both tables is
+currently `active = true` anyway (measured: 48/48, 114/114) — inventing a
+filter nothing else uses would be exactly the kind of ungrounded rule this
+task's brief warns against. An unknown value — one absent from the
+taxonomy altogether — is still rejected BY NAME (_unknown_values below)
 rather than silently dropped, because a silently dropped value records a
 mapping the user did not make and cannot see is missing.
 
@@ -31,6 +42,28 @@ reason — nothing to derive, nothing Carol has ruled on) and writes it to
 `legal_basis_for_processing`. There is no request field the client could
 use to set that column directly — see DataMappingRequest in
 screening_schemas.py, which carries `ground` and nothing else.
+
+THE PROVENANCE IS WRITTEN, NOT JUST THE DERIVED VALUE (fix round 1, item
+2). `legal_basis_for_processing = 'Consent'` on its own does not say WHICH
+of the (possibly several) "Consent"-class grounds produced it — for a
+compliance product, that link IS the audit trail a regulator would ask
+about. Once this module has written the activity's own
+`legal_basis_for_processing` (so it already agrees with the ground's
+class), it calls grounds.py's OWN `_record_declaration_ground` — the exact
+function `POST .../declaration/{id}/ground` already uses — to upsert the
+`privacycare_declaration_ground` row, rather than inventing a second way to
+write that table. Reused, not duplicated: `_record_declaration_ground`'s
+own consistency check (declaration's stored legal basis must equal the
+ground's class) passes trivially here because this module just wrote both
+values from the SAME ground, in the SAME transaction. `_UPSERT_
+DECLARATION_GROUND_SQL` (grounds.py) is itself an upsert keyed on the
+UNIQUE `privacy_declaration_id` column, so re-submitting a mapping with a
+DIFFERENT ground updates that one row rather than creating a second —
+provenance for an activity is always exactly one ground, matching
+`declaration_ground_table`'s own schema. Only called when `ground` is
+given this call (`None` means "not answered this call", same rule as every
+other optional field below) — an earlier call's provenance is left alone
+otherwise.
 
 SPECIAL-CATEGORY DATA IS DERIVED, NOT TICKED. `processes_special_category_
 data` is computed from the chosen `data_categories` against the SAME
@@ -74,23 +107,45 @@ pre-existing real one — is never read for the purpose of deciding whether
 to update it, and never written to, by this function, under any
 circumstances.
 
-WHAT HAPPENS WHEN THE PROCESS HAS NO SYSTEM. `privacydeclaration.system_id`
-is NOT NULL, but a business process has no system of its own — processes.py
-'s own module docstring says so explicitly ("Fides' map is anchored on
-systems, which can be scanned, while a process exists only once a
-consultant has written it down"), and the measured live data bears it out:
-84 of the 86 processes have never been linked to any system at all.
-Refusing to save a mapping until someone first goes and creates a Fides
-system by hand would defeat the entire point of this route — capturing the
-mapping AT THE MOMENT someone decides the process matters — for all but the
-one process that already happens to have one. So `_system_id_for_process`
-first looks for a system already in use by an EXISTING (marker or not)
-activity linked to this same process, and only if none exists does it
-provision a minimal placeholder `ctl_systems` row scoped to this process
-(fides_key `privacycare_process_<id>`, ON CONFLICT DO NOTHING so a raced or
-repeated call never errors). This is a PrivacyCare convention, not
-something Ethyca or the customer defined, and is named as such in this
-task's report.
+WHAT HAPPENS WHEN THE PROCESS HAS NO SYSTEM (fix round 1, item 3: kept,
+constrained). `privacydeclaration.system_id` is NOT NULL, but a business
+process has no system of its own — processes.py's own module docstring
+says so explicitly ("Fides' map is anchored on systems, which can be
+scanned, while a process exists only once a consultant has written it
+down"), and the measured live data bears it out: 84 of the 86 processes
+have never been linked to any system at all. Refusing to save a mapping
+until someone first goes and creates a Fides system by hand would defeat
+the entire point of this route — capturing the mapping AT THE MOMENT
+someone decides the process matters — for all but the one process that
+already happens to have one, and one shared "Unassigned" bucket holding 84
+activities would be unreadable in Fides' own system-organised screens,
+where process-named systems keep her estate legible.
+
+So `_system_id_for_process` first looks for a system already in use by an
+EXISTING (marker or not) activity linked to this same process, and only if
+none exists does it provision a minimal placeholder `ctl_systems` row
+scoped to THIS ONE process (fides_key `privacycare_process_<id>`, ON
+CONFLICT DO NOTHING so a raced or repeated call never errors). This is
+called ONLY from inside `save_mapping`'s create branch — lazily, once per
+process, exactly when that process is first mapped through this route.
+Nothing in this module, or anywhere else in this task, provisions a system
+eagerly for all 86 processes up front; there is no code path that runs
+`_system_id_for_process` other than a `save_mapping` call naming that
+specific `business_process_id`.
+
+Every system this module provisions is tagged `MAPPING_ROUTE_FEATURE_
+MARKER` in its own `tags` column (an `ARRAY(String)` Ethyca already ships
+on `ctl_systems`, same shape and same reasoning as `privacydeclaration.
+features` above) — identifiable, and so removable later, the same way a
+route-created ACTIVITY is. A system this module only REUSED (the two real
+activities' own `ctl_ef9cadb3-...` system, or an earlier mapping's
+provisioned one) is never tagged by this code path — only the INSERT that
+creates a brand new one sets `tags`, so an already-real customer system is
+never relabelled as ours. This is a PrivacyCare convention, not something
+Ethyca or the customer defined, and is named as such in this task's report
+for Product/Carol to review — there is exactly one `ctl_systems` row today,
+so the shape of what 85 more provisioned rows looks like is not yet
+visible in her demo.
 
 All raw SQL, all bound parameters, never a commit — the caller's session
 boundary decides, same rule as gate.py, risk/register.py and grounds.py.
@@ -102,6 +157,14 @@ from typing import List, Optional
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+# Reused, not duplicated (fix round 1, item 2) — the exact function
+# grounds.py's own POST .../ground route already calls to write
+# privacycare_declaration_ground. grounds.py decorates its OWN router
+# (privacycare_grounds_router, a distinct prefix from screening's), so
+# importing its business logic here carries none of the tasks-vs-
+# assessments same-router registration-order hazard api/router.py's
+# register() documents at length — see this module's own docstring.
+from fides.api.privacycare.api.grounds import _record_declaration_ground
 from fides.api.privacycare.taxonomy.kenyan import SPECIAL_TAG
 
 # Tags every privacydeclaration row this module has ever created. The ONLY
@@ -144,17 +207,15 @@ _BUSINESS_PROCESS_NAME_SQL = sqlalchemy.text(
 )
 
 _VALID_SUBJECTS_SQL = sqlalchemy.text(
-    "SELECT fides_key FROM ctl_data_subjects "
-    "WHERE is_default = false AND fides_key = ANY(:keys)"
+    "SELECT fides_key FROM ctl_data_subjects WHERE fides_key = ANY(:keys)"
 )
 
 _VALID_CATEGORIES_SQL = sqlalchemy.text(
-    "SELECT fides_key FROM ctl_data_categories "
-    "WHERE is_default = false AND fides_key = ANY(:keys)"
+    "SELECT fides_key FROM ctl_data_categories WHERE fides_key = ANY(:keys)"
 )
 
 _GROUND_SQL = sqlalchemy.text(
-    "SELECT ground, fides_legal_basis FROM privacycare_processing_ground "
+    "SELECT id, ground, fides_legal_basis FROM privacycare_processing_ground "
     "WHERE ground = :ground"
 )
 
@@ -213,8 +274,8 @@ _ANY_SYSTEM_FOR_PROCESS_SQL = sqlalchemy.text(
 )
 
 _INSERT_SYSTEM_SQL = sqlalchemy.text(
-    "INSERT INTO ctl_systems (id, fides_key, name, description) "
-    "VALUES (:id, :fides_key, :name, :description) "
+    "INSERT INTO ctl_systems (id, fides_key, name, description, tags) "
+    "VALUES (:id, :fides_key, :name, :description, :tags) "
     "ON CONFLICT (fides_key) DO NOTHING"
 )
 
@@ -312,6 +373,11 @@ def _system_id_for_process(db: Session, business_process_id: str, process_name: 
                 f"business process {business_process_id!r} — no scanned "
                 f"Fides system exists for it yet."
             ),
+            # Identifiable and removable later — same reasoning as the
+            # activity marker. Only ever set on the row THIS INSERT creates;
+            # a reused, real customer system (e.g. the two live activities'
+            # own ctl_ef9cadb3-... system) is never tagged by this code path.
+            "tags": [MAPPING_ROUTE_FEATURE_MARKER],
         },
     )
     return db.execute(_SYSTEM_ID_BY_FIDES_KEY_SQL, {"fides_key": fides_key}).scalar()
@@ -323,6 +389,7 @@ def save_mapping(
     business_process_id: str,
     name: str,
     data_categories: List[str],
+    recorded_by: str,
     data_subjects: Optional[List[str]] = None,
     ground: Optional[str] = None,
     purpose: Optional[str] = None,
@@ -336,6 +403,13 @@ def save_mapping(
     ValueError-to-404 mapping already matches on, reused here rather than
     duplicated); an unknown data subject or data category; an unknown
     ground; or a real ground with no fides_legal_basis determined yet.
+
+    `recorded_by` names who is recording the ground's provenance — passed
+    straight through to grounds.py's own `_record_declaration_ground` (see
+    this module's own docstring, "the provenance is written, not just the
+    derived value"). Not persisted anywhere on `privacydeclaration` itself
+    (that table has no created_by column); only on `privacycare_
+    declaration_ground`, and only when `ground` is given this call.
     """
     process_name = db.execute(
         _BUSINESS_PROCESS_NAME_SQL, {"id": business_process_id}
@@ -365,6 +439,7 @@ def save_mapping(
             )
 
     fides_legal_basis: Optional[str] = None
+    ground_id: Optional[str] = None
     if ground is not None:
         ground_row = db.execute(_GROUND_SQL, {"ground": ground}).mappings().first()
         if ground_row is None:
@@ -374,6 +449,7 @@ def save_mapping(
             raise ValueError(
                 f"no legal basis has been determined yet for ground {ground!r}"
             )
+        ground_id = ground_row["id"]
 
     processes_special_category_data = _is_special_category(db, categories)
 
@@ -430,6 +506,18 @@ def save_mapping(
             },
         )
         created = True
+
+    if ground_id is not None:
+        # Reused verbatim from grounds.py — see this module's own docstring,
+        # "the provenance is written, not just the derived value". Safe to
+        # call here: the activity's own legal_basis_for_processing was just
+        # written, above, from this SAME ground, in this SAME transaction,
+        # so _record_declaration_ground's own consistency check (the
+        # declaration's stored class must equal the ground's) passes by
+        # construction rather than by luck.
+        _record_declaration_ground(
+            db, declaration_id=declaration_id, ground_id=ground_id, recorded_by=recorded_by
+        )
 
     # Canonical state, not an echo of this call's own request fields — see
     # _SELECT_DECLARATION_SQL's own comment for why that matters on update.
