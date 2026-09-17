@@ -6,6 +6,7 @@
 import uuid
 
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     CheckConstraint,
     Column,
@@ -372,3 +373,75 @@ class DpiaRisk:
     # severity on read, so a change to the banding rule cannot leave stale
     # numbers behind in a compliance record.
     __table__ = dpia_risk_table
+
+
+screening_trigger_table = Table(
+    "privacycare_screening_trigger",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    Column("trigger_key", String(64), nullable=False, unique=True),
+    Column("label", String(255), nullable=False),
+    Column("description", Text, nullable=False),
+    Column("display_order", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    ),
+)
+
+
+@mapper_registry.mapped
+class ScreeningTrigger:
+    # The questions a screener answers before a DPIA exists. A table rather
+    # than a constant because the wording belongs to the privacy SME and she
+    # will revise it — two of the six were already recast once, on
+    # 2026-09-17, from a university sample case to this customer's world.
+    # Same shape and same reason as privacycare_dsr_timeline.
+    __table__ = screening_trigger_table
+
+
+screening_decision_table = Table(
+    "privacycare_screening_decision",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    # References privacydeclaration.id, an ETHYCA table. Deliberately NO
+    # ForeignKey: a constraint from our chain into theirs is the coupling
+    # that breaks an upstream merge. Existence is checked at write time.
+    # The declaration is this platform's processing activity — see
+    # context.py's GenerationTarget docstring.
+    Column("declaration_id", String(255), nullable=False, index=True),
+    Column("dpia_required", Boolean, nullable=False),
+    # Which triggers were ticked. Empty exactly when dpia_required is false.
+    Column("triggered_keys", ARRAY(String), nullable=False),
+    # Mandatory when dpia_required is false: WHY no assessment is needed.
+    # This is the compliance artifact a regulator asks for when they ask
+    # why an activity has none.
+    Column("justification", Text),
+    Column("decided_by", String(255), nullable=False),
+    Column(
+        "decided_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    ),
+    CheckConstraint(
+        "(dpia_required AND justification IS NULL) OR "
+        "(NOT dpia_required AND justification IS NOT NULL "
+        " AND length(trim(justification)) > 0)",
+        name="ck_screening_screenout_has_a_reason",
+    ),
+)
+
+
+@mapper_registry.mapped
+class ScreeningDecision:
+    # One screening verdict for one processing activity, at one moment.
+    # APPEND-ONLY: re-screening writes a new row and never updates an old
+    # one. An activity screened out last quarter may need a DPIA this one,
+    # and the earlier decision is the evidence of what was decided and on
+    # what basis — destroying it destroys exactly what a regulator would
+    # ask to see. Latest decided_at wins on read.
+    __table__ = screening_decision_table
