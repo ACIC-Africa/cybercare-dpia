@@ -510,6 +510,7 @@ class AssessmentTaskResponse(BaseModel):
     status: str
     total_count: int
     completed_count: int
+    skipped_count: int
     progress: float
     message: Optional[str]
     assessment_types: List[str]

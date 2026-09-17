@@ -20,7 +20,11 @@ from fides.api.privacycare.api.schemas import (
     CreateAssessmentTaskRequest,
     CreateAssessmentTaskResponse,
 )
-from fides.api.privacycare.tasks import GENERATION_QUEUE, generate_assessments
+from fides.api.privacycare.tasks import (
+    GENERATION_QUEUE,
+    generate_assessments,
+    skipped_for_task,
+)
 from fides.common.scope_registry import SYSTEM_READ
 
 # `status` is both a query-parameter name on GET /tasks below and the name
@@ -152,18 +156,35 @@ _SYSTEM_NAMES_SQL = sqlalchemy.text(
 )
 
 
-def _progress(total_count: int, completed_count: int) -> float:
-    """Reproduces PrivacyAssessmentTask.progress (Ethyca's model, line 134):
-    round((completed / total) * 100, 1), zero when total is zero.
+def _progress(total_count: int, completed_count: int, skipped_count: int) -> float:
+    """round(((completed + skipped) / total) * 100, 1), zero when total is
+    zero.
 
-    Derived rather than stored — there is no progress column. Reproducing
-    the formula exactly matters because the same number is rendered by
-    AssessmentTaskStatusIndicator.tsx as a percentage; a second definition
-    that rounded differently would make two screens disagree about one run.
+    This USED to reproduce PrivacyAssessmentTask.progress (Ethyca's model,
+    line 134) exactly — completed-only — on the reasoning that the same
+    number is rendered by AssessmentTaskStatusIndicator.tsx:134 as a
+    percentage, and a second definition that rounded differently would make
+    two screens disagree about one run.
+
+    That reasoning still holds; it now cuts the other way. Plan 19 made the
+    screening gate's skip count durable and visible (skipped_for_task,
+    below), and a screened-out activity HAS been processed — the answer was
+    "no DPIA needed" — so it belongs in the numerator alongside completed.
+    Reproducing Ethyca's formula exactly would mean progress under-reports
+    on any run that ever skips anything: 87 processing activities with 27
+    screened out and every real target done reads as 69% forever, not 100%.
+    Our number and Ethyca's PrivacyAssessmentTask.progress therefore now
+    intentionally diverge whenever a run has skipped_count > 0 — there is
+    no privacy_assessment_task.progress column to disagree with (it is a
+    Python property over their model, not a stored value we could match),
+    only the one number we compute here, and this is the more honest
+    definition of it. AssessmentTaskStatusIndicator.tsx:134 is still the
+    only other consumer, so whoever changes this formula again should go
+    read that render before changing what percentage it shows.
     """
     if not total_count:
         return 0.0
-    return round((completed_count / total_count) * 100, 1)
+    return round(((completed_count + skipped_count) / total_count) * 100, 1)
 
 
 def _task_response(db: Session, row) -> AssessmentTaskResponse:
@@ -191,13 +212,16 @@ def _task_response(db: Session, row) -> AssessmentTaskResponse:
             for key in keys
         ]
 
+    skipped_count = skipped_for_task(db, row["id"])
+
     return AssessmentTaskResponse(
         id=row["id"],
         action_type=row["action_type"],
         status=row["status"],
         total_count=row["total_count"],
         completed_count=row["completed_count"],
-        progress=_progress(row["total_count"], row["completed_count"]),
+        skipped_count=skipped_count,
+        progress=_progress(row["total_count"], row["completed_count"], skipped_count),
         message=row["message"],
         assessment_types=list(row["assessment_types"] or []),
         system_fides_keys=(

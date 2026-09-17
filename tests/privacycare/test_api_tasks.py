@@ -1,3 +1,4 @@
+import re
 import uuid
 
 import pytest
@@ -58,6 +59,21 @@ def _task_row(db, task_id):
         ),
         {"id": task_id},
     ).mappings().first()
+
+
+def _seed_skip(db, task_id, skipped_count):
+    """Writes a privacycare_generation_skip row directly, the same shape
+    Task 1's _record_skip writes, without going through run_generation —
+    these tests are about the API/schema layer reading the count back, not
+    about the screening gate that produces it (that's
+    test_screening_generation.py's job)."""
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_generation_skip (id, task_id, skipped_count) "
+            "VALUES (:id, :task_id, :skipped_count)"
+        ),
+        {"id": str(uuid.uuid4()), "task_id": task_id, "skipped_count": skipped_count},
+    )
 
 
 def test_create_writes_a_pending_task_row(db, queued, monkeypatch):
@@ -250,6 +266,104 @@ def test_progress_is_zero_when_nothing_is_counted_yet(db):
     db.flush()
 
     assert _task_detail(db, task_id).progress == 0.0
+
+
+def test_progress_stays_zero_when_total_is_zero_even_if_a_skip_row_exists(db):
+    # Belt-and-braces on the division guard: a stray skip row must not turn
+    # a zero-total task into a division error, regardless of what produced
+    # the row.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    _seed_skip(db, task_id, 5)
+    db.flush()
+
+    assert _task_detail(db, task_id).progress == 0.0
+
+
+def test_skipped_count_is_zero_when_nothing_was_skipped(db):
+    # No privacycare_generation_skip row for this task — Task 1's
+    # skipped_for_task contract says that reads as 0, not None and not an
+    # error.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.flush()
+
+    assert _task_detail(db, task_id).skipped_count == 0
+
+
+def test_skipped_count_reflects_the_recorded_skip(db):
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    _seed_skip(db, task_id, 3)
+    db.flush()
+
+    assert _task_detail(db, task_id).skipped_count == 3
+
+
+def test_progress_counts_skips_as_processed(db):
+    # 3 targets, 1 completed and 2 screened out. A screen-out IS the
+    # processing outcome ("no DPIA needed"), so it belongs in the
+    # numerator: (1 + 2) / 3 = 100%, not the old completed-only 33%.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task "
+            "SET total_count = 3, completed_count = 1 WHERE id = :id"
+        ),
+        {"id": task_id},
+    )
+    _seed_skip(db, task_id, 2)
+    db.flush()
+
+    detail = _task_detail(db, task_id)
+    assert detail.progress == 100.0
+    assert detail.completed_count == 1
+    assert detail.skipped_count == 2
+
+
+def test_progress_with_a_completed_a_skipped_and_a_failed_target(db):
+    # 1 completed, 1 skipped, 1 failed of 3 targets: (1 + 1) / 3 = 66.7,
+    # which the UI's Math.round renders as 67%. All three counts stay
+    # separately visible — completed, skipped, and (total - completed -
+    # skipped) as the implied failure count — rather than collapsing into
+    # one number.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task "
+            "SET total_count = 3, completed_count = 1 WHERE id = :id"
+        ),
+        {"id": task_id},
+    )
+    _seed_skip(db, task_id, 1)
+    db.flush()
+
+    detail = _task_detail(db, task_id)
+    assert detail.progress == 66.7
+    assert detail.total_count == 3
+    assert detail.completed_count == 1
+    assert detail.skipped_count == 1
+
+
+def test_skipped_count_agrees_with_the_message_text(db):
+    # The count is a typed field; the message is prose beside it. They must
+    # never disagree about the same run — parsing the digit back out of the
+    # message (rather than hardcoding the expected count twice) is what
+    # actually proves that.
+    task_id = _seed_task(db, assessment_types=["gdpr_dpia"])
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacy_assessment_task "
+            "SET total_count = 3, completed_count = 1, status = 'complete', "
+            "    message = 'Generated 1 of 3 assessments. 2 screened out "
+            "(no DPIA required).' WHERE id = :id"
+        ),
+        {"id": task_id},
+    )
+    _seed_skip(db, task_id, 2)
+    db.flush()
+
+    detail = _task_detail(db, task_id)
+    match = re.search(r"(\d+) screened out", detail.message)
+    assert match is not None, detail.message
+    assert detail.skipped_count == int(match.group(1))
 
 
 def test_task_detail_lists_the_assessments_it_produced(db):
