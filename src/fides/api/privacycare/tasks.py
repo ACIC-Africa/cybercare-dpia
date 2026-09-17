@@ -126,6 +126,20 @@ _TASK_COUNTS_SQL = sqlalchemy.text(
     "WHERE id = :task_id"
 )
 
+# One row per task_id: a re-run of the same task (see
+# test_re_running_generation_for_the_same_task_does_not_duplicate_the_skip_row)
+# must update the existing row rather than collide with the unique index or
+# leave a stale count behind — hence upsert, not plain INSERT.
+_UPSERT_GENERATION_SKIP_SQL = sqlalchemy.text(
+    "INSERT INTO privacycare_generation_skip (id, task_id, skipped_count) "
+    "VALUES (:id, :task_id, :skipped_count) "
+    "ON CONFLICT (task_id) DO UPDATE SET skipped_count = EXCLUDED.skipped_count"
+)
+
+_SKIPPED_FOR_TASK_SQL = sqlalchemy.text(
+    "SELECT skipped_count FROM privacycare_generation_skip WHERE task_id = :task_id"
+)
+
 
 def _assessment_name(target: GenerationTarget) -> str:
     """What the DPO sees on the assessment card.
@@ -406,7 +420,7 @@ def run_generation(db: Session, task_id: str) -> None:
         message += f" {skipped} screened out (no DPIA required)."
     if failures:
         message += f" {len(failures)} failed: {failures[0]}"
-    _finish(db, task_id, status, total, completed, message)
+    _finish(db, task_id, status, total, completed, message, skipped=skipped)
 
 
 def _create_assessment(
@@ -456,9 +470,46 @@ def _set_status(db, task_id, status, total, completed, message) -> None:
     )
 
 
-def _finish(db, task_id, status, total, completed, message) -> None:
+def _finish(db, task_id, status, total, completed, message, skipped: int = 0) -> None:
+    """Writes the task row's final status AND, in the same transaction, how
+    many activities this run screened out — so the two can never disagree
+    (plan 19, Task 1). `skipped` defaults to 0 for every call site that has
+    no target loop to have skipped anything (a template-resolution error, an
+    empty target set): those runs correctly leave no
+    privacycare_generation_skip row, the same as a real run that skipped
+    nothing.
+    """
     _set_status(db, task_id, status, total, completed, message)
+    if skipped:
+        _record_skip(db, task_id, skipped)
     db.commit()
+
+
+def _record_skip(db: Session, task_id: str, skipped_count: int) -> None:
+    """Persists how many activities this run's screening gate skipped.
+    Called only when skipped_count is non-zero (see _finish) — a run that
+    skipped nothing has nothing to say, and an absent row reads as zero
+    (skipped_for_task below).
+
+    Upserts on task_id rather than plain-inserting: a re-run of generation
+    for the same task_id must update the one row a unique index allows,
+    never collide with it or leave a stale count from an earlier run.
+    """
+    db.execute(
+        _UPSERT_GENERATION_SKIP_SQL,
+        {"id": str(uuid.uuid4()), "task_id": task_id, "skipped_count": skipped_count},
+    )
+
+
+def skipped_for_task(db: Session, task_id: str) -> int:
+    """How many activities a generation run skipped because the screening
+    gate said no DPIA was needed. 0 when no row exists — a run that
+    skipped nothing, or a task_id that was never run at all — never None,
+    never an error."""
+    row = db.execute(_SKIPPED_FOR_TASK_SQL, {"task_id": task_id}).first()
+    if row is None:
+        return 0
+    return row[0]
 
 
 def _current_counts(db: Session, task_id: str) -> tuple[int, int]:

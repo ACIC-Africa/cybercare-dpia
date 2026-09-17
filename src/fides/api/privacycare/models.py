@@ -445,3 +445,28 @@ class ScreeningDecision:
     # what basis — destroying it destroys exactly what a regulator would
     # ask to see. Latest decided_at wins on read.
     __table__ = screening_decision_table
+
+
+generation_skip_table = Table(
+    "privacycare_generation_skip",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    # References privacy_assessment_task.id, an ETHYCA table. Deliberately NO
+    # ForeignKey: a constraint from our chain into theirs is the coupling
+    # that breaks an upstream merge. One row per task, enforced by the
+    # unique index.
+    Column("task_id", String(255), nullable=False, unique=True),
+    Column("skipped_count", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), server_default=func.now()),
+)
+
+
+@mapper_registry.mapped
+class GenerationSkip:
+    # How many activities a generation run skipped because the screening
+    # gate said no DPIA was needed. It lives here because
+    # privacy_assessment_task is Ethyca's and has no field for it, and
+    # adding a column to their table is the merge-hostile move this fork
+    # avoids. Same reason privacycare_business_process and
+    # privacycare_dpia_risk exist.
+    __table__ = generation_skip_table
