@@ -196,6 +196,13 @@ def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):
 
 
 def test_a_screened_out_target_is_not_reported_as_a_failure(db):
+    # Fix round 1 (Finding 2, minor): this test used to assert only
+    # status/message and never that the target was actually skipped — it
+    # would have kept passing even if the gate check were deleted entirely,
+    # since an ungated run over one screened-out-but-otherwise-normal
+    # declaration also reports "complete" with no "fail" in the message.
+    # Asserting the empty assessment list ties the claim in the test's name
+    # to the behaviour it actually depends on.
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
     decl_id = _seed_declaration(db, sid, "marketing.advertising")
@@ -208,11 +215,65 @@ def test_a_screened_out_target_is_not_reported_as_a_failure(db):
 
     run_generation(db, task_id)
 
+    assert _assessments_for_task(db, task_id) == [], (
+        "precondition: the target must actually have been skipped, not "
+        "merely have generated without incident"
+    )
     row = _task_row(db, task_id)
+    assert row["completed_count"] == 0
     assert row["status"] == "complete", (
         "a screen-out must never flip the run's status to error"
     )
     assert "fail" not in row["message"].lower()
+
+
+def test_a_run_with_zero_completions_from_both_skips_and_failures_names_both(
+    db, monkeypatch
+):
+    # Fix round 1 (Finding 1, important): with completed==0, the old
+    # completed==0 branch fell straight into `if failures:` and wrote "All
+    # {total} assessments failed" whenever there was at least one failure —
+    # silently folding any screened-out targets into that count. Three
+    # targets here: one screened out, two raise. completed stays 0, but the
+    # message must credit the skip as a skip, not as a third failure, and
+    # status must still be "error" because something genuinely broke (an
+    # all-skipped zero-completion run is the one case that is NOT an error
+    # — see test_a_screened_out_declaration_produces_no_assessment above).
+    from fides.api.privacycare import tasks as tasks_module
+
+    monkeypatch.setattr(
+        tasks_module,
+        "answer_questions",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated failure")),
+    )
+
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    out_decl = _seed_declaration(db, sid, "marketing.advertising")
+    fail_decl = _seed_declaration(db, sid, "essential.service.payment_processing")
+    _screen_out(db, out_decl)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assert _assessments_for_task(db, task_id) == []
+    row = _task_row(db, task_id)
+    assert row["total_count"] == 2
+    assert row["completed_count"] == 0
+    assert row["status"] == "error", (
+        "a genuine failure occurred and produced nothing — unlike an "
+        "all-screened-out run, this is not a successful outcome"
+    )
+    message = row["message"].lower()
+    assert "1 screened out" in message
+    assert "1 failed" in message
+    assert "all 2 assessments failed" not in message, (
+        "the screened-out target must never be folded into the failure count"
+    )
 
 
 def test_re_screening_a_declaration_back_in_lets_the_next_run_generate(db):

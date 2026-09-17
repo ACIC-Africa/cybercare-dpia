@@ -383,28 +383,30 @@ def run_generation(db: Session, task_id: str) -> None:
                     exc,
                 )
 
-    if completed == 0:
-        if failures:
-            message = f"All {total} assessments failed. First: {failures[0]}"
-            _finish(db, task_id, "error", total, 0, message)
-        else:
-            # Every target was screened out — skipped == total, no
-            # failures at all. That is the gate doing exactly its job, not
-            # a run with nothing to show for itself, so it is reported as
-            # `complete`, not `error`.
-            message = (
-                f"All {total} assessments were screened out; none required "
-                "a DPIA."
-            )
-            _finish(db, task_id, "complete", total, 0, message)
-        return
+    # Fix round 1 (coordinator review, Important finding): completed==0 used
+    # to branch on `if failures:` alone and, whenever true, report "All
+    # {total} assessments failed" — folding any screened-out targets
+    # silently into that count. Three targets, one screened out and two
+    # failing, used to read "All 3 assessments failed" even though only two
+    # did. The message below is built the same way regardless of how many
+    # completed (uniform with the completed>0 case just below it), so
+    # `completed`, `skipped`, and `len(failures)` always show up as three
+    # separate, addable numbers rather than two of them colliding into one.
+    #
+    # `status` is decided on its own, independently of the message: `error`
+    # only when at least one target genuinely failed AND nothing completed
+    # — a real problem produced zero output. Zero completions caused solely
+    # by screening (skipped == total, failures empty) is the gate doing
+    # exactly its job, not a run with nothing to show for itself, and is
+    # reported as `complete`.
+    status = "error" if (completed == 0 and failures) else "complete"
 
     message = f"Generated {completed} of {total} assessments."
     if skipped:
         message += f" {skipped} screened out (no DPIA required)."
     if failures:
         message += f" {len(failures)} failed: {failures[0]}"
-    _finish(db, task_id, "complete", total, completed, message)
+    _finish(db, task_id, status, total, completed, message)
 
 
 def _create_assessment(
