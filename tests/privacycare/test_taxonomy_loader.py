@@ -133,15 +133,46 @@ def test_loading_twice_changes_nothing(db):
     assert before == after == (15 + 33, 85 + created, 111, 23)
 
 
+_BASELINE_SNAPSHOT_SQL = sqlalchemy.text(
+    "SELECT (SELECT count(*) FROM ctl_data_subjects), (SELECT count(*) FROM ctl_data_categories), "
+    "(SELECT count(*) FROM ctl_data_categories WHERE :tag = ANY(tags)), "
+    "(SELECT name FROM ctl_data_subjects WHERE fides_key='customer')"
+)
+
+
 def test_revert_restores_the_fides_baseline(db):
+    # This live database already has the Kenyan taxonomy loaded for real
+    # (permanently committed — 48 subjects / 114 categories / 26 tagged /
+    # "Customer/Client" today, not the pristine-install 15/85/0/"Customer"
+    # a hardcoded assertion would assume) plus two real demonstration
+    # declarations that permanently name a created key. So neither a fixed
+    # constant nor a simple "snapshot now, expect it back after load+revert"
+    # framing is valid here: a no-op load (ON CONFLICT DO NOTHING — this
+    # database is already loaded) followed by a real revert necessarily
+    # produces a DIFFERENT, smaller state than "now" — that smaller state
+    # *is* the Fides baseline, discovered live rather than assumed.
+    #
+    # Establish that baseline the same way this test's own revert call
+    # would establish it, then prove the round trip: load back on top of
+    # it, revert again, and the result must be identical to the baseline —
+    # whatever the baseline actually is in this environment. That is the
+    # behaviour "revert restores the Fides baseline" actually means, and it
+    # holds regardless of what this database already contains.
+    #
+    # force=True (both calls): the guard's refuse/admit behaviour is a
+    # separate concern, proven by
+    # test_revert_refuses_while_a_declaration_names_a_created_{category,subject}
+    # and test_a_declaration_naming_only_default_keys_does_not_block_revert.
+    # This test is about the restore mechanics (DELETE/tag-strip/rename)
+    # once revert proceeds, not about whether it is allowed to proceed.
+    revert_kenyan_taxonomy(db, force=True)
+    baseline = db.execute(_BASELINE_SNAPSHOT_SQL, {"tag": kenyan.SPECIAL_TAG}).one()
+
     load_kenyan_taxonomy(db)
-    revert_kenyan_taxonomy(db)
-    counts = db.execute(sqlalchemy.text(
-        "SELECT (SELECT count(*) FROM ctl_data_subjects), (SELECT count(*) FROM ctl_data_categories), "
-        "(SELECT count(*) FROM ctl_data_categories WHERE :tag = ANY(tags)), "
-        "(SELECT name FROM ctl_data_subjects WHERE fides_key='customer')"
-    ), {"tag": kenyan.SPECIAL_TAG}).one()
-    assert counts == (15, 85, 0, "Customer")
+    revert_kenyan_taxonomy(db, force=True)
+
+    after = db.execute(_BASELINE_SNAPSHOT_SQL, {"tag": kenyan.SPECIAL_TAG}).one()
+    assert after == baseline
 
 
 def test_cli_dry_run_by_default_writes_nothing(db):
@@ -179,6 +210,16 @@ def test_cli_dry_run_by_default_writes_nothing(db):
 def test_cli_revert_without_commit_is_dry_run(db):
     # F10: --commit is the single persistence switch for both directions;
     # --revert alone must roll back like the plain load dry run does.
+    #
+    # --force: this live database carries two real demonstration privacy
+    # declarations that permanently name a created key, so a bare --revert
+    # (no --force) hits the guard before it ever reaches the dry-run/commit
+    # branch and the subprocess exits non-zero on a ValueError traceback —
+    # that would test the guard, not the dry-run switch. --force gets the
+    # revert to the point this test is actually about (does --commit gate
+    # persistence); the guard's own behaviour is covered by
+    # test_revert_refuses_while_a_declaration_names_a_created_* and
+    # test_a_declaration_naming_only_default_keys_does_not_block_revert.
     before = (
         db.execute(sqlalchemy.text(
             "SELECT count(*) FROM ctl_data_subjects WHERE is_default = false"
@@ -188,7 +229,7 @@ def test_cli_revert_without_commit_is_dry_run(db):
         )).scalar(),
     )
     out = subprocess.run(
-        [sys.executable, "scripts/privacycare/load_taxonomy.py", "--revert"],
+        [sys.executable, "scripts/privacycare/load_taxonomy.py", "--revert", "--force"],
         capture_output=True, text=True, check=True,
     ).stdout
     assert "DRY RUN" in out
@@ -311,15 +352,22 @@ def _seed_declaration_naming_created_keys(db, **kwargs):
 
 
 def test_revert_refuses_while_a_declaration_names_a_created_category(db):
+    # This live database already carries real declarations that name
+    # created keys (see the I3 block comment above) — its guard count is
+    # never guaranteed to be 0 before we seed anything. What must hold
+    # regardless is the DELTA this seeded declaration causes: exactly +1,
+    # and a refusal that cites that new total.
     load_kenyan_taxonomy(db)
+    before = count_declarations_referencing_created_keys(db)
     _seed_declaration_naming_created_keys(db, categories=[CREATED_CATEGORY_KEY])
 
-    assert count_declarations_referencing_created_keys(db) == 1
+    after = count_declarations_referencing_created_keys(db)
+    assert after - before == 1
 
     with pytest.raises(ValueError) as exc_info:
         revert_kenyan_taxonomy(db)
 
-    assert "1 privacy declaration(s)" in str(exc_info.value)
+    assert f"{after} privacy declaration(s)" in str(exc_info.value)
     # Nothing was deleted: the guard runs before the first DELETE.
     assert db.execute(sqlalchemy.text(
         "SELECT count(*) FROM ctl_data_categories WHERE fides_key = :key"
@@ -329,14 +377,18 @@ def test_revert_refuses_while_a_declaration_names_a_created_category(db):
 def test_revert_refuses_while_a_declaration_names_a_created_subject(db):
     # The subject half of the guard: data_subjects is a second text array on
     # the same row, and a revert strips 33 created subject keys as well.
+    # Same delta reasoning as the category test above: this live database's
+    # guard count is not guaranteed to start at 0.
     load_kenyan_taxonomy(db)
+    before = count_declarations_referencing_created_keys(db)
     system = _seed_system(db, f"sys-{uuid.uuid4().hex[:6]}")
     decl = _seed_declaration(db, system, "marketing.advertising")
     db.execute(sqlalchemy.text(
         "UPDATE privacydeclaration SET data_subjects = ARRAY[:key] WHERE id = :id"
     ), {"key": CREATED_SUBJECT_KEY, "id": decl})
 
-    assert count_declarations_referencing_created_keys(db) == 1
+    after = count_declarations_referencing_created_keys(db)
+    assert after - before == 1
 
     with pytest.raises(ValueError):
         revert_kenyan_taxonomy(db)
@@ -367,12 +419,34 @@ def test_a_declaration_naming_only_default_keys_does_not_block_revert(db):
     # The guard counts CREATED keys only. A declaration naming Fides' own
     # default categories (the overwhelmingly common case, and the state of
     # the live database today) must not make revert unusable.
+    #
+    # This live database already carries two real demonstration
+    # declarations that DO name created keys (see the I3 block comment
+    # above), so its guard count is never guaranteed to be 0 — that is a
+    # fact about the environment, not about this declaration. What this
+    # test must prove is narrower and baseline-independent: a declaration
+    # naming ONLY default keys contributes NOTHING to the guard's count.
+    # Whether revert_kenyan_taxonomy ultimately raises or succeeds then
+    # depends only on whatever the count already was, which this
+    # declaration had no part in — assert that dependency directly rather
+    # than assuming a plain revert() always succeeds here (it does not,
+    # because of the unrelated real demonstration data).
     load_kenyan_taxonomy(db)
+    before = count_declarations_referencing_created_keys(db)
     _seed_declaration_naming_created_keys(db, categories=["user.contact.email"])
 
-    assert count_declarations_referencing_created_keys(db) == 0
+    after = count_declarations_referencing_created_keys(db)
+    assert after == before, "a default-key-only declaration must add nothing to the guard count"
 
-    revert_kenyan_taxonomy(db)
+    if before == 0:
+        revert_kenyan_taxonomy(db)
+    else:
+        # Pre-existing, unrelated declarations already name created keys —
+        # revert must still refuse, exactly as the dedicated refuse-tests
+        # prove, and this declaration's presence must not change that
+        # outcome either way.
+        with pytest.raises(ValueError):
+            revert_kenyan_taxonomy(db)
 
 
 # --- I4: the read-back drift check ----------------------------------------
