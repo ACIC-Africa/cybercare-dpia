@@ -322,6 +322,25 @@ def run_generation(db: Session, task_id: str) -> None:
         # false about their own estate.
         if is_screened_out(db, target.declaration_id):
             skipped += len(templates)
+            # Fix round 1 (coordinator review, Important finding): persisted
+            # and committed HERE, immediately — not only at the run's final
+            # _finish call. is_screened_out() above sits outside every
+            # per-target try/except (see this loop's own comment), so an
+            # exception on the very NEXT target, or anywhere else between
+            # iterations, escapes run_generation entirely and _finish's
+            # final call — the one call site that used to write this row —
+            # is never reached. Without a durable write here, activities
+            # already, genuinely screened out earlier in this same run
+            # would read back as zero the instant a later target's lookup
+            # hit a transient error. This is the same crash window
+            # _current_counts already closes for total_count/completed_count
+            # by being committed as they accrue; skipped had not been
+            # extended to match until now. Safe against a later per-target
+            # db.rollback() in this same loop: SQLAlchemy's rollback() only
+            # undoes the transaction opened since the last commit, so this
+            # commit is unaffected by any later one.
+            _record_skip(db, task_id, skipped)
+            db.commit()
             logger.info(
                 "PrivacyCare generation skipping {} ({}): screened out, no "
                 "DPIA required",
@@ -486,10 +505,21 @@ def _finish(db, task_id, status, total, completed, message, skipped: int = 0) ->
 
 
 def _record_skip(db: Session, task_id: str, skipped_count: int) -> None:
-    """Persists how many activities this run's screening gate skipped.
-    Called only when skipped_count is non-zero (see _finish) — a run that
-    skipped nothing has nothing to say, and an absent row reads as zero
+    """Persists how many activities this run's screening gate has skipped
+    SO FAR. Called only when skipped_count is non-zero (see the call sites
+    in run_generation's loop, _finish, and _fail_task) — a run that skipped
+    nothing has nothing to say, and an absent row reads as zero
     (skipped_for_task below).
+
+    Fix round 1 (coordinator review, Important finding): called twice, not
+    once. run_generation's loop calls this immediately after every skip,
+    committed right there, so the count is durable before the NEXT target's
+    processing can throw and escape the run entirely (see that call site's
+    own comment for the crash this closes). _finish's own call at the end
+    of a normal run re-upserts the same final total — a harmless no-op
+    write, kept because it is what makes _finish's "record it in the same
+    transaction as the task row" guarantee hold for the ordinary
+    (non-crash) case.
 
     Upserts on task_id rather than plain-inserting: a re-run of generation
     for the same task_id must update the one row a unique index allows,
@@ -543,10 +573,29 @@ def _fail_task(db: Session, task_id: str, exc: Exception) -> None:
     run_generation itself has) would then report having produced NONE. The
     counts are re-read from the row (see _current_counts) rather than
     assumed, and preserved in the error message.
+
+    Fix round 1, Task 1 (coordinator review, Important finding): `skipped`
+    gets the identical treatment, via skipped_for_task rather than a second
+    private reader — there is nothing task-row-specific left to duplicate,
+    unlike _current_counts, which reads privacy_assessment_task itself.
+    Passed through to _finish so a rolled-back-and-retried write does not
+    disturb the row run_generation's loop already committed; _finish's
+    `if skipped:` guard makes this call a no-op when nothing was ever
+    skipped, matching skipped_for_task's own "0 for no row" contract rather
+    than writing a stray zero row.
     """
     db.rollback()
     total, completed = _current_counts(db, task_id)
-    _finish(db, task_id, "error", total, completed, f"Generation failed: {exc}")
+    skipped = skipped_for_task(db, task_id)
+    _finish(
+        db,
+        task_id,
+        "error",
+        total,
+        completed,
+        f"Generation failed: {exc}",
+        skipped=skipped,
+    )
 
 
 @celery_app.task(base=DatabaseTask, bind=True, name=GENERATION_TASK_NAME)

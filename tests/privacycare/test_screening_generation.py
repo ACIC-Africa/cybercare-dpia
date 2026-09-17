@@ -20,6 +20,7 @@ import os
 import re
 import uuid
 
+import pytest
 import sqlalchemy
 
 from fides.api.privacycare.screening.gate import record_decision
@@ -28,6 +29,7 @@ from tests.privacycare.test_context import _seed_declaration, _seed_system
 from tests.privacycare.test_tasks import (
     _assessments_for_task,
     _full_coverage_template,
+    _run_wrapper,
     _seed_task,
     _task_row,
     db,  # noqa: F401 - reused fixture, not a local definition
@@ -462,3 +464,60 @@ def test_the_migration_creates_only_the_generation_skip_table():
     )
     assert "op.alter_column" not in source
     assert "op.add_column" not in source
+
+
+def test_a_crash_after_real_skips_does_not_report_zero_skipped(
+    db, monkeypatch  # noqa: F811
+):
+    # Fix round 1 (coordinator review, Important finding, self-flagged in
+    # the task-1 report): `_fail_task` never persisted a skip count, so a
+    # crash between loop iterations reported skipped_for_task == 0 even
+    # when earlier targets in the SAME run had genuinely been screened out
+    # moments before. `skipped` lived only as a local Python integer until
+    # the run's final _finish call, which a crash never reaches.
+    #
+    # This drives the REAL run_generation through the REAL Celery wrapper
+    # (_run_wrapper, same helper test_tasks.py's own wrapper tests use) so
+    # both the accrual and the failure path are exercised as they actually
+    # run in production, not reimplemented by hand. Two declarations are
+    # screened out for real; a third's is_screened_out lookup is made to
+    # raise, simulating exactly the "transient database error mid-loop"
+    # scenario the finding describes — is_screened_out is called directly
+    # in the for loop, outside every per-target try/except, so this
+    # exception escapes run_generation entirely.
+    from fides.api.privacycare import tasks as tasks_module
+
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    out_decl_1 = _seed_declaration(db, sid, "a.screened.one")
+    out_decl_2 = _seed_declaration(db, sid, "b.screened.two")
+    crash_decl = _seed_declaration(db, sid, "c.crashes")
+    _screen_out(db, out_decl_1)
+    _screen_out(db, out_decl_2)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    # Committed, not merely flushed: _fail_task opens with db.rollback() to
+    # clear a poisoned transaction (see test_tasks.py's
+    # test_the_celery_wrapper_records_a_failure_and_re_raises, same reason),
+    # and an uncommitted seed would vanish with it.
+    db.commit()
+
+    real_is_screened_out = tasks_module.is_screened_out
+
+    def _screened_out_then_boom(db_, declaration_id):
+        if declaration_id == crash_decl:
+            raise RuntimeError("transient database error")
+        return real_is_screened_out(db_, declaration_id)
+
+    monkeypatch.setattr(tasks_module, "is_screened_out", _screened_out_then_boom)
+
+    with pytest.raises(RuntimeError, match="transient database error"):
+        _run_wrapper(db, task_id)
+
+    assert skipped_for_task(db, task_id) == 2, (
+        "two activities were genuinely screened out before the crash on a "
+        "third target's gate lookup — that fact must survive the crash, "
+        "not reset to zero because it lived only in a local variable until "
+        "a final _finish call the crash never let the run reach"
+    )
