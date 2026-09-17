@@ -144,6 +144,38 @@ def test_all_six_triggers_mean_a_dpia_is_required(db, triggers, declaration_id):
     assert verdict.triggered_keys == sorted(TRIGGER_KEYS)
 
 
+def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, declaration_id):
+    # Final review fix (Minor 5): record_decision dedups via
+    # sorted(set(triggered_keys)) before deriving dpia_required or writing
+    # the row (gate.py's own comment: "a duplicate tick ... collapses to
+    # one entry rather than being treated as meaningfully different from
+    # ticking it once"). Benign and documented, but unrequested behaviour
+    # in the one function this brief was strict about not inventing rules
+    # in, and until now nothing pinned it — a future edit could silently
+    # start storing duplicates (or rejecting them) with no test noticing.
+    verdict = record_decision(
+        db,
+        declaration_id=declaration_id,
+        triggered_keys=["large_scale", "large_scale", "new_technology"],
+        justification=None,
+        decided_by="carol@example.com",
+    )
+
+    assert verdict.triggered_keys == ["large_scale", "new_technology"]
+
+    stored = db.execute(
+        sqlalchemy.text(
+            "SELECT triggered_keys FROM privacycare_screening_decision "
+            "WHERE declaration_id = :id"
+        ),
+        {"id": declaration_id},
+    ).scalar()
+    assert stored == ["large_scale", "new_technology"], (
+        "the duplicate must never reach the stored row either — the "
+        "verdict handed back and what was written must agree"
+    )
+
+
 def test_no_triggers_means_screened_out(db, triggers, declaration_id):
     verdict = record_decision(
         db,
