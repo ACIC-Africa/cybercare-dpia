@@ -288,17 +288,44 @@ def test_a_caller_cannot_pass_dpia_required(db, triggers, declaration_id):
 
 
 def test_a_failed_record_writes_nothing(db, triggers, declaration_id):
-    with pytest.raises(HTTPException):
-        _record(db, declaration_id, triggered_keys=["not_a_real_trigger"], justification=None)
+    # Final review fix: the route's ValueError path (screening.py) calls a
+    # REAL db.rollback() — this file's `db` fixture only patches `commit`,
+    # never `rollback` (unlike test_tasks.py's savepoint-based fixture,
+    # which this file deliberately does not use — see test_api_risk.py's
+    # sibling rollback-only fixture for the same shape). A real rollback()
+    # here discards the WHOLE transaction, including this test's own
+    # `declaration_id`/`triggers` fixture rows, on top of anything
+    # record_decision itself wrote. That makes the follow-up count query
+    # return 0 unconditionally — before this fix, moving record_decision's
+    # INSERT ahead of its own validation checks left this test green.
+    #
+    # Stubbed locally with a plain attribute assignment, not the shared
+    # `monkeypatch` fixture: `monkeypatch` here would be the SAME instance
+    # the `db` fixture already used to patch `commit`, and both patches
+    # would then be undone together, at monkeypatch's own teardown — which
+    # runs AFTER the `db` fixture's finalizer (session.rollback(), fixture
+    # teardown is LIFO and `db` was set up before `monkeypatch` could be
+    # requested here). That would leave the fixture's own cleanup rollback
+    # stubbed to flush too, and this test's writes would survive into the
+    # real dev database. Manual save/restore in `finally` sidesteps that
+    # entirely: the real method is back in place before this function
+    # returns, so the `db` fixture's own teardown rolls back for real.
+    real_rollback = db.rollback
+    db.rollback = db.flush
+    try:
+        with pytest.raises(HTTPException):
+            _record(db, declaration_id, triggered_keys=["not_a_real_trigger"], justification=None)
 
-    remaining = db.execute(
-        sqlalchemy.text(
-            "SELECT count(*) FROM privacycare_screening_decision "
-            "WHERE declaration_id = :id"
-        ),
-        {"id": declaration_id},
-    ).scalar()
-    assert remaining == 0
+        remaining = db.execute(
+            sqlalchemy.text(
+                "SELECT count(*) FROM privacycare_screening_decision "
+                "WHERE declaration_id = :id"
+            ),
+            {"id": declaration_id},
+        ).scalar()
+        assert remaining == 0
+    finally:
+        db.rollback = real_rollback
 
 
 # --- Route ordering ------------------------------------------------------
