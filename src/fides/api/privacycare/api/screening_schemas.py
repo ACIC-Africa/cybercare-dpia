@@ -53,8 +53,13 @@ class ScreeningVerdictResponse(BaseModel):
     # decision has no id to do it with; nothing in this response invents
     # one.
     #
+    # UPDATE (plan 20, Task 3): declaration_id -> business_process_id.
+    # Screening is keyed to the customer's business process (86 of them),
+    # not a processing activity (2 of them, both invented) — see
+    # api/screening.py's module docstring for the full re-key rationale.
+    #
     # No TypeScript counterpart: same reasoning as TriggerResponse above.
-    declaration_id: str
+    business_process_id: str
     dpia_required: bool
     triggered_keys: List[str]
     justification: Optional[str]
@@ -64,23 +69,65 @@ class ScreeningVerdictResponse(BaseModel):
 
 class CurrentScreeningResponse(BaseModel):
     # THE DISTINCTION THIS TASK EXISTS TO PRESERVE. verdict is None for a
-    # declaration that has never been screened — a legitimate 200, not a
-    # 404 and not a fabricated screen-out — while an unknown declaration_id
-    # never reaches this model at all (api/screening.py's own existence
-    # check raises 404 first). declaration_id is echoed back even when
-    # verdict is None so the body still names the resource it answered
-    # about rather than being an ambiguous empty response.
+    # business process that has never been screened — a legitimate 200,
+    # not a 404 and not a fabricated screen-out — while an unknown
+    # business_process_id never reaches this model at all
+    # (api/screening.py's own existence check raises 404 first).
+    # business_process_id is echoed back even when verdict is None so the
+    # body still names the resource it answered about rather than being an
+    # ambiguous empty response.
     #
     # No TypeScript counterpart: same reasoning as TriggerResponse above.
-    declaration_id: str
+    business_process_id: str
     verdict: Optional[ScreeningVerdictResponse]
 
 
 class ScreeningHistoryResponse(BaseModel):
-    # Every screening decision ever recorded for this declaration, newest
-    # first (gate.decision_history's own ordering) — empty, not 404, for a
-    # declaration that exists but has never been screened.
+    # Every screening decision ever recorded for this business process,
+    # newest first (gate.decision_history's own ordering) — empty, not
+    # 404, for a business process that exists but has never been screened.
     #
     # No TypeScript counterpart: same reasoning as TriggerResponse above.
-    declaration_id: str
+    business_process_id: str
     decisions: List[ScreeningVerdictResponse]
+
+
+class ScreeningStatusResponse(BaseModel):
+    # One row of GET /api/v1/privacycare/screening (plan 20, Task 3) — the
+    # list Carol works through in a single session, not one business
+    # process's detail. dpia_required, decided_by and decided_at are None
+    # together, always: a business process that has never been screened
+    # has no verdict, no decider and no timestamp, never any other
+    # combination (mirrors CurrentScreeningResponse.verdict's own
+    # None-means-unscreened contract, flattened onto one row instead of a
+    # nested object because this response exists to be scanned across
+    # 86+ rows at once, not read one at a time).
+    #
+    # has_mapping is true only when this business process links (through
+    # privacycare_process_declaration) to a privacy_declaration_id that
+    # ACTUALLY RESOLVES to a live privacydeclaration row — an orphan link
+    # (a declaration deleted after the link was made; one exists in this
+    # customer's live data) must not read as "mapped", and must not raise
+    # trying to find out. See api/screening.py's _LIST_SCREENING_STATUS_SQL
+    # for the join that makes that true.
+    #
+    # No TypeScript counterpart: same reasoning as TriggerResponse above.
+    business_process_id: str
+    name: str
+    business_cycle: Optional[str]
+    dpia_required: Optional[bool]
+    decided_by: Optional[str]
+    decided_at: Optional[datetime]
+    has_mapping: bool
+
+
+class ScreeningListResponse(BaseModel):
+    # A plain envelope, not fastapi_pagination.Page (contrast
+    # processes.py's list_business_processes) — the whole point of this
+    # route is fetching every business process's screening status in ONE
+    # call so the screen can filter by business cycle client-side; a
+    # paginated response would just move the "86 calls" problem into the
+    # browser instead of removing it.
+    #
+    # No TypeScript counterpart: same reasoning as TriggerResponse above.
+    processes: List[ScreeningStatusResponse]

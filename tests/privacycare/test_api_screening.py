@@ -1,4 +1,5 @@
-"""The screening gate's HTTP surface (plan 18, Task 4).
+"""The screening gate's HTTP surface (plan 18, Task 4; re-keyed to the
+business process, plus the list route, in plan 20, Task 3).
 
 Follows api/risk.py (plan 17) and its test file's own shape: routes are
 called directly as plain functions against a rolled-back session (no
@@ -18,10 +19,21 @@ given key is valid to screen against), never about the fixture's own
 throwaway label/description text, with the one exception noted at
 test_triggers_come_back_in_display_order itself.
 
-THE DISTINCTION THIS FILE EXISTS TO PROVE: an unknown declaration_id is a
-404 on every read AND the write route; a declaration that exists but has
-never been screened is a 200 with no verdict — never collapsed into
-either the 404 case or a fabricated "screened out".
+UPDATE (plan 20, Task 3): screening is now keyed to a business process
+(privacycare_business_process — 86 of the customer's own, real ones), not
+a processing activity (privacydeclaration — 2 of those, both invented).
+Every fixture and test below was re-keyed from declaration_id to
+business_process_id — see api/screening.py's own module docstring for the
+full rationale. This file also gained the list route
+(GET /api/v1/privacycare/screening) the screen cannot work without: every
+business process with its status, in one call.
+
+THE DISTINCTION THIS FILE EXISTS TO PROVE: an unknown business_process_id
+is a 404 on every id-keyed read AND the write route; a business process
+that exists but has never been screened is a 200 with no verdict — never
+collapsed into either the 404 case or a fabricated "not applicable" — and
+that holds on the list route too: an unscreened process is listed WITH a
+None verdict, not omitted and not 404'd.
 """
 import uuid
 
@@ -34,6 +46,7 @@ from fides.api.oauth.roles import CONTRIBUTOR, OWNER, ROLES_TO_SCOPES_MAPPING, V
 from fides.api.privacycare.api.screening import (
     get_current_screening_verdict,
     get_screening_history,
+    list_screening_status,
     list_screening_triggers,
     record_screening_decision,
 )
@@ -99,21 +112,66 @@ def triggers(db):
     return TRIGGER_KEYS
 
 
+def _seed_business_process(db, name: str, business_cycle: str) -> str:
+    """Seeds one of the customer's own business processes (her register,
+    not a generic fixture name) — screening now reads/writes against
+    privacycare_business_process, not privacydeclaration. Same helper,
+    same reasoning, as test_screening_gate.py's own
+    _seed_business_process."""
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, business_cycle) "
+            "VALUES (:id, :name, :cycle)"
+        ),
+        {"id": process_id, "name": name, "cycle": business_cycle},
+    )
+    return process_id
+
+
+def _link_declaration(db, business_process_id: str, declaration_id: str) -> None:
+    """Seeds one privacycare_process_declaration row linking a business
+    process to a processing activity — this is the join the list route's
+    has_mapping reads through. declaration_id need not resolve to a real
+    privacydeclaration row: this helper is also how these tests create an
+    ORPHAN link (mirrors the one real orphan row in this customer's live
+    data, whose privacy_declaration_id no longer exists) to prove the list
+    route tolerates it rather than crashing or misreporting it as mapped."""
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_process_declaration "
+            "(id, business_process_id, privacy_declaration_id) "
+            "VALUES (:id, :process_id, :declaration_id)"
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "process_id": business_process_id,
+            "declaration_id": declaration_id,
+        },
+    )
+
+
 @pytest.fixture
-def declaration_id(db) -> str:
-    system_id = _seed_system(db, f"sys_{uuid.uuid4().hex[:8]}")
-    return _seed_declaration(db, system_id, "marketing")
+def business_process_id(db) -> str:
+    return _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
 
 
-def _record(db, declaration_id, **overrides):
+def _record(db, business_process_id, **overrides):
     body = dict(triggered_keys=[], justification="Internal only, no external sharing.")
     body.update(overrides)
     return record_screening_decision(
-        declaration_id,
+        business_process_id,
         ScreeningDecisionRequest(**body),
         db=db,
         client=_fake_client("carol@example.com"),
     )
+
+
+def _find(processes, business_process_id: str):
+    for process in processes:
+        if process.business_process_id == business_process_id:
+            return process
+    raise AssertionError(f"{business_process_id!r} missing from the list response")
 
 
 # --- Triggers route ------------------------------------------------------
@@ -150,52 +208,124 @@ def test_triggers_route_is_a_200_empty_envelope_when_nothing_is_seeded(db):
     assert response.triggers == []
 
 
+# --- List route ------------------------------------------------------------
+
+
+def test_the_list_route_returns_a_never_screened_process_with_no_verdict(db, triggers):
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+
+    response = list_screening_status(db=db)
+
+    row = _find(response.processes, process_id)
+    assert row.name == "Fuel Card Issuance"
+    assert row.business_cycle == "Card Operations"
+    assert row.dpia_required is None
+    assert row.decided_by is None
+    assert row.decided_at is None
+    assert row.has_mapping is False
+
+
+def test_recording_a_decision_changes_what_the_list_route_returns(db, triggers):
+    process_id = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+
+    before = _find(list_screening_status(db=db).processes, process_id)
+    assert before.dpia_required is None
+    assert before.decided_by is None
+
+    _record(db, process_id, triggered_keys=["large_scale"], justification=None)
+
+    after = _find(list_screening_status(db=db).processes, process_id)
+    assert after.dpia_required is True
+    assert after.decided_by == "carol@example.com"
+    assert after.decided_at is not None
+
+
+def test_the_list_route_sorts_by_business_cycle_then_name(db):
+    # Two processes with distinct, sortable business-cycle names, seeded
+    # inside this test's own rolled-back transaction so ordering is judged
+    # only between them (relative position via .index()), never against an
+    # assumed total count or position in a list that also carries this
+    # customer's 86+ live rows.
+    suffix = uuid.uuid4().hex[:6]
+    cycle_a = f"AAA cycle {suffix}"
+    cycle_z = f"ZZZ cycle {suffix}"
+    first = _seed_business_process(db, "Fraud Risk Assessments", cycle_a)
+    second = _seed_business_process(db, "CSR Planning & Execution", cycle_z)
+
+    ids = [p.business_process_id for p in list_screening_status(db=db).processes]
+
+    assert ids.index(first) < ids.index(second)
+
+
+def test_the_list_route_reports_a_mapping_only_when_the_link_resolves(db):
+    process_id = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    system_id = _seed_system(db, f"sys_{uuid.uuid4().hex[:8]}")
+    declaration_id = _seed_declaration(db, system_id, "marketing")
+    _link_declaration(db, process_id, declaration_id)
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.has_mapping is True
+
+
+def test_an_orphan_mapping_link_is_not_reported_as_mapped_and_does_not_crash(db):
+    # Mirrors this customer's own live data: one privacycare_process_
+    # declaration row whose privacy_declaration_id no longer resolves to
+    # any privacydeclaration row (a declaration deleted after the link was
+    # made). The list route must not treat that as "mapped", and must not
+    # raise trying to find out.
+    process_id = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    _link_declaration(db, process_id, "decl_deleted_last_year")
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.has_mapping is False
+
+
 # --- Current verdict route -------------------------------------------------
 
 
-def test_an_unscreened_declaration_is_a_200_with_no_verdict_not_a_404(db, declaration_id):
-    response = get_current_screening_verdict(declaration_id, db=db)
+def test_an_unscreened_process_is_a_200_with_no_verdict_not_a_404(db, business_process_id):
+    response = get_current_screening_verdict(business_process_id, db=db)
 
-    assert response.declaration_id == declaration_id
+    assert response.business_process_id == business_process_id
     assert response.verdict is None
 
 
-def test_an_unknown_declaration_id_is_404_on_current_verdict(db):
+def test_an_unknown_business_process_id_is_404_on_current_verdict(db):
     with pytest.raises(HTTPException) as caught:
         get_current_screening_verdict(str(uuid.uuid4()), db=db)
     assert caught.value.status_code == 404
 
 
-def test_recording_a_decision_changes_the_current_verdict(db, triggers, declaration_id):
-    before = get_current_screening_verdict(declaration_id, db=db)
+def test_recording_a_decision_changes_the_current_verdict(db, triggers, business_process_id):
+    before = get_current_screening_verdict(business_process_id, db=db)
     assert before.verdict is None
 
-    _record(db, declaration_id, triggered_keys=["large_scale"], justification=None)
+    _record(db, business_process_id, triggered_keys=["large_scale"], justification=None)
 
-    after = get_current_screening_verdict(declaration_id, db=db)
+    after = get_current_screening_verdict(business_process_id, db=db)
     assert after.verdict is not None
     assert after.verdict.dpia_required is True
     assert after.verdict.triggered_keys == ["large_scale"]
-    assert after.verdict.declaration_id == declaration_id
+    assert after.verdict.business_process_id == business_process_id
     assert after.verdict.decided_by == "carol@example.com"
 
 
 # --- History route --------------------------------------------------------
 
 
-def test_history_is_empty_for_a_never_screened_declaration(db, declaration_id):
-    response = get_screening_history(declaration_id, db=db)
-    assert response.declaration_id == declaration_id
+def test_history_is_empty_for_a_never_screened_process(db, business_process_id):
+    response = get_screening_history(business_process_id, db=db)
+    assert response.business_process_id == business_process_id
     assert response.decisions == []
 
 
-def test_an_unknown_declaration_id_is_404_on_history(db):
+def test_an_unknown_business_process_id_is_404_on_history(db):
     with pytest.raises(HTTPException) as caught:
         get_screening_history(str(uuid.uuid4()), db=db)
     assert caught.value.status_code == 404
 
 
-def _backdate(db, declaration_id: str, triggered_keys: list, *, hours: int) -> None:
+def _backdate(db, business_process_id: str, triggered_keys: list, *, hours: int) -> None:
     """Pushes one decision's decided_at into the past by hand — same
     reasoning as test_screening_gate.py's own _backdate: this test's
     session never commits, so Postgres' now() (decided_at's server_default)
@@ -206,20 +336,20 @@ def _backdate(db, declaration_id: str, triggered_keys: list, *, hours: int) -> N
         sqlalchemy.text(
             "UPDATE privacycare_screening_decision "
             "SET decided_at = decided_at - (:hours || ' hours')::interval "
-            "WHERE declaration_id = :decl_id AND triggered_keys = :keys"
+            "WHERE business_process_id = :process_id AND triggered_keys = :keys"
         ),
-        {"hours": hours, "decl_id": declaration_id, "keys": triggered_keys},
+        {"hours": hours, "process_id": business_process_id, "keys": triggered_keys},
     )
 
 
-def test_history_returns_both_decisions_after_rescreening(db, triggers, declaration_id):
-    _record(db, declaration_id, triggered_keys=[], justification="Nothing ticked this quarter.")
-    _backdate(db, declaration_id, [], hours=1)
-    _record(db, declaration_id, triggered_keys=["special_category"], justification=None)
+def test_history_returns_both_decisions_after_rescreening(db, triggers, business_process_id):
+    _record(db, business_process_id, triggered_keys=[], justification="Nothing ticked this quarter.")
+    _backdate(db, business_process_id, [], hours=1)
+    _record(db, business_process_id, triggered_keys=["special_category"], justification=None)
 
-    response = get_screening_history(declaration_id, db=db)
+    response = get_screening_history(business_process_id, db=db)
 
-    assert response.declaration_id == declaration_id
+    assert response.business_process_id == business_process_id
     assert len(response.decisions) == 2
     assert {d.dpia_required for d in response.decisions} == {True, False}
     # Newest first (gate.decision_history's own ordering).
@@ -230,13 +360,13 @@ def test_history_returns_both_decisions_after_rescreening(db, triggers, declarat
 # --- Record decision route -------------------------------------------------
 
 
-def test_record_returns_the_created_verdict(db, triggers, declaration_id):
+def test_record_returns_the_created_verdict(db, triggers, business_process_id):
     verdict = _record(
-        db, declaration_id, triggered_keys=["new_technology", "large_scale"],
+        db, business_process_id, triggered_keys=["new_technology", "large_scale"],
         justification=None,
     )
 
-    assert verdict.declaration_id == declaration_id
+    assert verdict.business_process_id == business_process_id
     assert verdict.dpia_required is True
     assert verdict.triggered_keys == ["large_scale", "new_technology"]
     assert verdict.justification is None
@@ -244,31 +374,31 @@ def test_record_returns_the_created_verdict(db, triggers, declaration_id):
     assert verdict.decided_at is not None
 
 
-def test_a_screen_out_without_a_justification_is_400(db, triggers, declaration_id):
+def test_a_screen_out_without_a_justification_is_400(db, triggers, business_process_id):
     with pytest.raises(HTTPException) as caught:
-        _record(db, declaration_id, triggered_keys=[], justification=None)
+        _record(db, business_process_id, triggered_keys=[], justification=None)
     assert caught.value.status_code == 400
 
 
-def test_a_screen_out_with_a_blank_justification_is_400(db, triggers, declaration_id):
+def test_a_screen_out_with_a_blank_justification_is_400(db, triggers, business_process_id):
     with pytest.raises(HTTPException) as caught:
-        _record(db, declaration_id, triggered_keys=[], justification="   ")
+        _record(db, business_process_id, triggered_keys=[], justification="   ")
     assert caught.value.status_code == 400
 
 
-def test_an_unknown_trigger_key_is_400(db, triggers, declaration_id):
+def test_an_unknown_trigger_key_is_400(db, triggers, business_process_id):
     with pytest.raises(HTTPException) as caught:
-        _record(db, declaration_id, triggered_keys=["not_a_real_trigger"], justification=None)
+        _record(db, business_process_id, triggered_keys=["not_a_real_trigger"], justification=None)
     assert caught.value.status_code == 400
 
 
-def test_recording_against_an_unknown_declaration_is_404(db, triggers):
+def test_recording_against_an_unknown_business_process_is_404(db, triggers):
     with pytest.raises(HTTPException) as caught:
         _record(db, str(uuid.uuid4()), triggered_keys=["large_scale"], justification=None)
     assert caught.value.status_code == 404
 
 
-def test_a_caller_cannot_pass_dpia_required(db, triggers, declaration_id):
+def test_a_caller_cannot_pass_dpia_required(db, triggers, business_process_id):
     # ScreeningDecisionRequest carries no dpia_required field at all —
     # record_decision (gate.py) derives it from triggered_keys and does not
     # accept it as an argument. Pydantic's default extra="ignore" means a
@@ -282,19 +412,19 @@ def test_a_caller_cannot_pass_dpia_required(db, triggers, declaration_id):
     assert not hasattr(request, "dpia_required")
 
     verdict = record_screening_decision(
-        declaration_id, request, db=db, client=_fake_client("carol@example.com"),
+        business_process_id, request, db=db, client=_fake_client("carol@example.com"),
     )
     assert verdict.dpia_required is True
 
 
-def test_a_failed_record_writes_nothing(db, triggers, declaration_id):
+def test_a_failed_record_writes_nothing(db, triggers, business_process_id):
     # Final review fix: the route's ValueError path (screening.py) calls a
     # REAL db.rollback() — this file's `db` fixture only patches `commit`,
     # never `rollback` (unlike test_tasks.py's savepoint-based fixture,
     # which this file deliberately does not use — see test_api_risk.py's
     # sibling rollback-only fixture for the same shape). A real rollback()
     # here discards the WHOLE transaction, including this test's own
-    # `declaration_id`/`triggers` fixture rows, on top of anything
+    # `business_process_id`/`triggers` fixture rows, on top of anything
     # record_decision itself wrote. That makes the follow-up count query
     # return 0 unconditionally — before this fix, moving record_decision's
     # INSERT ahead of its own validation checks left this test green.
@@ -314,14 +444,14 @@ def test_a_failed_record_writes_nothing(db, triggers, declaration_id):
     db.rollback = db.flush
     try:
         with pytest.raises(HTTPException):
-            _record(db, declaration_id, triggered_keys=["not_a_real_trigger"], justification=None)
+            _record(db, business_process_id, triggered_keys=["not_a_real_trigger"], justification=None)
 
         remaining = db.execute(
             sqlalchemy.text(
                 "SELECT count(*) FROM privacycare_screening_decision "
-                "WHERE declaration_id = :id"
+                "WHERE business_process_id = :id"
             ),
-            {"id": declaration_id},
+            {"id": business_process_id},
         ).scalar()
         assert remaining == 0
     finally:
@@ -331,16 +461,16 @@ def test_a_failed_record_writes_nothing(db, triggers, declaration_id):
 # --- Route ordering ------------------------------------------------------
 
 
-def test_the_triggers_route_is_matched_before_the_declaration_id_route():
-    # GET /triggers would otherwise be swallowed by GET /{declaration_id}
-    # (declaration_id="triggers"), and the triggers route would 404 forever
-    # against a route that demonstrably exists — same hazard, same fix
-    # shape, as test_api_tasks.py's test_the_tasks_route_is_matched_before_
-    # the_assessment_id_route. A comment at the decorators documents the
-    # ordering; this test is the guard that actually catches a regression
-    # (screening.py's route functions are called directly everywhere else
-    # in this file, which proves each route WORKS but not that FastAPI
-    # would ever reach it through the real dispatch path).
+def test_the_triggers_route_is_matched_before_the_business_process_id_route():
+    # GET /triggers would otherwise be swallowed by GET /{business_process_id}
+    # (business_process_id="triggers"), and the triggers route would 404
+    # forever against a route that demonstrably exists — same hazard, same
+    # fix shape, as test_api_tasks.py's test_the_tasks_route_is_matched_
+    # before_the_assessment_id_route. A comment at the decorators documents
+    # the ordering; this test is the guard that actually catches a
+    # regression (screening.py's route functions are called directly
+    # everywhere else in this file, which proves each route WORKS but not
+    # that FastAPI would ever reach it through the real dispatch path).
     #
     # route.path on this router carries the full PRIVACYCARE_SCREENING_PREFIX
     # prefix (Fides' APIRouter subclass applies it at add_api_route time,
@@ -353,7 +483,7 @@ def test_the_triggers_route_is_matched_before_the_declaration_id_route():
 
     paths = [route.path for route in privacycare_screening_router.routes]
     assert paths.index(f"{PRIVACYCARE_SCREENING_PREFIX}/triggers") < paths.index(
-        f"{PRIVACYCARE_SCREENING_PREFIX}/{{declaration_id}}"
+        f"{PRIVACYCARE_SCREENING_PREFIX}/{{business_process_id}}"
     )
 
 
@@ -361,10 +491,11 @@ def test_the_triggers_route_is_matched_before_the_declaration_id_route():
 
 
 def test_viewer_can_read_but_not_write_while_owner_and_contributor_do_both():
-    # A screening decision names an activity (which triggers were ticked, a
-    # free-text justification for a screen-out), never a data subject — same
-    # reasoning PRIVACYCARE_RISK_READ's grant to Viewer records (roles.py) —
-    # so Viewer gets the read scope outright; the write scope does not.
+    # A screening decision names a business process (which triggers were
+    # ticked, a free-text justification for a screen-out), never a data
+    # subject — same reasoning PRIVACYCARE_RISK_READ's grant to Viewer
+    # records (roles.py) — so Viewer gets the read scope outright; the
+    # write scope does not.
     assert PRIVACYCARE_SCREENING_READ in ROLES_TO_SCOPES_MAPPING[VIEWER]
     assert PRIVACYCARE_SCREENING_CREATE not in ROLES_TO_SCOPES_MAPPING[VIEWER]
 
@@ -409,11 +540,11 @@ def test_every_screening_route_requires_its_declared_scope():
             ), f"{route.path} [{method}] does not require {expected_scope!r}"
             checked += 1
 
-    # 4 logical routes (triggers, current verdict, history, record decision),
-    # one HTTP method apiece — but fides.api.util.api_router.APIRouter
-    # registers BOTH a trailing-slash and a no-trailing-slash variant of
-    # every path as separate route objects (same guard as
-    # test_every_risk_route_requires_its_declared_scope /
-    # test_every_dsr_route_requires_its_declared_scope), so app.routes holds
-    # two entries per logical route: 4 * 2 = 8.
-    assert checked == 8, f"expected 8 screening route/method pairs, checked {checked}"
+    # 5 logical routes (list every process's status, triggers, current
+    # verdict, history, record decision), one HTTP method apiece — but
+    # fides.api.util.api_router.APIRouter registers BOTH a trailing-slash
+    # and a no-trailing-slash variant of every path as separate route
+    # objects (same guard as test_every_risk_route_requires_its_declared_
+    # scope / test_every_dsr_route_requires_its_declared_scope), so
+    # app.routes holds two entries per logical route: 5 * 2 = 10.
+    assert checked == 10, f"expected 10 screening route/method pairs, checked {checked}"

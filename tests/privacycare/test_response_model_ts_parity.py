@@ -407,6 +407,26 @@ ALLOWLIST: dict[str, dict] = {
             "No TS counterpart, same reason as TriggerResponse above."
         ),
     },
+    # GET /api/v1/privacycare/screening (plan 20, Task 3): the list route
+    # the screening screen depends on most. Same "no shipped admin-UI
+    # screen calls this" reasoning as TriggerResponse above — the screen
+    # this route serves is built from prompts/ once this plan lands, per
+    # this plan's own "Not in this plan" note.
+    "ScreeningStatusResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above. Also "
+            "recursed into from ScreeningListResponse.processes, covered by "
+            "its own entry below — no separate discovery happens for it "
+            "there."
+        ),
+    },
+    "ScreeningListResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above."
+        ),
+    },
 }
 
 
