@@ -89,7 +89,7 @@ PRIVACYCARE_CONSENT = "privacycare_consent"
 # same reason PRIVACYCARE_DISCOVERY, PRIVACYCARE_DSR and PRIVACYCARE_CONSENT
 # do.
 PRIVACYCARE_RISK = "privacycare_risk"
-# PrivacyCare (spec 2026-09-17 D-W2-7): the DPIA screening gate is ours —
+# PrivacyCare (spec 2026-09-16 D-W2-7): the DPIA screening gate is ours —
 # screening/gate.py's verdict (does an activity even need a DPIA at all) has
 # no Fides concept behind it — so it gets its own scope name for the same
 # reason PRIVACYCARE_DISCOVERY, PRIVACYCARE_DSR, PRIVACYCARE_CONSENT and
@@ -290,7 +290,7 @@ PRIVACYCARE_CONSENT_READ = f"{PRIVACYCARE_CONSENT}:{READ}"
 PRIVACYCARE_RISK_READ = f"{PRIVACYCARE_RISK}:{READ}"
 PRIVACYCARE_RISK_CREATE = f"{PRIVACYCARE_RISK}:{CREATE}"
 
-# PrivacyCare (spec 2026-09-17 D-W2-7). _CREATE, not _UPDATE, same
+# PrivacyCare (spec 2026-09-16 D-W2-7). _CREATE, not _UPDATE, same
 # one-write-scope-for-every-write-verb shape PRIVACYCARE_RISK_CREATE and
 # PRIVACYCARE_DSR_UPDATE already use — it guards the one write route here
 # (record a screening decision). See roles.py's viewer_scopes for why
@@ -453,7 +453,7 @@ SCOPE_DOCS = {
     # PrivacyCare (spec 2026-09-16 D-W2-2)
     PRIVACYCARE_RISK_READ: "View a DPIA's risk register and its ODPC prior-consultation finding",
     PRIVACYCARE_RISK_CREATE: "Add and remove risks in a DPIA's risk register",
-    # PrivacyCare (spec 2026-09-17 D-W2-7)
+    # PrivacyCare (spec 2026-09-16 D-W2-7)
     PRIVACYCARE_SCREENING_READ: "View the DPIA screening gate's triggers, a declaration's current verdict, and its decision history",
     PRIVACYCARE_SCREENING_CREATE: "Record a DPIA screening decision for a declaration",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",

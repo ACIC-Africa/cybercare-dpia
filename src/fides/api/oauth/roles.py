@@ -189,7 +189,7 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # Viewer already holds via this same list), but this grant should not
     # be read as a stronger promise than the data model actually enforces.
     PRIVACYCARE_RISK_READ,
-    # PrivacyCare (spec 2026-09-17 D-W2-7): PRIVACYCARE_SCREENING_READ IS
+    # PrivacyCare (spec 2026-09-16 D-W2-7): PRIVACYCARE_SCREENING_READ IS
     # granted to Viewer here, the same PRIVACYCARE_DISCOVERY_READ/
     # PRIVACYCARE_RISK_READ precedent immediately above rather than the
     # PRIVACYCARE_DSR_READ/PRIVACYCARE_CONSENT_READ one further up. A

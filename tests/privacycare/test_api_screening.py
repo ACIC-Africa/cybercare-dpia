@@ -276,6 +276,35 @@ def test_a_failed_record_writes_nothing(db, triggers, declaration_id):
     assert remaining == 0
 
 
+# --- Route ordering ------------------------------------------------------
+
+
+def test_the_triggers_route_is_matched_before_the_declaration_id_route():
+    # GET /triggers would otherwise be swallowed by GET /{declaration_id}
+    # (declaration_id="triggers"), and the triggers route would 404 forever
+    # against a route that demonstrably exists — same hazard, same fix
+    # shape, as test_api_tasks.py's test_the_tasks_route_is_matched_before_
+    # the_assessment_id_route. A comment at the decorators documents the
+    # ordering; this test is the guard that actually catches a regression
+    # (screening.py's route functions are called directly everywhere else
+    # in this file, which proves each route WORKS but not that FastAPI
+    # would ever reach it through the real dispatch path).
+    #
+    # route.path on this router carries the full PRIVACYCARE_SCREENING_PREFIX
+    # prefix (Fides' APIRouter subclass applies it at add_api_route time,
+    # same as PRIVACYCARE_PREFIX's own routes), so the paths compared here
+    # must match that.
+    from fides.api.privacycare.api.router import (
+        PRIVACYCARE_SCREENING_PREFIX,
+        privacycare_screening_router,
+    )
+
+    paths = [route.path for route in privacycare_screening_router.routes]
+    assert paths.index(f"{PRIVACYCARE_SCREENING_PREFIX}/triggers") < paths.index(
+        f"{PRIVACYCARE_SCREENING_PREFIX}/{{declaration_id}}"
+    )
+
+
 # --- Scopes -------------------------------------------------------------
 
 
