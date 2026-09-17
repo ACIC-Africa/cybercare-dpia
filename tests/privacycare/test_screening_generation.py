@@ -388,6 +388,51 @@ def test_a_declaration_linked_to_several_processes_generates_when_one_is_unscree
     assert row["completed_count"] == 1
 
 
+def test_a_not_applicable_verdict_on_a_soft_deleted_process_no_longer_blocks_generation(
+    db,  # noqa: F811
+):
+    # Batch cleanup (plan 20): _BUSINESS_PROCESSES_FOR_DECLARATION_SQL now
+    # filters deleted_at IS NULL, matching every other active-business-logic
+    # read of privacycare_business_process (api/processes.py, importers/
+    # processes.py). Nothing in this codebase writes deleted_at yet, so the
+    # soft-delete here is done by hand with a raw UPDATE — standing in for
+    # the write path that does not exist yet, the same way this file's own
+    # _backdate helper stands in for a clock that has not actually passed.
+    # Before the filter, a deleted process's last recorded not-applicable
+    # verdict would keep gating this declaration's generation forever,
+    # instead of dropping out the way "no link at all" already does.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    decl_id = _seed_declaration(db, sid, "marketing.advertising")
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _link(db, process_id, decl_id)
+    _screen_out(db, process_id)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE privacycare_business_process SET deleted_at = now() "
+            "WHERE id = :id"
+        ),
+        {"id": process_id},
+    )
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assessments = _assessments_for_task(db, task_id)
+    assert len(assessments) == 1, (
+        "the only linked process was soft-deleted, so this activity must "
+        "be treated as having no link at all and generate"
+    )
+    assert assessments[0]["declaration_id"] == decl_id
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["completed_count"] == 1
+
+
 def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)

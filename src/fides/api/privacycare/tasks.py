@@ -148,9 +148,21 @@ _SKIPPED_FOR_TASK_SQL = sqlalchemy.text(
 # actual operational unit. This is the join _is_activity_screened_out below
 # uses to resolve a GenerationTarget's declaration_id to the process(es)
 # that process it.
+#
+# `AND bp.deleted_at IS NULL` (batch cleanup, plan 20): matches the exact
+# predicate api/processes.py's own reads (_SELECT_PROCESSES_SQL,
+# _PROCESS_EXISTS_SQL) and importers/processes.py's _SELECT_MATCHING_SQL
+# already apply — every other active-business-logic read of
+# privacycare_business_process filters soft-deleted rows out, and this one
+# had not been extended to match. Nothing writes deleted_at yet, so this was
+# latent rather than live, but once a soft-delete ships, a deleted process's
+# last recorded verdict would otherwise keep gating its linked activity's
+# generation forever — the one case that should instead behave exactly like
+# "no link at all" and let the activity generate.
 _BUSINESS_PROCESSES_FOR_DECLARATION_SQL = sqlalchemy.text(
-    "SELECT business_process_id FROM privacycare_process_declaration "
-    "WHERE privacy_declaration_id = :declaration_id"
+    "SELECT pd.business_process_id FROM privacycare_process_declaration pd "
+    "JOIN privacycare_business_process bp ON bp.id = pd.business_process_id "
+    "WHERE pd.privacy_declaration_id = :declaration_id AND bp.deleted_at IS NULL"
 )
 
 
