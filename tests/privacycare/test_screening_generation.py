@@ -32,17 +32,25 @@ from tests.privacycare.test_tasks import (
 
 
 def _seed_trigger(db, key: str = "large_scale") -> None:
-    """The one trigger row needed to record a screen-IN decision.
-    privacycare_screening_trigger is empty in the live database (Task 1
-    deliberately did not run the seed for real), so any test that screens a
-    declaration IN must seed the trigger key it ticks. A screen-OUT needs no
-    trigger row at all: record_decision's unknown-key check is only ever
-    run against a non-empty triggered_keys list."""
+    """The one trigger row needed to record a screen-IN decision. A
+    screen-OUT needs no trigger row at all: record_decision's unknown-key
+    check is only ever run against a non-empty triggered_keys list.
+
+    UPDATE (Task 5, spec 2026-09-17, plan 18): the authorized `--commit`
+    seed has now run against this same live database, so
+    privacycare_screening_trigger is no longer empty by default — Carol's
+    six rows (which include "large_scale", this helper's own default) are
+    permanent, same as the Kenya template. ON CONFLICT (trigger_key) DO
+    NOTHING keeps this helper working either way: a no-op against the real
+    row in this database, a real insert against a from-empty one (e.g.
+    CI). Every caller here only needs the key to be valid to screen
+    against, never any particular label/description text."""
     db.execute(
         sqlalchemy.text(
             "INSERT INTO privacycare_screening_trigger "
             "(id, trigger_key, label, description, display_order) "
-            "VALUES (:id, :key, :label, :description, 1)"
+            "VALUES (:id, :key, :label, :description, 1) "
+            "ON CONFLICT (trigger_key) DO NOTHING"
         ),
         {
             "id": str(uuid.uuid4()),

@@ -8,11 +8,15 @@ test_every_risk_route_requires_its_declared_scope /
 test_every_dsr_route_requires_its_declared_scope) confirming every route
 actually declares the scope it is supposed to.
 
-privacycare_screening_trigger is empty in the live database (Task 1
-deliberately did not run the seed for real — that is Task 5's job), so
-every test here seeds the six trigger rows it needs inside the
-rolled-back session, exactly like test_screening_gate.py's own `triggers`
-fixture.
+UPDATE (Task 5, spec 2026-09-17, plan 18): the authorized `--commit` seed
+has now run against this same live database and Carol's six trigger rows
+stay there permanently (same as the Kenya template). The `triggers`
+fixture below is INSERT ... ON CONFLICT (trigger_key) DO NOTHING, so it is
+a no-op against those six real rows rather than raising UniqueViolation;
+every test using it below cares only about trigger_key identity (whether a
+given key is valid to screen against), never about the fixture's own
+throwaway label/description text, with the one exception noted at
+test_triggers_come_back_in_display_order itself.
 
 THE DISTINCTION THIS FILE EXISTS TO PROVE: an unknown declaration_id is a
 404 on every read AND the write route; a declaration that exists but has
@@ -71,14 +75,18 @@ def db(monkeypatch):
 
 @pytest.fixture
 def triggers(db):
-    """Seeds the six trigger rows this test file needs, inside the same
-    rolled-back session every test uses — the live table is empty."""
+    """Ensures the six trigger rows this test file needs exist, inside the
+    same rolled-back session every test uses. ON CONFLICT (trigger_key) DO
+    NOTHING: Task 5's real seed means these six keys already exist in the
+    live database, so this is a no-op there and a real insert only against
+    a from-empty database (e.g. CI)."""
     for order, key in enumerate(TRIGGER_KEYS, start=1):
         db.execute(
             sqlalchemy.text(
                 "INSERT INTO privacycare_screening_trigger "
                 "(id, trigger_key, label, description, display_order) "
-                "VALUES (:id, :key, :label, :description, :order)"
+                "VALUES (:id, :key, :label, :description, :order) "
+                "ON CONFLICT (trigger_key) DO NOTHING"
             ),
             {
                 "id": str(uuid.uuid4()),
@@ -112,15 +120,32 @@ def _record(db, declaration_id, **overrides):
 
 
 def test_triggers_come_back_in_display_order(db, triggers):
+    # UPDATE (Task 5): this test's own name is "...in display order", and
+    # that's the contract this route actually needs to prove — exact
+    # label/description text is test_seed_screening_triggers.py's job (per
+    # this file's own docstring, "not Carol's exact label text"). Before
+    # Task 5's real seed, the `triggers` fixture owned every row in the
+    # table outright, so asserting its own synthetic label/description
+    # text back was an easy way to prove passthrough; now that Carol's six
+    # real rows already exist, the fixture's INSERT is a no-op (ON
+    # CONFLICT DO NOTHING) and what comes back is her real text, not the
+    # fixture's placeholder — checked here only for non-emptiness, not a
+    # hardcoded pattern this file was never meant to own.
     response = list_screening_triggers(db=db)
 
     assert [t.trigger_key for t in response.triggers] == list(TRIGGER_KEYS)
-    for trigger, key in zip(response.triggers, TRIGGER_KEYS):
-        assert trigger.label == key.replace("_", " ").title()
-        assert trigger.description == f"Test description for {key}."
+    for trigger in response.triggers:
+        assert trigger.label
+        assert trigger.description
 
 
 def test_triggers_route_is_a_200_empty_envelope_when_nothing_is_seeded(db):
+    # UPDATE (Task 5): the live table is no longer empty by default (Carol's
+    # six rows are permanent, same as the Kenya template), so proving a
+    # genuinely empty table renders as [] rather than an exception now means
+    # clearing it inside this test's own rolled-back transaction — the
+    # DELETE never escapes past this test's session.rollback() teardown.
+    db.execute(sqlalchemy.text("DELETE FROM privacycare_screening_trigger"))
     response = list_screening_triggers(db=db)
     assert response.triggers == []
 

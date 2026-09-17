@@ -115,6 +115,38 @@ def _trigger_count(db_session) -> int:
     ).scalar()
 
 
+# Task 5 (spec 2026-09-17, plan 18): the authorized `--commit` seed has now
+# run against this same live database, so every test below that calls
+# cli.seed_screening_triggers(db) unmodified no longer exercises the INSERT
+# at all — ON CONFLICT (trigger_key) DO NOTHING fires against the six
+# already-committed rows before the test's own transaction ever begins, so
+# `db.execute(_SEED_SQL, ...)` always returns rowcount 0 and every SELECT
+# below just reads back Task 5's committed rows regardless of what
+# SCREENING_TRIGGERS currently holds. Verified directly: monkeypatching
+# SCREENING_TRIGGERS to a deliberately wrong description and calling
+# seed_screening_triggers(db) still returns written=0 and reads back the
+# real (uncorrupted) committed text — proof the create path never runs
+# inside these tests any more.
+#
+# Same fix as test_seed_kenya_template.py's IMPORTANT-2 disarmament: patch
+# the constant that ON CONFLICT keys off (KENYA_ASSESSMENT_TYPE there,
+# SCREENING_TRIGGERS' own trigger_key here) to unused values so the INSERT
+# actually executes inside this test's own rolled-back transaction, instead
+# of short-circuiting on the row Task 5 already committed. Only trigger_key
+# is suffixed — label and description are left exactly as Carol wrote them,
+# copied from CAROLS_TRIGGERS (typed independently above, not read from the
+# module under test), so a typo or a smart-quote swap in the module's own
+# prose still fails these tests exactly as before.
+_TEST_KEY_SUFFIX = "__test_content_copy"
+
+
+def _patched_triggers(cli):
+    return tuple(
+        (key + _TEST_KEY_SUFFIX, label, description)
+        for key, label, description in cli.SCREENING_TRIGGERS
+    )
+
+
 # --- The CLI, as a subprocess -----------------------------------------------
 
 
@@ -180,30 +212,39 @@ def test_a_bad_database_url_exits_non_zero_with_no_traceback_and_no_credential()
 # --- seed_screening_triggers(db), against the rolled-back fixture ----------
 
 
-def test_seeding_twice_does_not_duplicate(db):
+def test_seeding_twice_does_not_duplicate(db, monkeypatch):
     cli = _load_cli()
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
     cli.seed_screening_triggers(db)
     written_second_time = cli.seed_screening_triggers(db)
 
     assert written_second_time == 0
-    assert _trigger_count(db) == 6
+    assert _trigger_count(db) == 12, (
+        "6 real (Task 5's committed rows) + 6 test-suffixed rows this test "
+        "itself inserted"
+    )
 
 
-def test_exactly_six_triggers_are_seeded(db):
+def test_exactly_six_triggers_are_seeded(db, monkeypatch):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
-    assert _trigger_count(db) == 6
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
 
-def test_each_trigger_matches_carols_text_exactly(db):
+def test_each_trigger_matches_carols_text_exactly(db, monkeypatch):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
     rows = db.execute(
         sqlalchemy.text(
             "SELECT trigger_key, label, description FROM "
-            "privacycare_screening_trigger ORDER BY display_order"
-        )
+            "privacycare_screening_trigger WHERE trigger_key LIKE :pattern "
+            "ORDER BY display_order"
+        ),
+        {"pattern": f"%{_TEST_KEY_SUFFIX}"},
     ).all()
 
     assert len(rows) == len(CAROLS_TRIGGERS)
@@ -211,37 +252,48 @@ def test_each_trigger_matches_carols_text_exactly(db):
         rows, CAROLS_TRIGGERS
     ):
         # Full-string equality, not a substring check: a truncation or a
-        # smart-quote swap must fail this test.
-        assert row.trigger_key == expected_key
+        # smart-quote swap must fail this test. trigger_key carries the
+        # test's own suffix (see _patched_triggers) so the INSERT actually
+        # runs instead of hitting Task 5's already-committed row; label and
+        # description are asserted against Carol's real text, untouched.
+        assert row.trigger_key == expected_key + _TEST_KEY_SUFFIX
         assert row.label == expected_label
         assert row.description == expected_description
 
 
-def test_display_order_is_one_through_six_with_no_gaps(db):
+def test_display_order_is_one_through_six_with_no_gaps(db, monkeypatch):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
     orders = [
         row[0]
         for row in db.execute(
             sqlalchemy.text(
                 "SELECT display_order FROM privacycare_screening_trigger "
-                "ORDER BY display_order"
-            )
+                "WHERE trigger_key LIKE :pattern ORDER BY display_order"
+            ),
+            {"pattern": f"%{_TEST_KEY_SUFFIX}"},
         ).all()
     ]
     assert orders == [1, 2, 3, 4, 5, 6]
 
 
-def test_special_category_trigger_names_dpa_2019_section_2_not_article_9(db):
+def test_special_category_trigger_names_dpa_2019_section_2_not_article_9(
+    db, monkeypatch
+):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
     description = db.execute(
         sqlalchemy.text(
             "SELECT description FROM privacycare_screening_trigger "
-            "WHERE trigger_key = 'special_category'"
-        )
+            "WHERE trigger_key = :key"
+        ),
+        {"key": "special_category" + _TEST_KEY_SUFFIX},
     ).scalar()
     assert description is not None
     assert "Data Protection Act 2019" in description
@@ -249,30 +301,36 @@ def test_special_category_trigger_names_dpa_2019_section_2_not_article_9(db):
     assert "Article 9" not in description
 
 
-def test_vulnerable_subjects_trigger_does_not_mention_student(db):
+def test_vulnerable_subjects_trigger_does_not_mention_student(db, monkeypatch):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
     row = db.execute(
         sqlalchemy.text(
             "SELECT label, description FROM privacycare_screening_trigger "
-            "WHERE trigger_key = 'vulnerable_subjects'"
-        )
+            "WHERE trigger_key = :key"
+        ),
+        {"key": "vulnerable_subjects" + _TEST_KEY_SUFFIX},
     ).mappings().first()
     assert row is not None
     haystack = f"{row['label']} {row['description']}".lower()
     assert "student" not in haystack
 
 
-def test_no_kca_university_term_appears_in_any_seeded_row(db):
+def test_no_kca_university_term_appears_in_any_seeded_row(db, monkeypatch):
     cli = _load_cli()
-    cli.seed_screening_triggers(db)
+    monkeypatch.setattr(cli, "SCREENING_TRIGGERS", _patched_triggers(cli))
+    written = cli.seed_screening_triggers(db)
+    assert written == 6, "the create path must actually run inside this test"
 
     rows = db.execute(
         sqlalchemy.text(
             "SELECT trigger_key, label, description FROM "
-            "privacycare_screening_trigger"
-        )
+            "privacycare_screening_trigger WHERE trigger_key LIKE :pattern"
+        ),
+        {"pattern": f"%{_TEST_KEY_SUFFIX}"},
     ).mappings().all()
 
     haystack = " ".join(

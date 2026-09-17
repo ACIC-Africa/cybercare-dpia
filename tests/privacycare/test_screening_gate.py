@@ -4,10 +4,16 @@
 # weighting, no threshold, no scoring — this is a gate, not a risk
 # assessment.
 #
-# privacycare_screening_trigger is empty in the live database (Task 1
-# deliberately did not run the seed for real — that is Task 5's job), so
-# every test here seeds the six trigger rows it needs inside the
-# rolled-back session rather than assuming any exist.
+# UPDATE (Task 5, spec 2026-09-17, plan 18): the authorized `--commit` seed
+# has now run against this same live database and Carol's six trigger rows
+# are meant to stay there permanently (same as the Kenya template — see
+# test_seed_kenya_template.py's own UPDATE note). The `triggers` fixture
+# below is written as INSERT ... ON CONFLICT (trigger_key) DO NOTHING so it
+# stays a no-op against the six real rows rather than raising
+# UniqueViolation; this file never asserts on label/description content
+# (only trigger_key identity and display_order, both unchanged by the real
+# seed), so reading back Carol's real rows instead of this fixture's own
+# throwaway ones changes nothing any test here checks.
 import uuid
 
 import pytest
@@ -55,15 +61,20 @@ def db(monkeypatch):
 
 @pytest.fixture
 def triggers(db):
-    """Seeds the six trigger rows this test file needs, inside the same
-    rolled-back session every test uses. The live table is empty (Task 1
-    did not run the real seed), so nothing here can assume a row exists."""
+    """Ensures the six trigger rows this test file needs exist, inside the
+    same rolled-back session every test uses. ON CONFLICT (trigger_key) DO
+    NOTHING: Task 5's real seed means these six keys already exist in the
+    live database, so this is a no-op there and a real insert only against
+    a from-empty database (e.g. CI) — either way, the six keys this file
+    screens against are guaranteed present by the time this fixture
+    returns."""
     for order, key in enumerate(TRIGGER_KEYS, start=1):
         db.execute(
             sqlalchemy.text(
                 "INSERT INTO privacycare_screening_trigger "
                 "(id, trigger_key, label, description, display_order) "
-                "VALUES (:id, :key, :label, :description, :order)"
+                "VALUES (:id, :key, :label, :description, :order) "
+                "ON CONFLICT (trigger_key) DO NOTHING"
             ),
             {
                 "id": str(uuid.uuid4()),
@@ -91,6 +102,14 @@ def test_list_triggers_is_ordered_by_display_order(db, triggers):
 
 
 def test_list_triggers_is_empty_when_nothing_is_seeded(db):
+    # Task 5's real seed means the live table is no longer empty by
+    # default (and is not meant to become empty again — Carol's six rows
+    # are permanent, same as the Kenya template). Proving list_triggers
+    # returns [] for an empty table still means clearing it, just inside
+    # this test's own rolled-back transaction rather than assuming the
+    # live database starts that way — the DELETE never escapes past this
+    # test's own session.rollback() teardown.
+    db.execute(sqlalchemy.text("DELETE FROM privacycare_screening_trigger"))
     assert list_triggers(db) == []
 
 
