@@ -1,5 +1,6 @@
 """The DPIA screening gate's HTTP surface (spec 2026-09-16 D-W2-7, Task 4;
-re-keyed to the business process in plan 20, Task 3).
+re-keyed to the business process in plan 20, Task 3; the mapping route
+added in plan 20, Task 4).
 
 NAMESPACE. Our own /api/v1/privacycare/screening, NOT /api/v1/plus — the
 screening gate is new, Kenyan-specific ground with no Plus analogue (see
@@ -20,14 +21,19 @@ privacycare_business_process instead of privacydeclaration.
 
 SCOPES. PRIVACYCARE_SCREENING_READ guards the four read routes (list every
 business process's status, list triggers, current verdict, decision
-history); PRIVACYCARE_SCREENING_CREATE guards the one write route (record a
-decision) — one write scope for the one write verb, the same shape
-PRIVACYCARE_RISK_CREATE and PRIVACYCARE_DSR_UPDATE already use.
-PRIVACYCARE_SCREENING_READ IS granted to Viewer (roles.py's viewer_scopes)
-— a screening decision (gate.ScreeningVerdict) names a business process,
-which triggers were ticked and a free-text justification for a screen-out,
-never a data subject, the same distinction roles.py's PRIVACYCARE_RISK_READ
-comment draws for a risk-register row. See roles.py's own
+history); PRIVACYCARE_SCREENING_CREATE guards both write routes (record a
+decision, save a data mapping) — Task 4 reuses the existing write scope
+rather than adding a second one, since the brief named none and a mapping
+is, structurally, one more way of recording facts about a business
+process's assessability. PRIVACYCARE_SCREENING_READ IS granted to Viewer
+(roles.py's viewer_scopes) — a screening decision (gate.ScreeningVerdict)
+names a business process, which triggers were ticked and a free-text
+justification for a screen-out, never a data subject, the same distinction
+roles.py's PRIVACYCARE_RISK_READ comment draws for a risk-register row.
+This still holds after Task 4: nothing in this router lets a caller READ
+back a mapping's data subjects, and Viewer lacks the CREATE scope the
+mapping route requires, so a data subject is still never something Viewer
+can reach through this surface. See roles.py's own
 PRIVACYCARE_SCREENING_READ comment for the fuller version of this argument.
 
 THE DISTINCTION THIS FILE EXISTS TO ENFORCE. gate.py's own read functions
@@ -70,6 +76,8 @@ from fides.api.privacycare.api.identity import _created_by_from_client
 from fides.api.privacycare.api.router import privacycare_screening_router
 from fides.api.privacycare.api.screening_schemas import (
     CurrentScreeningResponse,
+    DataMappingRequest,
+    DataMappingResponse,
     ScreeningDecisionRequest,
     ScreeningHistoryResponse,
     ScreeningListResponse,
@@ -85,6 +93,7 @@ from fides.api.privacycare.screening.gate import (
     list_triggers,
     record_decision,
 )
+from fides.api.privacycare.screening.mapping import MappingResult, save_mapping
 from fides.common.scope_registry import (
     PRIVACYCARE_SCREENING_CREATE,
     PRIVACYCARE_SCREENING_READ,
@@ -177,6 +186,24 @@ def _response_from_verdict(verdict: ScreeningVerdict) -> ScreeningVerdictRespons
         justification=verdict.justification,
         decided_by=verdict.decided_by,
         decided_at=verdict.decided_at,
+    )
+
+
+def _response_from_mapping(result: MappingResult) -> DataMappingResponse:
+    return DataMappingResponse(
+        business_process_id=result.business_process_id,
+        privacy_declaration_id=result.privacy_declaration_id,
+        system_id=result.system_id,
+        name=result.name,
+        data_subjects=result.data_subjects,
+        data_categories=result.data_categories,
+        ground=result.ground,
+        fides_legal_basis=result.fides_legal_basis,
+        purpose=result.purpose,
+        retention_period=result.retention_period,
+        third_parties=result.third_parties,
+        processes_special_category_data=result.processes_special_category_data,
+        created=result.created,
     )
 
 
@@ -358,3 +385,60 @@ def record_screening_decision(
         raise HTTPException(status_code=status_code, detail=detail) from exc
     db.commit()
     return _response_from_verdict(verdict)
+
+
+@privacycare_screening_router.post(
+    "/{business_process_id}/mapping",
+    dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_SCREENING_CREATE])],
+    response_model=DataMappingResponse,
+    status_code=status_codes.HTTP_201_CREATED,
+)
+def save_data_mapping(
+    business_process_id: str,
+    request: DataMappingRequest,
+    *,
+    db: Session = Depends(get_db),
+) -> DataMappingResponse:
+    """Captures the data mapping behind an applicable business process
+    (screening/mapping.save_mapping) — the route that gets 85 of her 86
+    processes their first ever mapping. Creates a `privacydeclaration` and
+    links it to the process, or updates the ONE activity this route already
+    created for it (see mapping.py's own module docstring for why
+    idempotency is keyed to the activity, never to the process).
+
+    Reuses PRIVACYCARE_SCREENING_CREATE — the one write scope this whole
+    surface already has — rather than introducing a second write scope for
+    what is still, structurally, one more way of recording facts about a
+    business process's screening/assessability. No new scope was named in
+    this task's brief.
+
+    Same ValueError-to-status-code split as record_screening_decision just
+    above: save_mapping's own existence check raises "no such business
+    process: ..." for an unknown id, mapped to 404 here; every other
+    rejection (an unknown data subject, category or ground; a ground with
+    no determined legal basis; a missing name or empty data_categories) is
+    otherwise-valid-resource, bad input, and becomes 400.
+    """
+    try:
+        result = save_mapping(
+            db,
+            business_process_id=business_process_id,
+            name=request.name,
+            data_categories=request.data_categories,
+            data_subjects=request.data_subjects,
+            ground=request.ground,
+            purpose=request.purpose,
+            retention_period=request.retention_period,
+            third_parties=request.third_parties,
+        )
+    except ValueError as exc:
+        db.rollback()
+        detail = str(exc)
+        status_code = (
+            status_codes.HTTP_404_NOT_FOUND
+            if detail.startswith("no such business process")
+            else status_codes.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    db.commit()
+    return _response_from_mapping(result)

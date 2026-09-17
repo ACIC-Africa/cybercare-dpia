@@ -427,6 +427,18 @@ ALLOWLIST: dict[str, dict] = {
             "No TS counterpart, same reason as TriggerResponse above."
         ),
     },
+    # POST /api/v1/privacycare/screening/{business_process_id}/mapping
+    # (plan 20, Task 4). Same "no shipped admin-UI screen calls this"
+    # reasoning as TriggerResponse above — Screen 1's mapping modal
+    # (docs/design/privacycare-screens/DESIGN.md, "Step 2 — the prompted
+    # mapping") is built from this route in a later plan, per that design's
+    # own "Not in this plan" note.
+    "DataMappingResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above."
+        ),
+    },
 }
 
 

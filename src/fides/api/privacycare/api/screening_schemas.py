@@ -121,6 +121,76 @@ class ScreeningStatusResponse(BaseModel):
     has_mapping: bool
 
 
+class DataMappingRequest(BaseModel):
+    # POST .../mapping (plan 20, Task 4). Six fields from her own map, plus
+    # the activity's own name — see screening/mapping.py's module docstring
+    # for the full reasoning behind every one of these.
+    #
+    # name/data_categories are the only two that are always required: "a
+    # name and at least one data category" is the brief's own minimum for a
+    # valid activity. Every other field is Optional[...] = None, and None
+    # means "not answered this call" — mapping.save_mapping's UPDATE path
+    # leaves a column exactly as it was when the matching field here is
+    # None, so a privacy officer who saves three answers today and the rest
+    # next week never has today's answers erased by tomorrow's partial
+    # resubmission. An explicit empty list for data_subjects (as opposed to
+    # omitting the field, which defaults to None) DOES clear it — the one
+    # place an empty value and a missing one mean different things here.
+    #
+    # ground is free text matching privacycare_processing_ground.ground
+    # VERBATIM (e.g. "KYC Requirements") — her business situation, not the
+    # legal basis. save_mapping derives fides_legal_basis from it and
+    # writes THAT; there is no field here a caller could use to set the
+    # legal basis directly, which is the whole point (screening/mapping.py:
+    # "the lawful basis is derived, never accepted").
+    #
+    # No TypeScript counterpart yet: Screen 1's mapping modal
+    # (docs/design/privacycare-screens/DESIGN.md, "Step 2 — the prompted
+    # mapping") is built from this route in a later plan, per that design's
+    # own "Not in this plan" list. Allowlisted in
+    # test_response_model_ts_parity.py with that reason, same shape as
+    # TriggerResponse's own allowlist entry in screening_schemas.py above.
+    name: str = Field(min_length=1)
+    data_categories: List[str] = Field(min_length=1)
+    data_subjects: Optional[List[str]] = None
+    ground: Optional[str] = None
+    purpose: Optional[str] = None
+    retention_period: Optional[str] = None
+    third_parties: Optional[str] = None
+
+
+class DataMappingResponse(BaseModel):
+    # Mirrors screening/mapping.MappingResult field-for-field. `ground` here
+    # echoes what THIS call was given (None if this call did not name one,
+    # even when an earlier call already derived and persisted a legal
+    # basis) — the ground's own text is not a stored column anywhere on
+    # privacydeclaration, only its DERIVED fides_legal_basis is, and
+    # fides_legal_basis always reflects the current persisted value
+    # regardless of what this particular call supplied. See
+    # screening/mapping.py's save_mapping docstring.
+    #
+    # `created` distinguishes "this call made the activity" from "this call
+    # updated the one the route already owns for this process" — the
+    # idempotency this task's ruling required (screening/mapping.py's own
+    # module docstring: keyed to the activity this route created, never to
+    # the process).
+    #
+    # No TypeScript counterpart: same reasoning as DataMappingRequest above.
+    business_process_id: str
+    privacy_declaration_id: str
+    system_id: str
+    name: str
+    data_subjects: List[str]
+    data_categories: List[str]
+    ground: Optional[str]
+    fides_legal_basis: Optional[str]
+    purpose: Optional[str]
+    retention_period: Optional[str]
+    third_parties: Optional[str]
+    processes_special_category_data: bool
+    created: bool
+
+
 class ScreeningListResponse(BaseModel):
     # A plain envelope, not fastapi_pagination.Page (contrast
     # processes.py's list_business_processes) — the whole point of this

@@ -540,11 +540,12 @@ def test_every_screening_route_requires_its_declared_scope():
             ), f"{route.path} [{method}] does not require {expected_scope!r}"
             checked += 1
 
-    # 5 logical routes (list every process's status, triggers, current
-    # verdict, history, record decision), one HTTP method apiece — but
-    # fides.api.util.api_router.APIRouter registers BOTH a trailing-slash
-    # and a no-trailing-slash variant of every path as separate route
-    # objects (same guard as test_every_risk_route_requires_its_declared_
-    # scope / test_every_dsr_route_requires_its_declared_scope), so
-    # app.routes holds two entries per logical route: 5 * 2 = 10.
-    assert checked == 10, f"expected 10 screening route/method pairs, checked {checked}"
+    # 6 logical routes as of plan 20 Task 4 (list every process's status,
+    # triggers, current verdict, history, record decision, save a data
+    # mapping), one HTTP method apiece — but fides.api.util.api_router.
+    # APIRouter registers BOTH a trailing-slash and a no-trailing-slash
+    # variant of every path as separate route objects (same guard as
+    # test_every_risk_route_requires_its_declared_scope /
+    # test_every_dsr_route_requires_its_declared_scope), so app.routes
+    # holds two entries per logical route: 6 * 2 = 12.
+    assert checked == 12, f"expected 12 screening route/method pairs, checked {checked}"
