@@ -110,6 +110,11 @@ export const baseApi = createApi({
     "Privacy Assessment Questionnaire",
     "Privacy Assessment Evidence",
     "Privacy Assessment Tasks",
+    // PrivacyCare (spec 2026-09-16 D-W2-7g): the DPIA screening & mapping
+    // screen's own cache tags.
+    "PrivacyCare Screening",
+    "PrivacyCare Screening History",
+    "PrivacyCare Screening Mapping",
     "User Monitors",
     "Pre-Approval Webhooks",
     "Datastore Filters",

@@ -189,6 +189,17 @@ export const NAV_CONFIG: NavConfigGroup[] = [
         requiresFlag: "privacyAssessments",
         keywords: ["PIA", "DPIA"],
       },
+      // PrivacyCare (spec 2026-09-16 D-W2-7g): decide whether a business
+      // process needs a DPIA, and capture its data mapping. Same feature
+      // flag as its "Assessments" sibling above — this is still the
+      // Privacy assessments area, one step earlier in the workflow.
+      {
+        title: "Screening",
+        path: routes.PRIVACY_ASSESSMENTS_SCREENING_ROUTE,
+        scopes: [ScopeRegistryEnum.PRIVACYCARE_SCREENING_READ],
+        requiresFlag: "privacyAssessments",
+        keywords: ["DPIA", "screening", "applicable", "mapping"],
+      },
     ],
   },
   {

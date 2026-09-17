@@ -124,6 +124,9 @@ export const SANDBOX_PRIVACY_NOTICES_ROUTE = "/sandbox/privacy-notices";
 // Privacy Assessments routes
 export const PRIVACY_ASSESSMENTS_ROUTE = "/privacy-assessments";
 export const PRIVACY_ASSESSMENTS_DETAIL_ROUTE = "/privacy-assessments/[id]";
+// PrivacyCare (spec 2026-09-16 D-W2-7g): the DPIA screening & mapping screen.
+export const PRIVACY_ASSESSMENTS_SCREENING_ROUTE =
+  "/privacy-assessments/screening";
 
 // Data Purposes (Core Configuration)
 export const DATA_PURPOSES_ROUTE = "/data-purposes";
