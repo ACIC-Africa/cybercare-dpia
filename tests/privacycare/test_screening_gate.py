@@ -28,7 +28,6 @@ from fides.api.privacycare.screening.gate import (
     list_triggers,
     record_decision,
 )
-from tests.privacycare.test_context import _seed_declaration, _seed_system
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -87,10 +86,25 @@ def triggers(db):
     return TRIGGER_KEYS
 
 
+def _seed_business_process(db, name: str, business_cycle: str) -> str:
+    """Seeds one of the customer's own business processes (her register,
+    not a generic fixture name) — the existence check record_decision now
+    runs is against privacycare_business_process, not privacydeclaration,
+    so this is the table these tests need rows in."""
+    process_id = f"bp_{uuid.uuid4().hex[:12]}"
+    db.execute(
+        sqlalchemy.text(
+            "INSERT INTO privacycare_business_process (id, name, business_cycle) "
+            "VALUES (:id, :name, :cycle)"
+        ),
+        {"id": process_id, "name": name, "cycle": business_cycle},
+    )
+    return process_id
+
+
 @pytest.fixture
-def declaration_id(db) -> str:
-    system_id = _seed_system(db, f"sys_{uuid.uuid4().hex[:8]}")
-    return _seed_declaration(db, system_id, "marketing")
+def business_process_id(db) -> str:
+    return _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
 
 
 # --- list_triggers -----------------------------------------------------
@@ -116,10 +130,10 @@ def test_list_triggers_is_empty_when_nothing_is_seeded(db):
 # --- the derivation rule -------------------------------------------------
 
 
-def test_one_trigger_means_a_dpia_is_required(db, triggers, declaration_id):
+def test_one_trigger_means_a_dpia_is_required(db, triggers, business_process_id):
     verdict = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=["large_scale"],
         justification=None,
         decided_by="carol@example.com",
@@ -131,10 +145,10 @@ def test_one_trigger_means_a_dpia_is_required(db, triggers, declaration_id):
     assert verdict.justification is None
 
 
-def test_all_six_triggers_mean_a_dpia_is_required(db, triggers, declaration_id):
+def test_all_six_triggers_mean_a_dpia_is_required(db, triggers, business_process_id):
     verdict = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=list(TRIGGER_KEYS),
         justification=None,
         decided_by="carol@example.com",
@@ -144,7 +158,7 @@ def test_all_six_triggers_mean_a_dpia_is_required(db, triggers, declaration_id):
     assert verdict.triggered_keys == sorted(TRIGGER_KEYS)
 
 
-def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, declaration_id):
+def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, business_process_id):
     # Final review fix (Minor 5): record_decision dedups via
     # sorted(set(triggered_keys)) before deriving dpia_required or writing
     # the row (gate.py's own comment: "a duplicate tick ... collapses to
@@ -155,7 +169,7 @@ def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, declarati
     # start storing duplicates (or rejecting them) with no test noticing.
     verdict = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=["large_scale", "large_scale", "new_technology"],
         justification=None,
         decided_by="carol@example.com",
@@ -166,9 +180,9 @@ def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, declarati
     stored = db.execute(
         sqlalchemy.text(
             "SELECT triggered_keys FROM privacycare_screening_decision "
-            "WHERE declaration_id = :id"
+            "WHERE business_process_id = :id"
         ),
-        {"id": declaration_id},
+        {"id": business_process_id},
     ).scalar()
     assert stored == ["large_scale", "new_technology"], (
         "the duplicate must never reach the stored row either — the "
@@ -176,10 +190,10 @@ def test_a_duplicated_trigger_key_collapses_to_one_entry(db, triggers, declarati
     )
 
 
-def test_no_triggers_means_screened_out(db, triggers, declaration_id):
+def test_no_triggers_means_screened_out(db, triggers, business_process_id):
     verdict = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=[],
         justification="Internal-only headcount report, no external sharing.",
         decided_by="carol@example.com",
@@ -190,7 +204,7 @@ def test_no_triggers_means_screened_out(db, triggers, declaration_id):
     assert verdict.justification == "Internal-only headcount report, no external sharing."
 
 
-def test_dpia_required_cannot_be_passed_in_by_the_caller(db, triggers, declaration_id):
+def test_dpia_required_cannot_be_passed_in_by_the_caller(db, triggers, business_process_id):
     # There is no dpia_required parameter at all — it is derived, never
     # accepted, so a caller cannot tick three triggers and also declare no
     # DPIA needed. Confirmed here two ways: the interface itself rejects an
@@ -199,7 +213,7 @@ def test_dpia_required_cannot_be_passed_in_by_the_caller(db, triggers, declarati
     with pytest.raises(TypeError):
         record_decision(
             db,
-            declaration_id=declaration_id,
+            business_process_id=business_process_id,
             triggered_keys=["large_scale"],
             justification=None,
             decided_by="carol@example.com",
@@ -208,7 +222,7 @@ def test_dpia_required_cannot_be_passed_in_by_the_caller(db, triggers, declarati
 
     verdict = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=["large_scale", "new_technology"],
         justification=None,
         decided_by="carol@example.com",
@@ -219,33 +233,33 @@ def test_dpia_required_cannot_be_passed_in_by_the_caller(db, triggers, declarati
 # --- justification rules --------------------------------------------------
 
 
-def test_a_screen_out_without_a_justification_is_rejected(db, triggers, declaration_id):
+def test_a_screen_out_without_a_justification_is_rejected(db, triggers, business_process_id):
     with pytest.raises(ValueError, match="justification"):
         record_decision(
             db,
-            declaration_id=declaration_id,
+            business_process_id=business_process_id,
             triggered_keys=[],
             justification=None,
             decided_by="carol@example.com",
         )
 
 
-def test_a_screen_out_with_a_blank_justification_is_rejected(db, triggers, declaration_id):
+def test_a_screen_out_with_a_blank_justification_is_rejected(db, triggers, business_process_id):
     with pytest.raises(ValueError, match="justification"):
         record_decision(
             db,
-            declaration_id=declaration_id,
+            business_process_id=business_process_id,
             triggered_keys=[],
             justification="   ",
             decided_by="carol@example.com",
         )
 
 
-def test_a_screen_in_with_a_justification_is_rejected(db, triggers, declaration_id):
+def test_a_screen_in_with_a_justification_is_rejected(db, triggers, business_process_id):
     with pytest.raises(ValueError, match="justification"):
         record_decision(
             db,
-            declaration_id=declaration_id,
+            business_process_id=business_process_id,
             triggered_keys=["large_scale"],
             justification="Not needed but here's one anyway.",
             decided_by="carol@example.com",
@@ -255,63 +269,92 @@ def test_a_screen_in_with_a_justification_is_rejected(db, triggers, declaration_
 # --- unknown inputs ---------------------------------------------------
 
 
-def test_an_unknown_trigger_key_is_rejected_by_name(db, triggers, declaration_id):
+def test_an_unknown_trigger_key_is_rejected_by_name(db, triggers, business_process_id):
     with pytest.raises(ValueError, match="not_a_real_trigger"):
         record_decision(
             db,
-            declaration_id=declaration_id,
+            business_process_id=business_process_id,
             triggered_keys=["large_scale", "not_a_real_trigger"],
             justification=None,
             decided_by="carol@example.com",
         )
 
 
-def test_an_unknown_declaration_id_is_rejected(db, triggers):
-    with pytest.raises(ValueError, match="no such declaration"):
+def test_an_unknown_business_process_id_is_rejected(db, triggers):
+    with pytest.raises(ValueError, match="no such business process"):
         record_decision(
             db,
-            declaration_id="decl_does_not_exist",
+            business_process_id="bp_does_not_exist",
             triggered_keys=["large_scale"],
             justification=None,
             decided_by="carol@example.com",
         )
 
 
+# --- round-trip against a real process -------------------------------------
+
+
+def test_a_decision_against_a_real_process_round_trips(db, triggers):
+    # Not the shared `business_process_id` fixture: a second, distinct
+    # process from the customer's own register, to prove the round trip
+    # (write, then read back via current_verdict) works against whichever
+    # real business_process_id a caller hands in, not just the fixture's.
+    process_id = _seed_business_process(
+        db, "Fraud Risk Assessments", "Audit & Risk"
+    )
+
+    written = record_decision(
+        db,
+        business_process_id=process_id,
+        triggered_keys=["systematic_monitoring", "automated_decision"],
+        justification=None,
+        decided_by="carol@example.com",
+    )
+
+    read_back = current_verdict(db, process_id)
+
+    assert read_back is not None
+    assert read_back.business_process_id == process_id
+    assert read_back.dpia_required is True
+    assert read_back.triggered_keys == written.triggered_keys
+    assert read_back.decided_at == written.decided_at
+
+
 # --- append-only ---------------------------------------------------------
 
 
-def _decision_rows(db, declaration_id: str) -> list:
+def _decision_rows(db, business_process_id: str) -> list:
     return db.execute(
         sqlalchemy.text(
             "SELECT id, dpia_required, justification, decided_at FROM "
-            "privacycare_screening_decision WHERE declaration_id = :id"
+            "privacycare_screening_decision WHERE business_process_id = :id"
         ),
-        {"id": declaration_id},
+        {"id": business_process_id},
     ).all()
 
 
-def test_recording_twice_appends_rather_than_updates(db, triggers, declaration_id):
+def test_recording_twice_appends_rather_than_updates(db, triggers, business_process_id):
     first = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=[],
         justification="No processing risk identified this quarter.",
         decided_by="carol@example.com",
     )
 
-    rows_after_first = _decision_rows(db, declaration_id)
+    rows_after_first = _decision_rows(db, business_process_id)
     assert len(rows_after_first) == 1
     first_row_before = dict(rows_after_first[0]._mapping)
 
     second = record_decision(
         db,
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         triggered_keys=["large_scale"],
         justification=None,
         decided_by="michael@example.com",
     )
 
-    rows_after_second = _decision_rows(db, declaration_id)
+    rows_after_second = _decision_rows(db, business_process_id)
     assert len(rows_after_second) == 2
 
     # The first row is unchanged — re-screening appended, it never updated.
@@ -327,11 +370,11 @@ def test_recording_twice_appends_rather_than_updates(db, triggers, declaration_i
 # --- current_verdict / decision_history -----------------------------------
 
 
-def test_current_verdict_is_none_for_a_declaration_never_screened(db, declaration_id):
-    assert current_verdict(db, declaration_id) is None
+def test_current_verdict_is_none_for_a_business_process_never_screened(db, business_process_id):
+    assert current_verdict(db, business_process_id) is None
 
 
-def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int) -> None:
+def _backdate(db, business_process_id: str, triggered_keys: list[str], *, hours: int) -> None:
     """Pushes one decision's decided_at into the past by hand.
 
     Postgres' now() (this column's server_default) is the TRANSACTION's
@@ -345,24 +388,24 @@ def _backdate(db, declaration_id: str, triggered_keys: list[str], *, hours: int)
         sqlalchemy.text(
             "UPDATE privacycare_screening_decision "
             "SET decided_at = decided_at - (:hours || ' hours')::interval "
-            "WHERE declaration_id = :decl_id AND triggered_keys = :keys"
+            "WHERE business_process_id = :decl_id AND triggered_keys = :keys"
         ),
-        {"hours": hours, "decl_id": declaration_id, "keys": triggered_keys},
+        {"hours": hours, "decl_id": business_process_id, "keys": triggered_keys},
     )
 
 
-def test_current_verdict_returns_the_newest_decision(db, triggers, declaration_id):
+def test_current_verdict_returns_the_newest_decision(db, triggers, business_process_id):
     record_decision(
-        db, declaration_id=declaration_id, triggered_keys=[],
+        db, business_process_id=business_process_id, triggered_keys=[],
         justification="First pass: nothing ticked.", decided_by="carol@example.com",
     )
-    _backdate(db, declaration_id, [], hours=1)
+    _backdate(db, business_process_id, [], hours=1)
     second = record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["special_category"],
+        db, business_process_id=business_process_id, triggered_keys=["special_category"],
         justification=None, decided_by="carol@example.com",
     )
 
-    verdict = current_verdict(db, declaration_id)
+    verdict = current_verdict(db, business_process_id)
 
     assert verdict is not None
     assert verdict.dpia_required is True
@@ -370,18 +413,18 @@ def test_current_verdict_returns_the_newest_decision(db, triggers, declaration_i
     assert verdict.decided_at == second.decided_at
 
 
-def test_decision_history_returns_both_decisions_newest_first(db, triggers, declaration_id):
+def test_decision_history_returns_both_decisions_newest_first(db, triggers, business_process_id):
     first = record_decision(
-        db, declaration_id=declaration_id, triggered_keys=[],
+        db, business_process_id=business_process_id, triggered_keys=[],
         justification="First pass: nothing ticked.", decided_by="carol@example.com",
     )
-    _backdate(db, declaration_id, [], hours=1)
+    _backdate(db, business_process_id, [], hours=1)
     second = record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["special_category"],
+        db, business_process_id=business_process_id, triggered_keys=["special_category"],
         justification=None, decided_by="carol@example.com",
     )
 
-    history = decision_history(db, declaration_id)
+    history = decision_history(db, business_process_id)
 
     assert len(history) == 2
     assert history[0].decided_at >= history[1].decided_at
@@ -390,7 +433,7 @@ def test_decision_history_returns_both_decisions_newest_first(db, triggers, decl
     assert history[1].triggered_keys == first.triggered_keys
 
 
-def test_current_verdict_tie_break_is_deterministic_by_id(db, triggers, declaration_id):
+def test_current_verdict_tie_break_is_deterministic_by_id(db, triggers, business_process_id):
     # Force a genuine tie: two decisions that share the exact same
     # decided_at. record_decision itself has no way to pass decided_at (the
     # column defaults it), so the tie is manufactured directly against the
@@ -398,19 +441,19 @@ def test_current_verdict_tie_break_is_deterministic_by_id(db, triggers, declarat
     # comment for why ties break by id rather than being left
     # nondeterministic.
     first = record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["large_scale"],
+        db, business_process_id=business_process_id, triggered_keys=["large_scale"],
         justification=None, decided_by="carol@example.com",
     )
     second = record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["new_technology"],
+        db, business_process_id=business_process_id, triggered_keys=["new_technology"],
         justification=None, decided_by="carol@example.com",
     )
     db.execute(
         sqlalchemy.text(
             "UPDATE privacycare_screening_decision SET decided_at = :ts "
-            "WHERE declaration_id = :decl_id"
+            "WHERE business_process_id = :decl_id"
         ),
-        {"ts": second.decided_at, "decl_id": declaration_id},
+        {"ts": second.decided_at, "decl_id": business_process_id},
     )
 
     # ScreeningVerdict carries no id (it is not part of the dataclass's
@@ -422,9 +465,9 @@ def test_current_verdict_tie_break_is_deterministic_by_id(db, triggers, declarat
         for row in db.execute(
             sqlalchemy.text(
                 "SELECT id, triggered_keys FROM privacycare_screening_decision "
-                "WHERE declaration_id = :decl_id"
+                "WHERE business_process_id = :decl_id"
             ),
-            {"decl_id": declaration_id},
+            {"decl_id": business_process_id},
         ).all()
     }
     first_id = id_by_triggers[tuple(first.triggered_keys)]
@@ -438,57 +481,85 @@ def test_current_verdict_tie_break_is_deterministic_by_id(db, triggers, declarat
     # a deterministic tie-break, as opposed to whatever order Postgres
     # happens to hand rows back in.
     for _ in range(3):
-        verdict = current_verdict(db, declaration_id)
+        verdict = current_verdict(db, business_process_id)
         assert verdict is not None
         assert verdict.triggered_keys == expected_winner.triggered_keys
 
-    history = decision_history(db, declaration_id)
+    history = decision_history(db, business_process_id)
     assert [h.triggered_keys for h in history] == [
         expected_winner.triggered_keys,
         expected_loser.triggered_keys,
     ]
 
 
+def test_decisions_are_scoped_to_one_business_process(db, triggers, business_process_id):
+    # The WHERE clause in _SELECT_DECISIONS_SQL now filters on
+    # business_process_id, not declaration_id — this pins that a second,
+    # unrelated process (from the customer's own register, not a fixture
+    # id) never leaks into the first process's history or verdict, and
+    # vice versa.
+    other_process_id = _seed_business_process(
+        db, "CSR Planning & Execution", "CSR"
+    )
+
+    record_decision(
+        db, business_process_id=business_process_id, triggered_keys=["large_scale"],
+        justification=None, decided_by="carol@example.com",
+    )
+    record_decision(
+        db, business_process_id=other_process_id, triggered_keys=[],
+        justification="No DPIA-relevant processing in this cycle's CSR plan.",
+        decided_by="carol@example.com",
+    )
+
+    assert current_verdict(db, business_process_id).dpia_required is True
+    assert current_verdict(db, other_process_id).dpia_required is False
+    assert len(decision_history(db, business_process_id)) == 1
+    assert len(decision_history(db, other_process_id)) == 1
+    assert is_screened_out(db, business_process_id) is False
+    assert is_screened_out(db, other_process_id) is True
+
+
 # --- is_screened_out -------------------------------------------------------
 
 
-def test_is_screened_out_is_false_for_a_declaration_never_screened(db, declaration_id):
+def test_is_screened_out_is_false_for_a_business_process_never_screened(db, business_process_id):
     # Not an error, and not true: an unscreened activity has not been
     # screened out, and the gate is opt-in.
-    assert is_screened_out(db, declaration_id) is False
+    assert is_screened_out(db, business_process_id) is False
 
 
-def test_is_screened_out_is_true_after_a_screen_out_decision(db, triggers, declaration_id):
+def test_is_screened_out_is_true_after_a_screen_out_decision(db, triggers, business_process_id):
     record_decision(
-        db, declaration_id=declaration_id, triggered_keys=[],
+        db, business_process_id=business_process_id, triggered_keys=[],
         justification="Nothing ticked.", decided_by="carol@example.com",
     )
-    assert is_screened_out(db, declaration_id) is True
+    assert is_screened_out(db, business_process_id) is True
 
 
-def test_is_screened_out_is_false_after_a_dpia_required_decision(db, triggers, declaration_id):
+def test_is_screened_out_is_false_after_a_dpia_required_decision(db, triggers, business_process_id):
     record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["large_scale"],
+        db, business_process_id=business_process_id, triggered_keys=["large_scale"],
         justification=None, decided_by="carol@example.com",
     )
-    assert is_screened_out(db, declaration_id) is False
+    assert is_screened_out(db, business_process_id) is False
 
 
-def test_is_screened_out_reflects_the_latest_decision_only(db, triggers, declaration_id):
+def test_is_screened_out_reflects_the_latest_decision_only(db, triggers, business_process_id):
     record_decision(
-        db, declaration_id=declaration_id, triggered_keys=[],
+        db, business_process_id=business_process_id, triggered_keys=[],
         justification="Screened out last quarter.", decided_by="carol@example.com",
     )
-    assert is_screened_out(db, declaration_id) is True
+    assert is_screened_out(db, business_process_id) is True
 
     # Backdate the first decision — see _backdate's docstring: this test's
     # session never commits, so both decisions would otherwise share one
     # identical, transaction-scoped decided_at and this assertion would
     # depend on the id tie-break instead of proving "latest" actually means
     # "latest."
-    _backdate(db, declaration_id, [], hours=1)
+    _backdate(db, business_process_id, [], hours=1)
     record_decision(
-        db, declaration_id=declaration_id, triggered_keys=["automated_decision"],
+        db, business_process_id=business_process_id, triggered_keys=["automated_decision"],
         justification=None, decided_by="carol@example.com",
     )
-    assert is_screened_out(db, declaration_id) is False
+    assert is_screened_out(db, business_process_id) is False

@@ -39,23 +39,25 @@ _VALID_TRIGGER_KEYS_SQL = sqlalchemy.text(
     "SELECT trigger_key FROM privacycare_screening_trigger"
 )
 
-# No ForeignKey from privacycare_screening_decision.declaration_id to
-# privacydeclaration — see models.py's screening_decision_table comment:
-# a constraint from our chain into Ethyca's is the coupling that breaks an
-# upstream merge. Existence is checked here, at write time, instead.
-_DECLARATION_EXISTS_SQL = sqlalchemy.text(
-    "SELECT 1 FROM privacydeclaration WHERE id = :id"
+# privacycare_business_process is a PrivacyCare table in our own chain (see
+# models.py's screening_decision_table comment), so
+# privacycare_screening_decision.business_process_id now carries a real
+# ForeignKey. This existence check still runs ahead of the INSERT anyway,
+# so record_decision can raise a ValueError naming the process, rather
+# than surface Postgres' IntegrityError to the caller.
+_BUSINESS_PROCESS_EXISTS_SQL = sqlalchemy.text(
+    "SELECT 1 FROM privacycare_business_process WHERE id = :id"
 )
 
 _INSERT_DECISION_SQL = sqlalchemy.text(
     "INSERT INTO privacycare_screening_decision "
-    "(id, declaration_id, dpia_required, triggered_keys, justification, decided_by) "
-    "VALUES (:id, :declaration_id, :dpia_required, :triggered_keys, :justification, :decided_by) "
+    "(id, business_process_id, dpia_required, triggered_keys, justification, decided_by) "
+    "VALUES (:id, :business_process_id, :dpia_required, :triggered_keys, :justification, :decided_by) "
     "RETURNING decided_at"
 )
 
 _DECISION_COLUMNS = (
-    "declaration_id, dpia_required, triggered_keys, justification, "
+    "business_process_id, dpia_required, triggered_keys, justification, "
     "decided_by, decided_at"
 )
 
@@ -70,14 +72,14 @@ _DECISION_COLUMNS = (
 # flagged in review.
 _SELECT_DECISIONS_SQL = sqlalchemy.text(
     f"SELECT {_DECISION_COLUMNS} FROM privacycare_screening_decision "
-    "WHERE declaration_id = :declaration_id "
+    "WHERE business_process_id = :business_process_id "
     "ORDER BY decided_at DESC, id DESC"
 )
 
 
 @dataclass(frozen=True)
 class ScreeningVerdict:
-    declaration_id: str
+    business_process_id: str
     dpia_required: bool
     triggered_keys: list[str]  # sorted; empty when not required
     justification: Optional[str]  # present exactly when not required
@@ -91,7 +93,7 @@ def _to_verdict(row: "RowProxy") -> ScreeningVerdict:
     # happens here — this is a straight read of what was written, not a
     # second place that could apply a different rule.
     return ScreeningVerdict(
-        declaration_id=row.declaration_id,
+        business_process_id=row.business_process_id,
         dpia_required=row.dpia_required,
         triggered_keys=list(row.triggered_keys),
         justification=row.justification,
@@ -111,7 +113,7 @@ def list_triggers(db: Session) -> list[dict]:
 def record_decision(
     db: Session,
     *,
-    declaration_id: str,
+    business_process_id: str,
     triggered_keys: list[str],
     justification: Optional[str],
     decided_by: str,
@@ -172,15 +174,17 @@ def record_decision(
                 "compliance artifact a regulator asks for"
             )
 
-    exists = db.execute(_DECLARATION_EXISTS_SQL, {"id": declaration_id}).first()
+    exists = db.execute(
+        _BUSINESS_PROCESS_EXISTS_SQL, {"id": business_process_id}
+    ).first()
     if exists is None:
-        raise ValueError(f"no such declaration: {declaration_id!r}")
+        raise ValueError(f"no such business process: {business_process_id!r}")
 
     result = db.execute(
         _INSERT_DECISION_SQL,
         {
             "id": str(uuid.uuid4()),
-            "declaration_id": declaration_id,
+            "business_process_id": business_process_id,
             "dpia_required": dpia_required,
             "triggered_keys": keys,
             "justification": justification,
@@ -189,7 +193,7 @@ def record_decision(
     ).first()
 
     return ScreeningVerdict(
-        declaration_id=declaration_id,
+        business_process_id=business_process_id,
         dpia_required=dpia_required,
         triggered_keys=keys,
         justification=justification,
@@ -198,31 +202,33 @@ def record_decision(
     )
 
 
-def decision_history(db: Session, declaration_id: str) -> list[ScreeningVerdict]:
-    """Every screening decision ever recorded for this declaration, newest
-    first (see _SELECT_DECISIONS_SQL's comment for the decided_at/id
-    tie-break). Empty when the declaration has never been screened."""
-    rows = db.execute(_SELECT_DECISIONS_SQL, {"declaration_id": declaration_id}).all()
+def decision_history(db: Session, business_process_id: str) -> list[ScreeningVerdict]:
+    """Every screening decision ever recorded for this business process,
+    newest first (see _SELECT_DECISIONS_SQL's comment for the decided_at/id
+    tie-break). Empty when the process has never been screened."""
+    rows = db.execute(
+        _SELECT_DECISIONS_SQL, {"business_process_id": business_process_id}
+    ).all()
     return [_to_verdict(row) for row in rows]
 
 
-def current_verdict(db: Session, declaration_id: str) -> Optional[ScreeningVerdict]:
-    """The newest screening decision for this declaration, or None when it
-    has never been screened at all. Built on decision_history so the two
+def current_verdict(db: Session, business_process_id: str) -> Optional[ScreeningVerdict]:
+    """The newest screening decision for this business process, or None when
+    it has never been screened at all. Built on decision_history so the two
     can never disagree about which row is "current" or about the
     decided_at/id tie-break — there is exactly one ordering rule, defined
     once, in _SELECT_DECISIONS_SQL."""
-    history = decision_history(db, declaration_id)
+    history = decision_history(db, business_process_id)
     return history[0] if history else None
 
 
-def is_screened_out(db: Session, declaration_id: str) -> bool:
+def is_screened_out(db: Session, business_process_id: str) -> bool:
     """True only when the LATEST decision screened the activity out
-    (dpia_required is False). False for a declaration that has never been
-    screened at all — that is not an error and it is not "screened out":
-    an unscreened activity has simply not been screened, and screening is
-    opt-in, not assumed."""
-    verdict = current_verdict(db, declaration_id)
+    (dpia_required is False). False for a business process that has never
+    been screened at all — that is not an error and it is not "screened
+    out": an unscreened activity has simply not been screened, and
+    screening is opt-in, not assumed."""
+    verdict = current_verdict(db, business_process_id)
     if verdict is None:
         return False
     return not verdict.dpia_required

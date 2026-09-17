@@ -407,12 +407,25 @@ screening_decision_table = Table(
     "privacycare_screening_decision",
     PRIVACYCARE_METADATA,
     Column("id", String(255), primary_key=True, default=_uuid),
-    # References privacydeclaration.id, an ETHYCA table. Deliberately NO
-    # ForeignKey: a constraint from our chain into theirs is the coupling
-    # that breaks an upstream merge. Existence is checked at write time.
-    # The declaration is this platform's processing activity — see
-    # context.py's GenerationTarget docstring.
-    Column("declaration_id", String(255), nullable=False, index=True),
+    # References privacycare_business_process.id — OURS, in our own chain,
+    # not Ethyca's. The "no ForeignKey" reasoning that still applies to
+    # privacycare_dpia_risk.assessment_id, privacycare_generation_skip.task_id
+    # and privacycare_process_declaration.privacy_declaration_id above was
+    # specifically about a constraint reaching from our migration chain into
+    # ETHYCA's tables — that coupling is what breaks an upstream merge. It
+    # does not apply here: privacycare_business_process is a PrivacyCare
+    # table, created and migrated in this same chain, so a real ForeignKey
+    # is safe and is used. ondelete is deliberately left unset (Postgres'
+    # default, RESTRICT): a business process must not be deletable out from
+    # under the screening decisions recorded against it — see spec
+    # 2026-09-17-privacycare-20-screening-rekey Task 1.
+    Column(
+        "business_process_id",
+        String(255),
+        ForeignKey("privacycare_business_process.id"),
+        nullable=False,
+        index=True,
+    ),
     Column("dpia_required", Boolean, nullable=False),
     # Which triggers were ticked. Empty exactly when dpia_required is false.
     Column("triggered_keys", ARRAY(String), nullable=False),
