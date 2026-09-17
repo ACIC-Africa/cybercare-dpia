@@ -276,6 +276,118 @@ def test_a_declaration_with_no_process_link_is_not_blocked_even_when_a_process_i
     assert row["completed_count"] == 1
 
 
+# Batch cleanup (plan 20): _is_activity_screened_out's multi-link branch —
+# one declaration linked to SEVERAL business processes — had no test at
+# all. The docstring's rule: skip only when EVERY linked process currently
+# screens out; one linked process that is applicable, or simply never
+# screened, is enough to let the activity generate. The three tests below
+# each seed their own two-process link on a single declaration (the live
+# table holds 3 rows, all on one process, so leaning on it would pass
+# vacuously) and cover the three cells that matter: all-out, one-applicable,
+# one-unscreened.
+
+
+def test_a_declaration_linked_to_several_processes_is_skipped_only_when_all_are_not_applicable(
+    db,  # noqa: F811
+):
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    decl_id = _seed_declaration(db, sid, "marketing.advertising")
+    process_1 = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    process_2 = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, process_1, decl_id)
+    _link(db, process_2, decl_id)
+    _screen_out(db, process_1)
+    _screen_out(db, process_2)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assert _assessments_for_task(db, task_id) == [], (
+        "every business process linked to this activity is not applicable, "
+        "so the activity must be skipped, exactly as the single-process "
+        "case already is"
+    )
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["total_count"] == 1
+    assert row["completed_count"] == 0
+
+
+def test_a_declaration_linked_to_several_processes_generates_when_one_is_applicable(
+    db,  # noqa: F811
+):
+    # One linked process screened IN is enough to let the activity
+    # generate, even though the other linked process is not applicable —
+    # the resolver must not skip merely because SOME linked process is not
+    # applicable; it must require ALL of them to be.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    decl_id = _seed_declaration(db, sid, "marketing.advertising")
+    not_applicable = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    applicable = _seed_business_process(db, "Fraud Risk Assessments", "Audit & Risk")
+    _link(db, not_applicable, decl_id)
+    _link(db, applicable, decl_id)
+    _screen_out(db, not_applicable)
+    _screen_in(db, applicable)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assessments = _assessments_for_task(db, task_id)
+    assert len(assessments) == 1, (
+        "one linked process being applicable must let the activity "
+        "generate, regardless of the other linked process's not-applicable "
+        "verdict"
+    )
+    assert assessments[0]["declaration_id"] == decl_id
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["completed_count"] == 1
+
+
+def test_a_declaration_linked_to_several_processes_generates_when_one_is_unscreened(
+    db,  # noqa: F811
+):
+    # A linked process that has simply never been screened is, per
+    # is_screened_out's own opt-in contract, not "not applicable" — so it
+    # must not be treated as agreeing with a sibling process's not-applicable
+    # verdict. The activity must generate.
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key)
+    decl_id = _seed_declaration(db, sid, "marketing.advertising")
+    not_applicable = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    unscreened = _seed_business_process(db, "CSR Planning & Execution", "CSR")
+    _link(db, not_applicable, decl_id)
+    _link(db, unscreened, decl_id)
+    _screen_out(db, not_applicable)
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _full_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(db, assessment_types=[atype], system_fides_keys=[key])
+    db.flush()
+
+    run_generation(db, task_id)
+
+    assessments = _assessments_for_task(db, task_id)
+    assert len(assessments) == 1, (
+        "one linked process being unscreened must let the activity "
+        "generate, the same as if it were explicitly applicable"
+    )
+    assert assessments[0]["declaration_id"] == decl_id
+    row = _task_row(db, task_id)
+    assert row["status"] == "complete"
+    assert row["completed_count"] == 1
+
+
 def test_a_mixed_run_skips_the_screened_out_and_processes_the_rest(db):  # noqa: F811
     key = f"sys-{uuid.uuid4().hex[:6]}"
     sid = _seed_system(db, key)
