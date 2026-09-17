@@ -19,22 +19,34 @@ ScreeningHistoryResponse (screening_schemas.py) carry business_process_id
 instead of declaration_id, and this module's own existence check reads
 privacycare_business_process instead of privacydeclaration.
 
-SCOPES. PRIVACYCARE_SCREENING_READ guards the four read routes (list every
+SCOPES. PRIVACYCARE_SCREENING_READ guards the five read routes (list every
 business process's status, list triggers, current verdict, decision
-history); PRIVACYCARE_SCREENING_CREATE guards both write routes (record a
-decision, save a data mapping) — Task 4 reuses the existing write scope
-rather than adding a second one, since the brief named none and a mapping
-is, structurally, one more way of recording facts about a business
+history, read back a data mapping — the last one added in the final fix
+wave, item I-2); PRIVACYCARE_SCREENING_CREATE guards both write routes
+(record a decision, save a data mapping) — Task 4 reuses the existing write
+scope rather than adding a second one, since the brief named none and a
+mapping is, structurally, one more way of recording facts about a business
 process's assessability. PRIVACYCARE_SCREENING_READ IS granted to Viewer
 (roles.py's viewer_scopes) — a screening decision (gate.ScreeningVerdict)
 names a business process, which triggers were ticked and a free-text
 justification for a screen-out, never a data subject, the same distinction
 roles.py's PRIVACYCARE_RISK_READ comment draws for a risk-register row.
-This still holds after Task 4: nothing in this router lets a caller READ
-back a mapping's data subjects, and Viewer lacks the CREATE scope the
-mapping route requires, so a data subject is still never something Viewer
-can reach through this surface. See roles.py's own
-PRIVACYCARE_SCREENING_READ comment for the fuller version of this argument.
+
+THIS NO LONGER HOLDS UNCHANGED after the fix wave's GET .../mapping route:
+unlike every OTHER route this scope guards, a mapping's own
+DataMappingResponse DOES name data subjects and data categories, and
+Viewer now has a read path to them that did not exist before (Viewer lacks
+PRIVACYCARE_SCREENING_CREATE, so this remains true only for reading, never
+for writing, a mapping). The fix wave's own ruling on this finding (I-2)
+scoped it deliberately to "the cheap half" — a read side must exist at all,
+because the screen design promises a partial mapping can be "saved and
+returned to" and nothing else makes that possible — and did not revisit
+whether PRIVACYCARE_SCREENING_READ is still the right scope for it now
+that a data subject is reachable through it. Named here, not silently
+resolved, for Product/Carol: a future finer-grained scope split (mapping
+read vs. decision read) is a real option this fix wave did not take. See
+roles.py's own PRIVACYCARE_SCREENING_READ comment for the corresponding
+note on the Viewer grant.
 
 THE DISTINCTION THIS FILE EXISTS TO ENFORCE. gate.py's own read functions
 (current_verdict, decision_history) have NO existence check on
@@ -91,6 +103,7 @@ from fides.api.privacycare.api.screening_schemas import (
     CurrentScreeningResponse,
     DataMappingRequest,
     DataMappingResponse,
+    MappingReadResponse,
     ScreeningDecisionRequest,
     ScreeningHistoryResponse,
     ScreeningListResponse,
@@ -109,6 +122,7 @@ from fides.api.privacycare.screening.gate import (
 from fides.api.privacycare.screening.mapping import (
     MappingResult,
     existing_system_id_for_process,
+    get_mapping,
     save_mapping,
 )
 from fides.common.scope_registry import (
@@ -403,6 +417,52 @@ def record_screening_decision(
         raise HTTPException(status_code=status_code, detail=detail) from exc
     db.commit()
     return _response_from_verdict(verdict)
+
+
+@privacycare_screening_router.get(
+    "/{business_process_id}/mapping",
+    dependencies=[Security(verify_oauth_client, scopes=[PRIVACYCARE_SCREENING_READ])],
+    response_model=MappingReadResponse,
+)
+def get_data_mapping(
+    business_process_id: str,
+    *,
+    db: Session = Depends(get_db),
+) -> MappingReadResponse:
+    """Reads back the ONE activity THIS ROUTE owns for this business process
+    (fix wave, item I-2), or an explicit null when it has none.
+
+    404 for an unknown business_process_id; 200 with mapping=None for a
+    real business process that either has never been mapped through this
+    route, or carries only activities this route does not own (a
+    pre-existing real activity with no marker) — those are two different
+    real states from "no such business process" and from each other, and a
+    caller must be able to tell all three apart, same discipline the
+    current-verdict and history GETs above already keep for screening
+    decisions. Without this route, a partial mapping cannot be "saved and
+    returned to" the way the screen design promises, and a privacy officer
+    re-typing a mapping they cannot see would silently create a THIRD
+    activity — see mapping.py's own module docstring.
+
+    Read scope (PRIVACYCARE_SCREENING_READ), not the write scope the POST
+    sibling below requires — this route never writes ctl_systems or
+    privacydeclaration, so it carries none of that route's fix round 2,
+    item I-3 (SYSTEM_UPDATE) requirement either.
+    """
+    try:
+        result = get_mapping(db, business_process_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = (
+            status_codes.HTTP_404_NOT_FOUND
+            if detail.startswith("no such business process")
+            else status_codes.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return MappingReadResponse(
+        business_process_id=business_process_id,
+        mapping=_response_from_mapping(result) if result is not None else None,
+    )
 
 
 # fix round 2, item I-3 (SECURITY). This route writes ctl_systems and

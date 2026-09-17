@@ -253,8 +253,8 @@ def register() -> None:
     # grounds.py, chat.py, monitors.py, dsr.py, consent.py and risk.py
     # above — it carries none of the tasks-vs-assessments matching-order
     # hazard either. screening.py's OWN internal ordering hazard (GET
-    # "/triggers" must be registered ahead of GET "/{declaration_id}" on
-    # ITS router) is local to that one file and documented there instead.
+    # "/triggers" must be registered ahead of GET "/{business_process_id}"
+    # on ITS router) is local to that one file and documented there instead.
     importlib.import_module("fides.api.privacycare.api.screening")
 
     app_setup.ROUTERS.append(privacycare_router)

@@ -45,12 +45,17 @@ from sqlalchemy.orm import Session
 from fides.api.oauth.roles import CONTRIBUTOR, OWNER, ROLES_TO_SCOPES_MAPPING, VIEWER
 from fides.api.privacycare.api.screening import (
     get_current_screening_verdict,
+    get_data_mapping,
     get_screening_history,
     list_screening_status,
     list_screening_triggers,
     record_screening_decision,
+    save_data_mapping,
 )
-from fides.api.privacycare.api.screening_schemas import ScreeningDecisionRequest
+from fides.api.privacycare.api.screening_schemas import (
+    DataMappingRequest,
+    ScreeningDecisionRequest,
+)
 from fides.common.scope_registry import (
     PRIVACYCARE_SCREENING_CREATE,
     PRIVACYCARE_SCREENING_READ,
@@ -458,6 +463,49 @@ def test_a_failed_record_writes_nothing(db, triggers, business_process_id):
         db.rollback = real_rollback
 
 
+# --- Mapping read route (fix wave, item I-2) -------------------------------
+
+
+def test_an_unmapped_process_is_a_200_with_no_mapping_not_a_404(db, business_process_id):
+    response = get_data_mapping(business_process_id, db=db)
+    assert response.business_process_id == business_process_id
+    assert response.mapping is None
+
+
+def test_an_unknown_business_process_id_is_404_on_get_mapping(db):
+    with pytest.raises(HTTPException) as caught:
+        get_data_mapping(str(uuid.uuid4()), db=db)
+    assert caught.value.status_code == 404
+
+
+def test_a_saved_mapping_is_readable_back(db, business_process_id):
+    saved = save_data_mapping(
+        business_process_id,
+        DataMappingRequest(name="Fuel card KYC verification", data_categories=["user.contact.email"]),
+        db=db,
+        client=_fake_client("carol@example.com"),
+    )
+
+    response = get_data_mapping(business_process_id, db=db)
+    assert response.mapping is not None
+    assert response.mapping.privacy_declaration_id == saved.privacy_declaration_id
+    assert response.mapping.name == "Fuel card KYC verification"
+    assert response.mapping.data_categories == ["user.contact.email"]
+
+
+def test_a_process_with_only_a_route_unowned_activity_reads_as_no_mapping(db, business_process_id):
+    # A pre-existing real activity with no marker (mirrors bp_94d5439ced86's
+    # own two real, route-unowned activities) is a real and different state
+    # from "never mapped" — both must read as mapping=None, not conflated
+    # with a 404, and not fabricated into a mapping this route never wrote.
+    system_id = _seed_system(db, f"sys_{uuid.uuid4().hex[:8]}")
+    declaration_id = _seed_declaration(db, system_id, "marketing")
+    _link_declaration(db, business_process_id, declaration_id)
+
+    response = get_data_mapping(business_process_id, db=db)
+    assert response.mapping is None
+
+
 # --- Route ordering ------------------------------------------------------
 
 
@@ -540,12 +588,12 @@ def test_every_screening_route_requires_its_declared_scope():
             ), f"{route.path} [{method}] does not require {expected_scope!r}"
             checked += 1
 
-    # 6 logical routes as of plan 20 Task 4 (list every process's status,
-    # triggers, current verdict, history, record decision, save a data
-    # mapping), one HTTP method apiece — but fides.api.util.api_router.
-    # APIRouter registers BOTH a trailing-slash and a no-trailing-slash
-    # variant of every path as separate route objects (same guard as
-    # test_every_risk_route_requires_its_declared_scope /
-    # test_every_dsr_route_requires_its_declared_scope), so app.routes
-    # holds two entries per logical route: 6 * 2 = 12.
-    assert checked == 12, f"expected 12 screening route/method pairs, checked {checked}"
+    # 7 logical routes as of the final fix wave, item I-2 (list every
+    # process's status, triggers, current verdict, history, record
+    # decision, save a data mapping, read back a data mapping), one HTTP
+    # method apiece — but fides.api.util.api_router.APIRouter registers
+    # BOTH a trailing-slash and a no-trailing-slash variant of every path as
+    # separate route objects (same guard as test_every_risk_route_requires_
+    # its_declared_scope / test_every_dsr_route_requires_its_declared_scope),
+    # so app.routes holds two entries per logical route: 7 * 2 = 14.
+    assert checked == 14, f"expected 14 screening route/method pairs, checked {checked}"

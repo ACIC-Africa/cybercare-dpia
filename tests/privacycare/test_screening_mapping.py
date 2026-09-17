@@ -29,6 +29,9 @@ import sqlalchemy
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from fides.api.models.sql_models import (
+    System as SystemModel,  # type: ignore[attr-defined]
+)
 from fides.api.oauth.utils import verify_oauth_client
 from fides.api.privacycare import tasks as tasks_module
 from fides.api.privacycare.api.router import (
@@ -41,8 +44,11 @@ from fides.api.privacycare.context import select_targets
 from fides.api.privacycare.screening.gate import record_decision
 from fides.api.privacycare.screening.mapping import (
     MAPPING_ROUTE_FEATURE_MARKER,
+    MAPPING_ROUTE_ORGANIZATION_FIDES_KEY,
+    MAPPING_ROUTE_SYSTEM_TYPE,
     save_mapping,
 )
+from fides.api.schemas.system import BasicSystemResponse
 from fides.common.scope_registry import PRIVACYCARE_SCREENING_CREATE
 from tests.privacycare.test_api_assessments import _fake_client
 
@@ -70,6 +76,11 @@ TRIGGER_KEYS = (
 REAL_SUBJECT = "auditor"  # her own loaded addition (is_default = false)
 REAL_CATEGORY = "user.financial.income"
 REAL_SPECIAL_CATEGORY = "user.health_and_medical.hiv_status"
+# A real ctl_data_uses fides_key (fix wave, item C-2). All 56 rows in
+# ctl_data_uses are fideslang defaults — the Kenyan taxonomy load never
+# added any of her own (measured) — so there is no "her own loaded
+# addition" analogue here the way REAL_SUBJECT/REAL_CATEGORY have one.
+REAL_DATA_USE = "essential.legal_obligation"
 REAL_GROUND = "KYC Requirements"
 REAL_GROUND_LEGAL_BASIS = "Legitimate interests"
 # A real ground with NO fides_legal_basis determined yet (D-KT-4) — Carol
@@ -318,7 +329,10 @@ def test_a_complete_mapping_creates_an_activity_and_the_link(db, business_proces
             data_categories=[REAL_CATEGORY],
             data_subjects=[REAL_SUBJECT],
             ground=REAL_GROUND,
-            purpose="Verify a fuel card applicant's identity before enrolment.",
+            # A real ctl_data_uses fides_key (fix wave, item C-2) — purpose
+            # is a taxonomy key now, never free text. See
+            # REAL_DATA_USE's own comment for why this one.
+            purpose=REAL_DATA_USE,
             retention_period="7 years",
             third_parties="Credit reference bureau",
         ),
@@ -332,7 +346,7 @@ def test_a_complete_mapping_creates_an_activity_and_the_link(db, business_proces
     assert response.data_categories == [REAL_CATEGORY]
     assert response.data_subjects == [REAL_SUBJECT]
     assert response.fides_legal_basis == REAL_GROUND_LEGAL_BASIS
-    assert response.purpose == "Verify a fuel card applicant's identity before enrolment."
+    assert response.purpose == REAL_DATA_USE
     assert response.retention_period == "7 years"
     assert response.third_parties == "Credit reference bureau"
     assert response.processes_special_category_data is False
@@ -447,6 +461,27 @@ def test_an_unknown_ground_is_rejected_by_name(db, business_process_id):
         _save(db, business_process_id, ground="Not One Of Her Grounds")
     assert caught.value.status_code == 400
     assert "Not One Of Her Grounds" in caught.value.detail
+
+
+def test_an_unknown_purpose_is_rejected_by_name(db, business_process_id):
+    # Fix wave, item C-2: purpose is a taxonomy key (ctl_data_uses), not
+    # free text — the defect this test guards against is exactly what
+    # produced the two invalid live rows the final whole-branch review
+    # found: prose written straight into data_use, a FidesKey column.
+    with pytest.raises(HTTPException) as caught:
+        _save(
+            db, business_process_id,
+            purpose="Verify applicant identity and issue a fuel card",
+        )
+    assert caught.value.status_code == 400
+    assert "Verify applicant identity and issue a fuel card" in caught.value.detail
+
+
+def test_a_valid_purpose_taxonomy_key_is_accepted_and_persisted(db, business_process_id):
+    response = _save(db, business_process_id, purpose=REAL_DATA_USE)
+    assert response.purpose == REAL_DATA_USE
+    row = _snapshot(db, response.privacy_declaration_id)
+    assert row["data_use"] == REAL_DATA_USE
 
 
 def test_mapping_against_an_unknown_business_process_is_404(db):
@@ -917,6 +952,34 @@ def test_a_provisioned_system_is_tagged_identifiable_and_removable(db, business_
     system = _system_row(db, response.system_id)
     assert system["fides_key"] == f"privacycare_process_{business_process_id}"
     assert MAPPING_ROUTE_FEATURE_MARKER in (system["tags"] or [])
+
+
+def test_a_provisioned_system_passes_fideslang_response_validation(db, business_process_id):
+    # Fix wave, item C-1. Mirrors test_taxonomy_loader.py's own
+    # test_created_rows_pass_fideslang_response_validation exactly — the
+    # SAME defect shape (a raw-SQL INSERT leaving a required fideslang
+    # field NULL), the SAME convention (validate the row this code path
+    # actually wrote, not a lookalike). GET /api/v1/system declares
+    # BasicSystemResponse as its response_model, so that is the model this
+    # asserts against, not a hand-picked subset of its fields.
+    #
+    # Before this fix, organization_fides_key and system_type were both
+    # left NULL, which is not merely "missing" — both are required,
+    # non-Optional str on fideslang's own System model, which
+    # BasicSystemResponse inherits — so FastAPI's response validation
+    # would raise trying to serialize this row inside the LIST of every
+    # system, taking every OTHER (valid) system down with it. This test
+    # proves the row alone validates; the live-database repair (this
+    # task's report) proves the two already-written bad rows were fixed
+    # the same way.
+    response = _save(db, business_process_id)
+
+    orm_system = (
+        db.query(SystemModel).filter(SystemModel.id == response.system_id).one()
+    )
+    validated = BasicSystemResponse.model_validate(orm_system)
+    assert validated.organization_fides_key == MAPPING_ROUTE_ORGANIZATION_FIDES_KEY
+    assert validated.system_type == MAPPING_ROUTE_SYSTEM_TYPE
 
 
 def test_a_reused_real_system_is_never_tagged_as_route_provisioned(db, business_process_id):

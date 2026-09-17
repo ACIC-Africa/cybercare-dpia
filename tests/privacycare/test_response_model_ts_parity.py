@@ -439,6 +439,17 @@ ALLOWLIST: dict[str, dict] = {
             "No TS counterpart, same reason as TriggerResponse above."
         ),
     },
+    # GET /api/v1/privacycare/screening/{business_process_id}/mapping
+    # (final fix wave, item I-2). Same "no shipped admin-UI screen calls
+    # this" reasoning as TriggerResponse above.
+    "MappingReadResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as TriggerResponse above. Also "
+            "recurses into DataMappingResponse, covered by its own entry "
+            "above — no separate discovery happens for it there."
+        ),
+    },
 }
 
 

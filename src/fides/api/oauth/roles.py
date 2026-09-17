@@ -201,6 +201,16 @@ viewer_scopes = [  # Intentionally omitted USER_PERMISSION_READ and PRIVACY_REQU
     # here and is not imported into this module at all: Owner and
     # Contributor still get it by registry derivation below, same as every
     # other write scope this list omits.
+    #
+    # UPDATE (final fix wave, item I-2): GET .../mapping was added behind
+    # this SAME scope, and — unlike every other route it guards — a
+    # mapping's DataMappingResponse DOES name data subjects and data
+    # categories. Viewer can now read those back, though still not write
+    # them (PRIVACYCARE_SCREENING_CREATE is still absent from this list).
+    # This is a real widening of what Viewer can see through this scope,
+    # not something this fix wave re-litigated — see api/screening.py's
+    # own module docstring for the fuller note, named there for Product/
+    # Carol rather than silently resolved.
     PRIVACYCARE_SCREENING_READ,
     RULE_READ,
     SCOPE_READ,

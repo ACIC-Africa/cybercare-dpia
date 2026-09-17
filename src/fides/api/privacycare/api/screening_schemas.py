@@ -144,6 +144,14 @@ class DataMappingRequest(BaseModel):
     # legal basis directly, which is the whole point (screening/mapping.py:
     # "the lawful basis is derived, never accepted").
     #
+    # purpose (fix wave, item C-2) is a ctl_data_uses fides_key — a picker
+    # value, NOT free text — validated by save_mapping exactly like
+    # data_subjects/data_categories/ground and rejected by name when
+    # unknown. An earlier round wrote whatever prose was given here
+    # straight into privacydeclaration.data_use, which is a FidesKey column
+    # (alphanumerics and `. _ < > -` only); see screening/mapping.py's own
+    # module docstring for the full story of why that was wrong.
+    #
     # No TypeScript counterpart yet: Screen 1's mapping modal
     # (docs/design/privacycare-screens/DESIGN.md, "Step 2 — the prompted
     # mapping") is built from this route in a later plan, per that design's
@@ -189,6 +197,22 @@ class DataMappingResponse(BaseModel):
     third_parties: Optional[str]
     processes_special_category_data: bool
     created: bool
+
+
+class MappingReadResponse(BaseModel):
+    # GET .../mapping (fix wave, item I-2). Same shape as
+    # CurrentScreeningResponse above, applied to mappings instead of
+    # screening decisions: `mapping` is None for a business process with no
+    # activity THIS ROUTE owns — never screened, or mapped only through an
+    # activity this route did not create — while an unknown
+    # business_process_id never reaches this model at all (api/screening.py's
+    # existence check raises 404 first). business_process_id is echoed back
+    # even when mapping is None, same reasoning as CurrentScreeningResponse's
+    # own comment.
+    #
+    # No TypeScript counterpart: same reasoning as TriggerResponse above.
+    business_process_id: str
+    mapping: Optional[DataMappingResponse]
 
 
 class ScreeningListResponse(BaseModel):

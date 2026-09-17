@@ -10,27 +10,49 @@ business process through `privacycare_process_declaration` — the same link
 table tasks.py's `_is_activity_screened_out` already reads to resolve an
 activity back to its process's screening verdict.
 
-VOCABULARIES, NOT FREE TEXT (fix round 1, item 1). Every data subject and
-data category offered to her lives in `ctl_data_subjects`/
-`ctl_data_categories` — her 33/29 loaded-for-her rows (`is_default =
-false`) SIDE BY SIDE with fideslang's own shipped defaults (15/85 more),
-never instead of them (taxonomy/loader.py loaded her additions ALONGSIDE
-fideslang, per plan 09). The first cut of this module validated against
-`is_default = false` only, which rejected the ONLY data mapping the
-customer actually has today: both real live activities on
-`bp_94d5439ced86` use exclusively default-valued rows (`data_subjects =
-{customer}`, categories `user.contact.email`/`user.contact.phone_number`/
-`user.financial`/`user.behavior.purchase_history` — all `is_default =
-true`). Validation is now against the FULL active taxonomy — existence in
-`ctl_data_subjects`/`ctl_data_categories` at all, defaults included; no
-`is_default` filter, and no `active` filter either, because no other
-PrivacyCare code filters on that column and every row in both tables is
-currently `active = true` anyway (measured: 48/48, 114/114) — inventing a
-filter nothing else uses would be exactly the kind of ungrounded rule this
-task's brief warns against. An unknown value — one absent from the
-taxonomy altogether — is still rejected BY NAME (_unknown_values below)
-rather than silently dropped, because a silently dropped value records a
-mapping the user did not make and cannot see is missing.
+VOCABULARIES, NOT FREE TEXT (fix round 1, item 1; extended to `purpose` in
+the final fix wave, item C-2). Every data subject and data category offered
+to her lives in `ctl_data_subjects`/`ctl_data_categories` — her 33/29
+loaded-for-her rows (`is_default = false`) SIDE BY SIDE with fideslang's own
+shipped defaults (15/85 more), never instead of them (taxonomy/loader.py
+loaded her additions ALONGSIDE fideslang, per plan 09). The first cut of
+this module validated against `is_default = false` only, which rejected the
+ONLY data mapping the customer actually has today: both real live
+activities on `bp_94d5439ced86` use exclusively default-valued rows
+(`data_subjects = {customer}`, categories `user.contact.email`/
+`user.contact.phone_number`/`user.financial`/`user.behavior.purchase_history`
+— all `is_default = true`). Validation is now against the FULL active
+taxonomy — existence in `ctl_data_subjects`/`ctl_data_categories` at all,
+defaults included; no `is_default` filter, and no `active` filter either,
+because no other PrivacyCare code filters on that column and every row in
+both tables is currently `active = true` anyway (measured: 48/48, 114/114)
+— inventing a filter nothing else uses would be exactly the kind of
+ungrounded rule this task's brief warns against. An unknown value — one
+absent from the taxonomy altogether — is still rejected BY NAME
+(_unknown_values below) rather than silently dropped, because a silently
+dropped value records a mapping the user did not make and cannot see is
+missing.
+
+`purpose` IS ALSO A TAXONOMY KEY, NOT PROSE (final fix wave, item C-2 —
+this is the one field the first cut of this task got wrong). `purpose` is
+written to `privacydeclaration.data_use`, and `data_use` is a `FidesKey`:
+alphanumerics and `. _ < > -` only. An earlier round accepted free text
+here on the theory that `PrivacyDeclaration.purpose`'s own hybrid property
+(sql_models.py) "equates the two" — that hybrid returns an `Optional[int]`
+TCF Purpose id **looked up by `data_use`**; reading it actually proves
+`data_use` is a taxonomy key, the opposite of what was concluded. The two
+route-created activities in the live database before this fix carried
+`data_use` values of raw prose ("Verify applicant identity and issue a fuel
+card...") — invalid `FidesKey`s that happened not to be validated by
+anything downstream yet, not evidence that the shape was fine. `purpose` is
+now validated against `ctl_data_uses` (56 rows, all fideslang defaults —
+the Kenyan taxonomy load never added any of her own) by the SAME
+`_unknown_values` helper the other three vocabularies use, and rejected BY
+NAME when absent, exactly like a data subject or category. The
+`UNSPECIFIED_DATA_USE` sentinel below is the one deliberate exception: it
+is used only when `purpose` is not given at all (a legitimately partial
+mapping), is already a valid `FidesKey`, and is never itself checked
+against `ctl_data_uses` — see its own comment for why that is fine.
 
 THE LAWFUL BASIS IS DERIVED, NEVER ACCEPTED. The client sends the *ground*
 — her business situation ("KYC Requirements", "Enrolment of an Applicant")
@@ -149,6 +171,45 @@ for Product/Carol to review — there is exactly one `ctl_systems` row today,
 so the shape of what 85 more provisioned rows looks like is not yet
 visible in her demo.
 
+A PROVISIONED SYSTEM MUST BE A VALID `System` (final fix wave, item C-1 —
+the other defect the first cut of this task got wrong). `_INSERT_SYSTEM_SQL`
+used to write only `(id, fides_key, name, description, tags)`, leaving
+`organization_fides_key` and `system_type` NULL. Both are required,
+non-Optional `str` on fideslang's own `System` model — which
+`BasicSystemResponse` inherits, and which `GET /api/v1/system` declares as
+its `response_model` — so FastAPI validates the WHOLE list on every call,
+and a single bad row 500s the entire System Inventory screen, taking the
+customer's own genuinely-valid systems down with it (measured live: it did,
+for `fuel_card_crm`). This repo had already learned this exact lesson once,
+from plan 09's raw-SQL taxonomy inserts (`test_created_rows_carry_default_
+organization`, `test_created_rows_pass_fideslang_response_validation` —
+tests/privacycare/test_taxonomy_loader.py) and the mapping route did not
+inherit the convention. `_INSERT_SYSTEM_SQL` now sets both columns:
+`organization_fides_key` to `'default_organization'` — the only row in
+`ctl_organizations`, and what every Fides default row and the customer's
+own `fuel_card_crm` already carry — and `system_type` to
+`MAPPING_ROUTE_SYSTEM_TYPE` (`'Application'`, matching `fuel_card_crm`'s own
+value; the field's own description names "Service, Application, Third
+Party" as its examples, and there is no enum to pick from, so matching the
+customer's one existing precedent is the least surprising choice for a
+process-anchored placeholder with no scanned infrastructure of its own).
+
+THE MAPPING CAN BE READ BACK (final fix wave, item I-2). The screen design
+promises a partial mapping can be "saved and returned to", which is not
+possible without a read side — and an officer who cannot see what they
+already saved would silently create a THIRD activity on their next visit
+(see "IDEMPOTENCY IS KEYED TO THE ACTIVITY" above). `get_mapping` answers
+that: it returns the SAME row `save_mapping`'s own update branch would find
+(`_EXISTING_ROUTE_ACTIVITY_SQL`, reused verbatim, taken with no lock — a
+GET must never block a concurrent write), built through the SAME
+`_result_from_row` construction `save_mapping` itself uses, so the two can
+never disagree about what a mapping looks like. `None` for a process with
+no route-owned activity — including one that carries only activities this
+route does not own, which is a real and different state from "never
+mapped" and must not be confused with it (see api/screening.py's own
+`_response_from_mapping`-adjacent handling for how the route surfaces that
+distinction as 200-with-null rather than 404).
+
 All raw SQL, all bound parameters, never a commit — the caller's session
 boundary decides, same rule as gate.py, risk/register.py and grounds.py.
 """
@@ -174,16 +235,33 @@ from fides.api.privacycare.taxonomy.kenyan import SPECIAL_TAG
 # the process id alone is not safe to key off of.
 MAPPING_ROUTE_FEATURE_MARKER = "privacycare:mapping_route"
 
+# The organization every route-provisioned system belongs to, and the type
+# it is tagged with (fix wave, item C-1 — see this module's own docstring).
+# 'default_organization' is the only row in ctl_organizations and what every
+# Fides default row, and the customer's own real fuel_card_crm, already
+# carry. 'Application' matches fuel_card_crm's own system_type — there is no
+# enum to choose from (fideslang's System.system_type is a free str whose
+# field description names "Service, Application, Third Party, etc." as
+# examples only), so matching her one existing precedent is the least
+# surprising choice for a process-anchored placeholder with no scanned
+# infrastructure of its own.
+MAPPING_ROUTE_ORGANIZATION_FIDES_KEY = "default_organization"
+MAPPING_ROUTE_SYSTEM_TYPE = "Application"
+
 # Written to `data_use` when no `purpose` is supplied yet (a legitimately
-# partial mapping — see DataMappingRequest). NOT a taxonomy key: data_use is
-# a soft String reference with no FK into ctl_data_uses (context.py's
-# build_context already documents that "a declaration may legitimately name
-# a custom data use" and resolves an unmatched one to None name/description
-# rather than raising), and PrivacyDeclaration.purpose's own hybrid property
-# looks up MAPPED_PURPOSES_ONLY_BY_DATA_USE.get(self.data_use) and returns
-# None for anything it does not recognise — this sentinel included. Neither
-# read path breaks; both simply have nothing to say about it yet, which is
-# the truth.
+# partial mapping — see DataMappingRequest). Deliberately NOT one of the 56
+# rows in ctl_data_uses (a real `purpose`, once given, must be — see this
+# module's own docstring, "`purpose` IS ALSO A TAXONOMY KEY, NOT PROSE"):
+# this sentinel is a synthetic placeholder for "nothing recorded yet", never
+# checked against _VALID_DATA_USES_SQL itself (the None-vs-sentinel branch
+# below chooses it directly, bypassing validation, precisely because "not
+# answered" is not a value to validate). Both of `data_use`'s own read paths
+# already tolerate an unmatched value gracefully rather than raising —
+# context.py's build_context documents that "a declaration may legitimately
+# name a custom data use" and resolves an unmatched one to None name/
+# description, and PrivacyDeclaration.purpose's own hybrid property looks up
+# MAPPED_PURPOSES_ONLY_BY_DATA_USE.get(self.data_use) and returns None for
+# anything it does not recognise — this sentinel included, same as before.
 UNSPECIFIED_DATA_USE = "privacycare.purpose_not_yet_recorded"
 
 
@@ -228,12 +306,28 @@ _BUSINESS_PROCESS_NAME_SQL = sqlalchemy.text(
     "SELECT name FROM privacycare_business_process WHERE id = :id FOR UPDATE"
 )
 
+# A local copy of the same existence check, WITHOUT the write path's own
+# FOR UPDATE lock — used only by get_mapping (fix wave, item I-2), which is
+# a read and must never block behind, or itself hold, a lock a concurrent
+# save_mapping call is waiting on. Same convention api/screening.py's own
+# module docstring documents for why each module keeps its own copy of this
+# query rather than importing another module's private one.
+_BUSINESS_PROCESS_EXISTS_SQL = sqlalchemy.text(
+    "SELECT 1 FROM privacycare_business_process WHERE id = :id"
+)
+
 _VALID_SUBJECTS_SQL = sqlalchemy.text(
     "SELECT fides_key FROM ctl_data_subjects WHERE fides_key = ANY(:keys)"
 )
 
 _VALID_CATEGORIES_SQL = sqlalchemy.text(
     "SELECT fides_key FROM ctl_data_categories WHERE fides_key = ANY(:keys)"
+)
+
+# fix wave, item C-2: purpose is a taxonomy key like subjects and
+# categories, not free text — see this module's own docstring.
+_VALID_DATA_USES_SQL = sqlalchemy.text(
+    "SELECT fides_key FROM ctl_data_uses WHERE fides_key = ANY(:keys)"
 )
 
 _GROUND_SQL = sqlalchemy.text(
@@ -296,9 +390,16 @@ _ANY_SYSTEM_FOR_PROCESS_SQL = sqlalchemy.text(
     "ORDER BY pd.created_at, pd.id LIMIT 1"
 )
 
+# fix wave, item C-1: organization_fides_key and system_type are both
+# required, non-Optional str on fideslang's System model — omitting them
+# (the pre-fix shape) produced a row GET /api/v1/system's own
+# BasicSystemResponse cannot validate, 500ing the WHOLE list. See this
+# module's own docstring for the measured live evidence.
 _INSERT_SYSTEM_SQL = sqlalchemy.text(
-    "INSERT INTO ctl_systems (id, fides_key, name, description, tags) "
-    "VALUES (:id, :fides_key, :name, :description, :tags) "
+    "INSERT INTO ctl_systems "
+    "(id, fides_key, name, description, tags, organization_fides_key, system_type) "
+    "VALUES (:id, :fides_key, :name, :description, :tags, "
+    " :organization_fides_key, :system_type) "
     "ON CONFLICT (fides_key) DO NOTHING"
 )
 
@@ -412,6 +513,11 @@ def _system_id_for_process(db: Session, business_process_id: str, process_name: 
             # a reused, real customer system (e.g. the two live activities'
             # own ctl_ef9cadb3-... system) is never tagged by this code path.
             "tags": [MAPPING_ROUTE_FEATURE_MARKER],
+            # fix wave, item C-1: both required, non-Optional str on
+            # fideslang's System model — see _INSERT_SYSTEM_SQL's own
+            # comment and this module's docstring.
+            "organization_fides_key": MAPPING_ROUTE_ORGANIZATION_FIDES_KEY,
+            "system_type": MAPPING_ROUTE_SYSTEM_TYPE,
         },
     )
     return db.execute(_SYSTEM_ID_BY_FIDES_KEY_SQL, {"fides_key": fides_key}).scalar()
@@ -471,6 +577,16 @@ def save_mapping(
             raise ValueError(
                 f"unknown data subject(s): {', '.join(unknown_subjects)}"
             )
+
+    # fix wave, item C-2: purpose is a taxonomy key (ctl_data_uses), not
+    # free text — see this module's own docstring, "`purpose` IS ALSO A
+    # TAXONOMY KEY, NOT PROSE". Only checked when given this call; None
+    # ("not answered") is not a value to validate, and takes the
+    # UNSPECIFIED_DATA_USE sentinel branch further down instead.
+    if purpose is not None:
+        unknown_purpose = _unknown_values(db, _VALID_DATA_USES_SQL, [purpose])
+        if unknown_purpose:
+            raise ValueError(f"unknown purpose value: {purpose!r}")
 
     fides_legal_basis: Optional[str] = None
     ground_id: Optional[str] = None
@@ -556,6 +672,24 @@ def save_mapping(
     # Canonical state, not an echo of this call's own request fields — see
     # _SELECT_DECLARATION_SQL's own comment for why that matters on update.
     row = db.execute(_SELECT_DECLARATION_SQL, {"id": declaration_id}).mappings().first()
+    return _result_from_row(
+        business_process_id, declaration_id, row, ground=ground, created=created
+    )
+
+
+def _result_from_row(
+    business_process_id: str,
+    declaration_id: str,
+    row,
+    *,
+    ground: Optional[str],
+    created: bool,
+) -> MappingResult:
+    """Builds a MappingResult from a _SELECT_DECLARATION_SQL row — the ONE
+    place that shape is assembled, used by both save_mapping (fresh off its
+    own write, in the same transaction) and get_mapping (fix wave, item
+    I-2, a pure read with no write of its own) so the two can never
+    disagree about what a mapping looks like."""
     persisted_purpose = row["data_use"]
     if persisted_purpose == UNSPECIFIED_DATA_USE:
         persisted_purpose = None
@@ -570,8 +704,10 @@ def save_mapping(
         # The ground's own TEXT is not stored anywhere on privacydeclaration
         # — only its derived fides_legal_basis is. This echoes what THIS
         # call was given (None when this call did not name one, even if an
-        # earlier call already set the legal basis); fides_legal_basis below
-        # always reflects the current persisted, derived value.
+        # earlier call already set the legal basis, or — on the get_mapping
+        # read path — always, since a read never "names" a ground at all);
+        # fides_legal_basis below always reflects the current persisted,
+        # derived value.
         ground=ground,
         fides_legal_basis=row["legal_basis_for_processing"],
         purpose=persisted_purpose,
@@ -580,3 +716,52 @@ def save_mapping(
         processes_special_category_data=row["processes_special_category_data"],
         created=created,
     )
+
+
+def get_mapping(db: Session, business_process_id: str) -> Optional[MappingResult]:
+    """Reads back the ONE activity THIS ROUTE owns for this business
+    process (fix wave, item I-2) — or None when it has none. Without this,
+    the screen design's promise that a partial mapping can be "saved and
+    returned to" is impossible to keep, and a privacy officer who re-types
+    a mapping they cannot see would silently create a THIRD activity (see
+    this module's own docstring, "IDEMPOTENCY IS KEYED TO THE ACTIVITY").
+
+    Raises ValueError("no such business process: ...") for an unknown
+    business_process_id — the same message and prefix save_mapping and
+    gate.record_decision already use, so api/screening.py's existing
+    ValueError-to-404 mapping handles this with no new branch.
+
+    Returns None, not an error, in TWO different real situations a caller
+    must be able to tell apart from a 404: a business process that has
+    simply never been mapped at all, and one that carries only activities
+    this route does not own (a pre-existing real one with no marker) —
+    api/screening.py's own route surfaces both as a 200 with an explicit
+    null, same "unmapped is not an error" contract gate.py's own
+    current_verdict already keeps for screening decisions.
+
+    Uses _EXISTING_ROUTE_ACTIVITY_SQL with NO lock — a read must never
+    block behind, or itself hold, the FOR UPDATE lock save_mapping takes on
+    the business process row (fix round 2, item I-2); the two mustn't be
+    able to deadlock against each other, and a GET is not the caller who
+    gets to decide create-vs-update, so it has nothing to protect by
+    locking.
+    """
+    exists = db.execute(
+        _BUSINESS_PROCESS_EXISTS_SQL, {"id": business_process_id}
+    ).first()
+    if exists is None:
+        raise ValueError(f"no such business process: {business_process_id!r}")
+
+    existing = db.execute(
+        _EXISTING_ROUTE_ACTIVITY_SQL,
+        {"business_process_id": business_process_id, "marker": MAPPING_ROUTE_FEATURE_MARKER},
+    ).mappings().first()
+    if existing is None:
+        return None
+
+    declaration_id = existing["declaration_id"]
+    row = db.execute(_SELECT_DECLARATION_SQL, {"id": declaration_id}).mappings().first()
+    # ground=None: a read never "names" a ground this call — see
+    # _result_from_row's own comment on this field. created=False: a read
+    # never creates or updates anything.
+    return _result_from_row(business_process_id, declaration_id, row, ground=None, created=False)

@@ -163,15 +163,15 @@ def record_decision(
         if justification is not None:
             raise ValueError(
                 "justification must not be given when a trigger requires a "
-                "DPIA — the ticked triggers are the reason, and a "
-                "screen-in does not need a second one"
+                "DPIA — the ticked triggers are the reason, and marking a "
+                "process applicable does not need a second one"
             )
     else:
         if justification is None or not justification.strip():
             raise ValueError(
-                "justification is required when no trigger is ticked — a "
-                "screen-out needs a one-line reason, and this is the "
-                "compliance artifact a regulator asks for"
+                "justification is required when no trigger is ticked — "
+                "marking a process not applicable needs a one-line reason, "
+                "and this is the compliance artifact a regulator asks for"
             )
 
     exists = db.execute(
