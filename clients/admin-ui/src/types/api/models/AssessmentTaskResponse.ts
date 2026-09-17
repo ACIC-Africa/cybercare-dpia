@@ -29,6 +29,11 @@ export type AssessmentTaskResponse = {
    */
   completed_count?: number;
   /**
+   * Skipped Count
+   */
+  // PrivacyCare (spec 2026-09-16 D-W2-7g)
+  skipped_count?: number;
+  /**
    * Progress
    */
   progress?: number;

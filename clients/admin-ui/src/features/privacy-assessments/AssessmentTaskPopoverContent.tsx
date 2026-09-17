@@ -5,9 +5,24 @@ import { useRelativeTime } from "~/features/common/hooks/useRelativeTime";
 import { AssessmentTaskResponse, TaskStatus } from "./types";
 import { formatSystems, formatTypes } from "./utils";
 
+// PrivacyCare (spec 2026-09-16 D-W2-7g): the generated OpenAPI contract
+// (types/api/models/AssessmentTaskResponse.ts) now carries skipped_count,
+// but this feature module's hand-authored AssessmentTaskResponse (./types)
+// does not — that file is out of this task's edit budget. Extend it
+// locally instead of widening the shared interface.
+type TaskWithSkips = AssessmentTaskResponse & { skipped_count?: number };
+
+// PrivacyCare (spec 2026-09-16 D-W2-7g): a screened-out activity is a
+// decision ("no DPIA needed"), not an error or a skip-because-broken — say
+// nothing when there is nothing to say (skipped_count is 0/undefined), and
+// otherwise use the same "screened out" wording the backend and the spec
+// use, never a synonym.
+const screenedOutSuffix = (skippedCount?: number): string =>
+  skippedCount ? `, ${skippedCount} screened out (no DPIA required)` : "";
+
 interface AssessmentTaskPopoverContentProps {
-  activeTask: AssessmentTaskResponse | null;
-  lastCompletedTask: AssessmentTaskResponse | null;
+  activeTask: TaskWithSkips | null;
+  lastCompletedTask: TaskWithSkips | null;
   templateNamesMap?: Record<string, string>;
 }
 
@@ -42,6 +57,8 @@ export const AssessmentTaskPopoverContent = ({
               <Text size="sm">
                 {activeTask.completed_count} of {activeTask.total_count}{" "}
                 assessments
+                {/* PrivacyCare (spec 2026-09-16 D-W2-7g) */}
+                {screenedOutSuffix(activeTask.skipped_count)}
               </Text>
               <Progress
                 percent={Math.round(activeTask.progress)}
@@ -82,6 +99,15 @@ export const AssessmentTaskPopoverContent = ({
           ) : (
             <Tag color="success">Completed</Tag>
           )}
+        </Descriptions.Item>
+        {/* PrivacyCare (spec 2026-09-16 D-W2-7g): the outcome — how many
+            assessments the run produced, and how many activities the
+            screening gate decided didn't need one. */}
+        <Descriptions.Item label="Outcome">
+          <Text size="sm">
+            {lastCompletedTask.completed_count} assessments produced
+            {screenedOutSuffix(lastCompletedTask.skipped_count)}
+          </Text>
         </Descriptions.Item>
         <Descriptions.Item label="Type">
           {formatTypes(lastCompletedTask.assessment_types, templateNamesMap)}

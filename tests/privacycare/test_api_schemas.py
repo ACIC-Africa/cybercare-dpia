@@ -643,7 +643,9 @@ def test_assessment_task_response_keeps_high_risk_only_the_feature_override_omit
 
 
 def test_the_assessment_task_response_contract_was_actually_read():
-    assert len(_ts_fields("AssessmentTaskResponse")) == 17
+    # PrivacyCare (spec 2026-09-16 D-W2-7g): 17 -> 18 when skipped_count was
+    # added to the generated TS contract alongside the Python model.
+    assert len(_ts_fields("AssessmentTaskResponse")) == 18
 
 
 def test_assessment_task_system_info_matches_the_generated_contract():
