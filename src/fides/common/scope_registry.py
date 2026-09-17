@@ -454,8 +454,8 @@ SCOPE_DOCS = {
     PRIVACYCARE_RISK_READ: "View a DPIA's risk register and its ODPC prior-consultation finding",
     PRIVACYCARE_RISK_CREATE: "Add and remove risks in a DPIA's risk register",
     # PrivacyCare (spec 2026-09-16 D-W2-7)
-    PRIVACYCARE_SCREENING_READ: "View the DPIA screening gate's triggers, a declaration's current verdict, and its decision history",
-    PRIVACYCARE_SCREENING_CREATE: "Record a DPIA screening decision for a declaration",
+    PRIVACYCARE_SCREENING_READ: "View the DPIA screening gate's triggers, a business process's current verdict, and its decision history",
+    PRIVACYCARE_SCREENING_CREATE: "Record a DPIA screening decision for a business process, or save its data mapping (also requires system-write authorisation)",
     SYSTEM_INTEGRATION_LINK_CREATE_OR_UPDATE: "Create or update system-integration links",
     SYSTEM_INTEGRATION_LINK_DELETE: "Delete system-integration links",
     SYSTEM_INTEGRATION_LINK_READ: "Read system-integration links",
