@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 
 import { ScopeRegistryEnum } from "~/types/api";
 
-import { ScreeningTable } from "./ScreeningTable";
 import { ScreeningStatusResponse } from "./screening.types";
+import { ScreeningTable } from "./ScreeningTable";
 
 // PrivacyCare (spec 2026-09-16 D-W2-7g): real business processes and cycle,
 // not placeholders — Fuel Card Issuance is applicable and mapped, CSR
@@ -37,7 +37,8 @@ const PROCESSES: ScreeningStatusResponse[] = [
 let mockUserScopes: ScopeRegistryEnum[] = [];
 
 jest.mock("~/app/hooks", () => ({
-  useAppSelector: (selector: (state: unknown) => unknown) => selector(undefined),
+  useAppSelector: (selector: (state: unknown) => unknown) =>
+    selector(undefined),
 }));
 
 jest.mock("~/features/user-management", () => ({
@@ -66,7 +67,9 @@ describe("ScreeningTable — permissions", () => {
     ).not.toBeInTheDocument();
     // Hidden, not disabled — a disabled button with no explanation
     // generates a support ticket (DESIGN.md).
-    expect(screen.queryByRole("button", { name: /re-screen/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /re-screen/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the record-decision control to a Contributor (create scope)", () => {
@@ -91,6 +94,58 @@ describe("ScreeningTable — permissions", () => {
     expect(
       screen.getByTestId("record-decision-bp_94d5439ced86"),
     ).toHaveTextContent("Re-screen");
+  });
+});
+
+describe("ScreeningTable — the mapping quick-action is gated on both scopes (M7)", () => {
+  beforeEach(() => {
+    mockUserScopes = [];
+  });
+
+  it("hides the mapping action for a role with screening create but no System Update", () => {
+    mockUserScopes = [ScopeRegistryEnum.PRIVACYCARE_SCREENING_CREATE];
+    render(<ScreeningTable processes={PROCESSES} />);
+
+    // Restrict's own contract is "any of these scopes" — a single list of
+    // both scopes would wrongly show this for EITHER one alone. Nesting is
+    // what actually ANDs them (see ScreeningTable's own comment on this).
+    expect(
+      screen.queryByTestId("mapping-action-bp_94d5439ced86"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the mapping action for a role with System Update but no screening create", () => {
+    mockUserScopes = [ScopeRegistryEnum.SYSTEM_UPDATE];
+    render(<ScreeningTable processes={PROCESSES} />);
+
+    expect(
+      screen.queryByTestId("mapping-action-bp_94d5439ced86"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the mapping action only when both scopes are held", () => {
+    mockUserScopes = [
+      ScopeRegistryEnum.PRIVACYCARE_SCREENING_CREATE,
+      ScopeRegistryEnum.SYSTEM_UPDATE,
+    ];
+    render(<ScreeningTable processes={PROCESSES} />);
+
+    expect(
+      screen.getByTestId("mapping-action-bp_94d5439ced86"),
+    ).toBeInTheDocument();
+  });
+
+  it('labels the mapping action "Open mapping", not "Edit mapping" — has_mapping does not mean this route owns it (M1)', () => {
+    mockUserScopes = [
+      ScopeRegistryEnum.PRIVACYCARE_SCREENING_CREATE,
+      ScopeRegistryEnum.SYSTEM_UPDATE,
+    ];
+    render(<ScreeningTable processes={PROCESSES} />);
+
+    expect(
+      screen.getByTestId("mapping-action-bp_94d5439ced86"),
+    ).toHaveTextContent("Open mapping");
+    expect(screen.queryByText("Edit mapping")).not.toBeInTheDocument();
   });
 });
 

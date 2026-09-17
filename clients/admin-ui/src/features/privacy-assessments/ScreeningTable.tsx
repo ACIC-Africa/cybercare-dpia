@@ -107,23 +107,40 @@ export const ScreeningTable = ({
         return (
           <Flex align="center" gap="small">
             <MappingStatusTag row={row} />
+            {/* M7: nested Restrict, not a single list of scopes — Restrict's
+                own contract is "any of these", which would wrongly let
+                EITHER scope alone show this link. Saving a mapping needs
+                BOTH PRIVACYCARE_SCREENING_CREATE and SYSTEM_UPDATE (see
+                MappingStepForm's own canSaveMapping comment), so nesting
+                is what actually ANDs them. */}
             <Restrict scopes={[ScopeRegistryEnum.PRIVACYCARE_SCREENING_CREATE]}>
-              <Button
-                type="link"
-                size="small"
-                className="p-0"
-                data-testid={`mapping-action-${row.business_process_id}`}
-                onClick={() =>
-                  setModalState({
-                    businessProcessId: row.business_process_id,
-                    processName: row.name,
-                    hasMapping: row.has_mapping,
-                    initialStep: "mapping",
-                  })
-                }
-              >
-                {row.has_mapping ? "Edit mapping" : "Start mapping"}
-              </Button>
+              <Restrict scopes={[ScopeRegistryEnum.SYSTEM_UPDATE]}>
+                <Button
+                  type="link"
+                  size="small"
+                  className="p-0"
+                  data-testid={`mapping-action-${row.business_process_id}`}
+                  onClick={() =>
+                    setModalState({
+                      businessProcessId: row.business_process_id,
+                      processName: row.name,
+                      hasMapping: row.has_mapping,
+                      initialStep: "mapping",
+                    })
+                  }
+                >
+                  {/* M1: "Edit mapping" over-promised. has_mapping is true
+                      for a foreign-owned activity too (any live link, not
+                      only one this route created — see
+                      ScreeningStatusResponse's own has_mapping comment),
+                      and on that row the modal correctly refuses to edit
+                      anything — a real row in live data (bp_94d5439ced86)
+                      is exactly this case. "Open mapping" promises only
+                      what is true either way: something opens, and what it
+                      shows is honest once it does. */}
+                  {row.has_mapping ? "Open mapping" : "Start mapping"}
+                </Button>
+              </Restrict>
             </Restrict>
           </Flex>
         );

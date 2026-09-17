@@ -47,17 +47,18 @@ describe("MappingStatusTag", () => {
     expect(screen.getByText("—")).toBeInTheDocument();
   });
 
-  it('renders "Complete" for an applicable, mapped process (Fuel Card Issuance)', () => {
+  it('renders "Mapped" for an applicable, mapped process (Fuel Card Issuance) — not "Complete" (I4: has_mapping means a link exists, not that the mapping is thorough)', () => {
     render(
       <MappingStatusTag row={{ ...baseRow, dpia_required: true, has_mapping: true }} />,
     );
-    expect(screen.getByText("Complete")).toBeInTheDocument();
+    expect(screen.getByText("Mapped")).toBeInTheDocument();
+    expect(screen.queryByText("Complete")).not.toBeInTheDocument();
   });
 
-  it('renders "Not started" for an applicable, unmapped process', () => {
+  it('renders "Not mapped" for an applicable, unmapped process', () => {
     render(
       <MappingStatusTag row={{ ...baseRow, dpia_required: true, has_mapping: false }} />,
     );
-    expect(screen.getByText("Not started")).toBeInTheDocument();
+    expect(screen.getByText("Not mapped")).toBeInTheDocument();
   });
 });

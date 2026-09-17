@@ -73,6 +73,11 @@ export const RecordDecisionModal = ({
   const [form] = Form.useForm<DecisionFormValues>();
   const [step, setStep] = useState<RecordDecisionStep>(initialStep);
   const [isMappingSaving, setIsMappingSaving] = useState(false);
+  // I2: the mapping step keeps its own Form instance (MappingStepForm owns
+  // it), so this modal cannot read its dirty state the way it reads the
+  // decision step's own `form.isFieldsTouched()` below. MappingStepForm
+  // reports it here instead — see its own onDirtyChange prop.
+  const [isMappingDirty, setIsMappingDirty] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const {
@@ -97,6 +102,7 @@ export const RecordDecisionModal = ({
     form.resetFields();
     setStep(initialStep);
     setSubmitError(null);
+    setIsMappingDirty(false);
   };
 
   const handleClose = () => {
@@ -144,7 +150,15 @@ export const RecordDecisionModal = ({
       }
       open={open}
       onClose={handleClose}
-      getIsDirty={() => step === "decision" && form.isFieldsTouched()}
+      // I2: was `step === "decision" && form.isFieldsTouched()` — the
+      // mapping step's own dirty guard was always off, so Escape or an
+      // overlay click silently discarded a six-field form with no warning,
+      // exactly the form DESIGN.md itself calls out as the one that gets
+      // abandoned if it demands too much before saving anything. Both
+      // steps are now guarded, each from its own signal.
+      getIsDirty={() =>
+        step === "decision" ? form.isFieldsTouched() : isMappingDirty
+      }
       footer={null}
       width={MODAL_SIZE.md}
       closable={!isSaving}
@@ -251,12 +265,20 @@ export const RecordDecisionModal = ({
                       <Item
                         name="justification"
                         label="Reason"
+                        // I6: `required` is set explicitly because the only
+                        // rule here is a custom validator, not `{ required:
+                        // true }` — AntD only auto-renders the asterisk for
+                        // the latter, so without this the field silently had
+                        // no required marker at all; nothing but the
+                        // consequence alert above explained why the submit
+                        // button stayed disabled.
+                        required
                         rules={[
                           {
                             validator: async (_rule, value: string) => {
                               if (isBlank(value)) {
                                 throw new Error(
-                                  "Give a reason. This is the record that explains why this activity has no assessment.",
+                                  "Give a reason. This is the record that explains why this business process has no assessment.",
                                 );
                               }
                             },
@@ -336,6 +358,7 @@ export const RecordDecisionModal = ({
             onSaved={handleClose}
             onCancel={handleClose}
             onSavingChange={setIsMappingSaving}
+            onDirtyChange={setIsMappingDirty}
           />
         )}
       </Space>

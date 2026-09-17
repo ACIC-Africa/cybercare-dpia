@@ -45,8 +45,10 @@ const TRIGGERS = [
   {
     id: "trg-5",
     trigger_key: "automated_decision",
-    label: "Automated decision-making with legal or similarly significant effect",
-    description: "Decisions made about a person with no meaningful human review.",
+    label:
+      "Automated decision-making with legal or similarly significant effect",
+    description:
+      "Decisions made about a person with no meaningful human review.",
     display_order: 5,
   },
   {
@@ -61,7 +63,13 @@ const TRIGGERS = [
   },
 ];
 
-const mockRecordDecision = jest.fn(() => ({ unwrap: () => Promise.resolve({}) }));
+type RecordDecisionArgs = {
+  businessProcessId: string;
+  body: Record<string, unknown>;
+};
+const mockRecordDecision = jest.fn(() => ({
+  unwrap: () => Promise.resolve({}),
+}));
 const mockGetScreeningTriggersQuery = jest.fn();
 
 jest.mock("./screening.slice", () => ({
@@ -75,10 +83,23 @@ jest.mock("./screening.slice", () => ({
 // The mapping step is its own component with its own tests
 // (MappingStepForm.test.tsx) — stubbed here so this file can test the
 // decision step in isolation, the same way AssessmentDetail.test.tsx stubs
-// out QuestionCard/EvidenceDrawer/etc.
+// out QuestionCard/EvidenceDrawer/etc. The stub exposes a button that calls
+// onDirtyChange, so the I2 dirty-guard tests below can simulate "she has
+// typed into the mapping step" without needing the real form's fields.
 jest.mock("./MappingStepForm", () => ({
-  MappingStepForm: ({ processName }: { processName: string }) => (
-    <div data-testid="mapping-step-stub">Mapping step for {processName}</div>
+  MappingStepForm: ({
+    processName,
+    onDirtyChange,
+  }: {
+    processName: string;
+    onDirtyChange?: (isDirty: boolean) => void;
+  }) => (
+    <div data-testid="mapping-step-stub">
+      Mapping step for {processName}
+      <button type="button" onClick={() => onDirtyChange?.(true)}>
+        simulate a mapping edit
+      </button>
+    </div>
   ),
 }));
 
@@ -101,17 +122,27 @@ jest.mock(
 
 // ConfirmCloseModal's own close-guard needs fidesui's Modal.confirm API,
 // which in turn needs a FidesUIProvider ancestor this test does not stand
-// up — the guard behaviour itself (confirm-before-discard) is
-// ConfirmCloseModal's own concern, not this component's, so it is stubbed
-// to a plain passthrough here the same way AssessmentDetail.test.tsx stubs
-// useMessage/useNotification for the same reason, one level up the stack.
-jest.mock(
-  "~/features/common/hooks/useConfirmDirtyClose",
-  () => ({
-    __esModule: true,
-    default: (onClose: () => void) => onClose,
-  }),
-);
+// up, so the Modal.confirm DIALOG itself is not exercised here — but the
+// hook's actual DECISION RULE (call onClose only when getIsDirty() is
+// false; otherwise block the close) is real, not stubbed away. The
+// previous version of this stub (`(onClose) => onClose`, ignoring
+// getIsDirty entirely) is exactly why I2's bug — the mapping step's own
+// getIsDirty hardcoded to `false` — could ship without a single test here
+// failing: a passthrough closes unconditionally regardless of what
+// getIsDirty says, so no regression to that logic could ever be caught by
+// this file. This fake still isn't the real UI, but it is the real
+// contract, which is what "guard both steps" actually needs proven.
+jest.mock("~/features/common/hooks/useConfirmDirtyClose", () => ({
+  __esModule: true,
+  default: (onClose: () => void, getIsDirty: () => boolean) => () => {
+    if (!getIsDirty()) {
+      onClose();
+    }
+    // else: the real hook would show a confirmation dialog instead of
+    // closing — proving the close was BLOCKED (onClose not called) is
+    // exactly the behaviour a regression here needs to break.
+  },
+}));
 
 const renderModal = () =>
   render(
@@ -192,14 +223,18 @@ describe("RecordDecisionModal — the reason field and the live consequence", ()
 describe("RecordDecisionModal — validation", () => {
   it("keeps Record decision disabled when not applicable and the reason is blank", () => {
     renderModal();
-    expect(screen.getByRole("button", { name: /record decision/i })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /record decision/i }),
+    ).toBeDisabled();
   });
 
   it("keeps Record decision disabled when the reason is whitespace only", async () => {
     const user = userEvent.setup();
     renderModal();
     await user.type(screen.getByTestId("input-justification"), "   ");
-    expect(screen.getByRole("button", { name: /record decision/i })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /record decision/i }),
+    ).toBeDisabled();
   });
 
   it("enables Record decision once a real reason is typed", async () => {
@@ -209,14 +244,113 @@ describe("RecordDecisionModal — validation", () => {
       screen.getByTestId("input-justification"),
       "No personal data is processed for this activity.",
     );
-    expect(screen.getByRole("button", { name: /record decision/i })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /record decision/i }),
+    ).toBeEnabled();
   });
 
   it("does not require a reason once a question is ticked", async () => {
     const user = userEvent.setup();
     renderModal();
     await user.click(screen.getByTestId("trigger-special_category"));
-    expect(screen.getByRole("button", { name: /record decision/i })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: /record decision/i }),
+    ).toBeEnabled();
+  });
+});
+
+describe("RecordDecisionModal — the request body (I5)", () => {
+  it("never sends dpia_required, and sends justification: null when applicable", async () => {
+    const user = userEvent.setup();
+    renderModal();
+
+    await user.click(screen.getByTestId("trigger-large_scale"));
+    await user.click(screen.getByRole("button", { name: /record decision/i }));
+
+    expect(mockRecordDecision).toHaveBeenCalledTimes(1);
+    const [{ body }] = mockRecordDecision.mock.calls[0] as unknown as [
+      RecordDecisionArgs,
+    ];
+    // toEqual, not a subset match — a sibling field slipping in (like a
+    // client-supplied dpia_required) must fail this, not pass silently.
+    expect(body).toEqual({
+      triggered_keys: ["large_scale"],
+      justification: null,
+    });
+  });
+
+  it("sends the typed reason, and an empty triggered_keys list, when not applicable", async () => {
+    const user = userEvent.setup();
+    renderModal();
+
+    await user.type(
+      screen.getByTestId("input-justification"),
+      "No personal data is processed for this activity.",
+    );
+    await user.click(screen.getByRole("button", { name: /record decision/i }));
+
+    expect(mockRecordDecision).toHaveBeenCalledTimes(1);
+    const [{ body }] = mockRecordDecision.mock.calls[0] as unknown as [
+      RecordDecisionArgs,
+    ];
+    expect(body).toEqual({
+      triggered_keys: [],
+      justification: "No personal data is processed for this activity.",
+    });
+  });
+});
+
+describe("RecordDecisionModal — the mapping step's own dirty guard (I2)", () => {
+  const advanceToMappingStep = async (
+    user: ReturnType<typeof userEvent.setup>,
+  ) => {
+    await user.click(screen.getByTestId("trigger-large_scale"));
+    await user.click(screen.getByRole("button", { name: /record decision/i }));
+    expect(await screen.findByTestId("mapping-step-stub")).toBeInTheDocument();
+  };
+
+  it("blocks a close attempt once the mapping step reports unsaved edits", async () => {
+    const user = userEvent.setup();
+    const onClose = jest.fn();
+    render(
+      <RecordDecisionModal
+        open
+        onClose={onClose}
+        businessProcessId="bp_94d5439ced86"
+        processName="Fuel Card Issuance"
+        hasMapping={false}
+      />,
+    );
+    await advanceToMappingStep(user);
+
+    await user.click(
+      screen.getByRole("button", { name: /simulate a mapping edit/i }),
+    );
+    await user.keyboard("{Escape}");
+
+    // Before this fix, getIsDirty was hardcoded `step === "decision" &&
+    // ...` — false on the mapping step no matter what — so this same
+    // sequence closed unconditionally. onClose must NOT fire here.
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes immediately from the mapping step when nothing has been touched", async () => {
+    const user = userEvent.setup();
+    const onClose = jest.fn();
+    render(
+      <RecordDecisionModal
+        open
+        onClose={onClose}
+        businessProcessId="bp_94d5439ced86"
+        processName="Fuel Card Issuance"
+        hasMapping={false}
+      />,
+    );
+    await advanceToMappingStep(user);
+
+    await user.keyboard("{Escape}");
+
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -224,7 +358,9 @@ describe("RecordDecisionModal — the permanence caution", () => {
   it("shows the caution before the submit button, never after it", () => {
     renderModal();
     const caution = screen.getByTestId("permanence-caution");
-    const submitButton = screen.getByRole("button", { name: /record decision/i });
+    const submitButton = screen.getByRole("button", {
+      name: /record decision/i,
+    });
 
     expect(caution).toBeInTheDocument();
     expect(caution).toHaveTextContent(/permanent record/i);

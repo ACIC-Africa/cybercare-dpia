@@ -31,9 +31,16 @@ export const SCREENING_STATUS_TAG_COLORS: Record<
   not_applicable: "default",
 };
 
+// I4 (fix wave): "Complete" is not what has_mapping means. The list SQL sets
+// it true for ANY linked activity — a mapping saved with only a name and one
+// category (which this screen explicitly invites, see MappingStepForm's own
+// "only a name and at least one data category are required" text), and a
+// foreign-owned activity this screen cannot even open. "Mapped" / "Not
+// mapped" says exactly, and only, what the API reports: whether a live
+// mapping is linked, not whether it is thorough.
 export const MAPPING_STATUS_LABELS = {
-  complete: "Complete",
-  not_started: "Not started",
+  complete: "Mapped",
+  not_started: "Not mapped",
 } as const;
 
 export const MAPPING_STATUS_TAG_COLORS: Record<
