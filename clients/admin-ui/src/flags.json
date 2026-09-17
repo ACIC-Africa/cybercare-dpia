@@ -54,7 +54,7 @@
     "description": "Enable privacy assessments feature",
     "development": true,
     "test": false,
-    "production": false
+    "production": true
   },
   "policies": {
     "label": "DSR Policies",
@@ -75,7 +75,7 @@
     "description": "Enable the new Ant Design-only home dashboard",
     "development": true,
     "test": false,
-    "production": false
+    "production": true
   },
   "jiraIntegration": {
     "label": "Jira integration",
@@ -138,7 +138,7 @@
     "description": "Show the assessment status card on the dashboard",
     "development": true,
     "test": false,
-    "production": false
+    "production": true
   },
   "dsrTraversalVisualizer": {
     "label": "DSR traversal visualizer",
