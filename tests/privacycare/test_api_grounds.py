@@ -60,8 +60,13 @@ def test_only_mapped_grounds_are_offered(db):
 
     body = list_processing_grounds(db=db, client=_fake_client("carol@example.com"))
 
-    assert len(body.grounds) == 11
-    assert body.unmapped_count == 12
+    # Carol (WhatsApp, two rounds on 2026-09-18) retired "N/A" and ruled on
+    # 9 of the original 12 unmapped grounds, taking mapped from 11 to 20 (of
+    # 22 total, since "N/A" no longer counts). The 2 still unmapped are
+    # deliberate: "Legitimate Activities by a Foundation..." ("not sure")
+    # and "Research" ("depends on the nature of the research").
+    assert len(body.grounds) == 20
+    assert body.unmapped_count == 2
     assert all(g.fides_legal_basis for g in body.grounds)
 
 
@@ -152,21 +157,28 @@ def test_recording_a_ground_upserts_rather_than_duplicates(db):
 
 
 def test_a_null_class_ground_cannot_be_recorded(db):
+    # "Public Interest" used to be this test's example of a null-class
+    # ground (it carried only a `suggested` hint), but Carol has since ruled
+    # it Public interest (WhatsApp round 2, 2026-09-18) — it is no longer
+    # null and would no longer prove this. "Research" is: Carol left it
+    # deliberately unmapped ("It could be either of the three depending on
+    # the nature of the research"), so its fides_legal_basis is still NULL.
     load_kenyan_taxonomy(db)
     system = _seed_system(db, f"sys_{uuid4().hex[:8]}")
-    decl = _seed_declaration(db, system, "marketing", legal_basis_for_processing="Public interest")
-    pub = _ground_id(db, "Public Interest")
+    decl = _seed_declaration(db, system, "marketing", legal_basis_for_processing="Legitimate interests")
+    research = _ground_id(db, "Research")
 
     with pytest.raises(HTTPException) as exc_info:
         set_declaration_ground(
             decl,
-            SetGroundRequest(processing_ground_id=pub),
+            SetGroundRequest(processing_ground_id=research),
             db=db,
             client=_fake_client("carol@example.com"),
         )
 
     assert exc_info.value.status_code == 409, (
-        "suggested class is not a class; Carol has not ruled"
+        "Research has no fides_legal_basis yet — Carol declined to rule "
+        "(case-dependent), not a data-entry gap"
     )
 
 

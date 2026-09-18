@@ -1,11 +1,15 @@
 """D-KT-5: which Kenyan ground produced a declaration's Article 6 value.
 
 privacycare_processing_ground (loaded by taxonomy/loader.py's
-load_kenyan_taxonomy) holds 23 grounds sourced from the customer's own
-lawful-basis register, of which 12 have no `fides_legal_basis` yet — D-KT-4
-says the form must never offer one of those 12 until Carol rules on it. This
-module is the door onto that table plus privacycare_declaration_ground, the
-join that records which ground a specific declaration relies on.
+load_kenyan_taxonomy) holds 22 grounds sourced from the customer's own
+lawful-basis register (23 minus "N/A", retired on Carol's ruling — WhatsApp
+2026-09-18: "yes, since it's empty."), of which 2 have no `fides_legal_basis`
+yet — D-KT-4 says the form must never offer one of those 2 until Carol rules
+on it. (Carol has ruled on 9 of the original 12 unmapped grounds, over two
+WhatsApp exchanges on 2026-09-18 — see kenyan.py's GROUNDS list for the
+per-ground record; the 2 still unmapped are deliberate, not an oversight.)
+This module is the door onto that table plus privacycare_declaration_ground,
+the join that records which ground a specific declaration relies on.
 
 D-KT-4's other half is the guarantee this module enforces on write: the form
 writes the enum straight to Fides' own privacydeclaration.legal_basis_for_processing,
@@ -70,7 +74,7 @@ class ProcessingGroundResponse(BaseModel):
 class ProcessingGroundListResponse(BaseModel):
     # Same TS counterpart file as ProcessingGroundResponse above.
     grounds: List[ProcessingGroundResponse]
-    # D-KT-4: how many of the 23 loaded grounds still have no class — a
+    # D-KT-4: how many of the 22 loaded grounds still have no class — a
     # count the consultant screen needs so "why isn't ground X offered" has
     # an answer without a second query.
     unmapped_count: int
@@ -90,8 +94,19 @@ class DeclarationGroundResponse(BaseModel):
 
 
 _SELECT_MAPPED_GROUNDS_SQL = sqlalchemy.text(
+    # COLLATE "C": plain byte/codepoint order, not the database's locale
+    # collation. Postgres' default (locale-aware) collation treats
+    # punctuation as lower-weight than letters, so e.g. "Obligation of
+    # Law- Legal basis" sorts BEFORE "Obligation of Law (SPI)" under it
+    # (comparing "...Legal basis" against "...SPI)" once the hyphen and
+    # parenthesis are set aside) — surprising to a consultant scanning an
+    # alphabetised list, and inconsistent across deployments with a
+    # different default locale. This was never visible while only one of
+    # those two grounds had a class (Carol ruled the "- Legal basis" one
+    # in a later round); now that both are mapped, ordering must be
+    # deterministic and match simple alphabetical order.
     "SELECT id, ground, fides_legal_basis FROM privacycare_processing_ground "
-    "WHERE fides_legal_basis IS NOT NULL ORDER BY ground"
+    "WHERE fides_legal_basis IS NOT NULL ORDER BY ground COLLATE \"C\""
 )
 
 _COUNT_UNMAPPED_GROUNDS_SQL = sqlalchemy.text(
@@ -215,7 +230,7 @@ def list_processing_grounds(
     client: ClientDetail = Security(verify_oauth_client, scopes=[SYSTEM_READ]),
 ) -> ProcessingGroundListResponse:
     """Only grounds Carol has already ruled a class for (D-KT-4) — the form
-    must never offer one of the still-NULL 12 as a choice."""
+    must never offer one of the still-NULL 2 as a choice."""
     return _list_mapped_grounds(db)
 
 

@@ -106,9 +106,17 @@ def test_deferred_terms_are_recorded_with_an_owner_not_loaded(db):
     )).scalar() == 0
 
 
-def test_grounds_load_23_with_11_mapped(db):
+def test_grounds_load_22_with_20_mapped(db):
+    # Carol (WhatsApp, two rounds on 2026-09-18) retired "N/A" (23 -> 22
+    # grounds — "yes, since it's empty") and ruled on 9 of the 11 grounds
+    # that were previously unmapped, taking mapped from 11 to 20. The 2
+    # that remain unmapped are deliberate, not an oversight:
+    # "Legitimate Activities by a Foundation, Association or any other Not
+    # for Profit Body (SPI)" ("not sure") and "Research" ("It could be
+    # either of the three depending on the nature of the research" — a
+    # basis that depends on the case cannot be reduced to one class).
     summary = load_kenyan_taxonomy(db)
-    assert (summary.grounds_loaded, summary.grounds_unmapped) == (23, 12)
+    assert (summary.grounds_loaded, summary.grounds_unmapped) == (22, 2)
     kyc = db.execute(sqlalchemy.text(
         "SELECT fides_legal_basis FROM privacycare_processing_ground WHERE ground = 'KYC Requirements'"
     )).scalar()
@@ -127,10 +135,15 @@ def test_loading_twice_changes_nothing(db):
         "(SELECT count(*) FROM privacycare_taxonomy_mapping), (SELECT count(*) FROM privacycare_processing_ground)"
     )).one()
     # 33 subjects created; 29 categories created (18 special + 11 non-special);
-    # derive, don't copy: the number must come from the data module.
+    # derive, don't copy: the number must come from the data module. Grounds
+    # is 22, not the original 23 — "N/A" was retired (Carol, WhatsApp
+    # 2026-09-18: "yes, since it's empty.") and explicitly deleted from the
+    # database; kenyan.py no longer upserts it, so a reload does not bring
+    # it back.
     created = sum(c.action == "create" for c in kenyan.CATEGORIES)
     assert created == 29
-    assert before == after == (15 + 33, 85 + created, 111, 23)
+    assert len(kenyan.GROUNDS) == 22
+    assert before == after == (15 + 33, 85 + created, 111, 22)
 
 
 _BASELINE_SNAPSHOT_SQL = sqlalchemy.text(

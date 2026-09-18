@@ -127,21 +127,26 @@ processes_special_category_data from the chosen data_categories against
 the SAME ancestor-prefix tag walk the read path uses. Nothing in this
 script computes any of those five things itself.
 
-THE ELEVEN USABLE GROUNDS, NOT THE OTHER TWELVE (D-SEED-3, OQ-W2-4). Of the
-23 rows in privacycare_processing_ground, 11 carry a non-null
-fides_legal_basis and 12 do not — Carol has not yet ruled on the other 12,
-and save_mapping() itself refuses to derive a legal basis from one that
-has none (raises ValueError, "no legal basis has been determined yet for
-ground ..."). Every `ground` value in MAPPINGS below is one of the 11
-usable ones, verified against the live table before this docstring was
-written (Adherence to Pension / Collective Agreement Laws, Background
-Checks and Pre-employment Screening, Compliance with Measures / Laws to
-Redress Unfair Discrimination, Consent by a Child's Parent or Guardian,
-Consent by the Data Subject, Customer Relationship Administration,
-Enrolment of an Applicant, KYC Requirements, Labour Legislation
-Compliance, Marketing, Obligation of Law (SPI)). This seed does not work
-around the gap; it demonstrates the product's honest behaviour at the
-boundary of it, exactly as D-SEED-3 asks.
+THE ELEVEN USABLE GROUNDS THIS SEED ACTUALLY USES (D-SEED-3, OQ-W2-4).
+At the time this docstring was written, of the 23 rows in
+privacycare_processing_ground, 11 carried a non-null fides_legal_basis and
+12 did not — Carol had not yet ruled on the other 12, and save_mapping()
+itself refuses to derive a legal basis from one that has none (raises
+ValueError, "no legal basis has been determined yet for ground ...").
+Every `ground` value in MAPPINGS below is one of those original 11
+(Adherence to Pension / Collective Agreement Laws, Background Checks and
+Pre-employment Screening, Compliance with Measures / Laws to Redress
+Unfair Discrimination, Consent by a Child's Parent or Guardian, Consent by
+the Data Subject, Customer Relationship Administration, Enrolment of an
+Applicant, KYC Requirements, Labour Legislation Compliance, Marketing,
+Obligation of Law (SPI)). Carol has since ruled on 9 of the other 12
+(WhatsApp, two rounds on 2026-09-18) and "N/A" was retired, so the table
+now holds 22 grounds with 20 usable — but this seed's own MAPPINGS was
+authored against the original 11 and was never revisited to add the newly
+usable ones; the 11 it uses remain a subset of the 20 usable today, so
+nothing here is broken by that ruling, it is simply not exhaustive of it.
+This seed does not work around the gap; it demonstrates the product's
+honest behaviour at the boundary of it, exactly as D-SEED-3 asks.
 
 WHY THESE 38 PROCESSES, NOT A RANDOM 38. Business processes were selected
 by hand, one at a time, for a PLAUSIBLE personal-data story: Payroll
@@ -988,10 +993,12 @@ SCREENING_DECISIONS: tuple[dict, ...] = (
 #
 # Every `data_subjects` value is a live ctl_data_subjects.fides_key, every
 # `data_categories` value a live ctl_data_categories.fides_key, every
-# `ground` value one of the eleven USABLE privacycare_processing_ground
-# rows (see this module's own docstring), and every `purpose` value a live
-# ctl_data_uses.fides_key — test_seed_demo.py checks all four containments
-# against the live tables directly, not against a second hand-typed list.
+# `ground` value one of the original eleven usable privacycare_processing_ground
+# rows this seed was authored against (see this module's own docstring —
+# more are usable today, but this table was never revisited to add them),
+# and every `purpose` value a live ctl_data_uses.fides_key —
+# test_seed_demo.py checks all four containments against the live tables
+# directly, not against a second hand-typed list.
 MAPPINGS: tuple[dict, ...] = (
     {
         "process": "Payroll Administration",

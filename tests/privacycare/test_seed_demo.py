@@ -284,7 +284,7 @@ def test_not_applicable_justifications_self_disclose_as_demo_content():
 
 def test_mappings_use_only_live_vocabularies(db):
     """D-SEED-3: subjects/categories/purpose come from the loaded taxonomy,
-    ground from the 11 USABLE processing grounds only. Checked against the
+    ground from the USABLE processing grounds only. Checked against the
     live tables, not a second hand-typed list."""
     cli = _load_cli()
 
@@ -315,7 +315,15 @@ def test_mappings_use_only_live_vocabularies(db):
             )
         ).all()
     }
-    assert len(usable_grounds) == 11, "expected exactly 11 usable grounds (OQ-W2-4)"
+    # OQ-W2-4 was 11 usable grounds; Carol has since ruled on 9 more of the
+    # originally-unmapped 12 (WhatsApp, two rounds on 2026-09-18) and "N/A"
+    # was retired, taking usable from 11 to 20 (of 22 total grounds — the 2
+    # still unmapped, "Legitimate Activities by a Foundation..." and
+    # "Research", are deliberate, not an oversight). This seed's own
+    # MAPPINGS table was authored before that ruling and still only uses
+    # the original 11, which remain a subset of the 20 usable grounds today
+    # — that containment is what the loop below actually checks.
+    assert len(usable_grounds) == 20, "expected exactly 20 usable grounds post-ruling (was 11, OQ-W2-4)"
 
     for entry in cli.MAPPINGS:
         for subject in entry["data_subjects"]:

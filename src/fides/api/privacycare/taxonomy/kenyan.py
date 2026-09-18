@@ -195,8 +195,37 @@ CATEGORIES = [
 ]
 # Counts checked in _check() at the foot of this module.
 
-# All 23 grounds. `fides_legal_basis` comes ONLY from `source_class`;
-# `suggested` only where the name is unambiguous.
+# All 22 grounds (23 in the customer's register minus "N/A", retired —
+# Carol, WhatsApp 2026-09-18: "yes, since it's empty." Verified against the
+# live database that nothing in privacycare_declaration_ground referenced
+# it before removal).
+#
+# `fides_legal_basis` comes from `source_class` where the customer's own
+# classification maps unambiguously (Legal -> Legal obligations,
+# Consent -> Consent, Legitimate Interest -> Legitimate interests).
+# Everywhere else it is Carol's direct ruling, over two WhatsApp exchanges
+# on 2026-09-18 ("round 1" and "round 2" below), recorded ground-by-ground
+# in the comments beside each row. `suggested` is a pre-ruling hint only —
+# kept for provenance even on rows a ruling has now confirmed.
+#
+# Four of these rulings (Performance of an Insurance Agreement, Risk
+# Assessment, Support Business Operation, Proper Medical Treatment / Care)
+# were applied directly to the database earlier the same day; the lines
+# below are those rulings landing in source, which is what the loader
+# actually reads on every run — without this, the next loader run would
+# have undone them.
+#
+# SPI. Three grounds below carry a "(SPI)" suffix from the customer's own
+# register, undefined anywhere in the source material. Asked directly,
+# Carol answered with her own hedge intact: "SPI - Special Personal
+# Information?" — recorded here as her answer, not silently promoted to a
+# certainty.
+#
+# Two grounds are deliberately left unmapped, not overlooked:
+# "Legitimate Activities by a Foundation..." (Carol: "not sure") and
+# "Research" (Carol: "It could be either of the three depending on the
+# nature of the research" — a situation whose basis depends on the case
+# cannot derive one basis).
 GROUNDS = [
     Ground("Adherence to Pension / Collective Agreement Laws", "Legal", "Legal obligations", None),
     Ground("Background Checks and Pre-employment Screening", "Legal", "Legal obligations", None),
@@ -205,22 +234,43 @@ GROUNDS = [
     Ground("Consent by the Data Subject", "Consent", "Consent", None),
     Ground("Customer Relationship Administration", "Legitimate Interest", "Legitimate interests", None),
     Ground("Enrolment of an Applicant", "Legitimate Interest", "Legitimate interests", None),
-    Ground("Establishment, exercise or defense of a legal claim (SPI)", "Legal basis", None, None),
+    # Carol, WhatsApp round 2 (2026-09-18), clarifying an earlier ambiguous
+    # answer on this ground: "Yes, sorry, meant legal obligation."
+    Ground("Establishment, exercise or defense of a legal claim (SPI)", "Legal basis", "Legal obligations", None),
     Ground("KYC Requirements", "Legitimate Interest", "Legitimate interests", None),
     Ground("Labour Legislation Compliance", "Legal", "Legal obligations", None),
+    # Carol, WhatsApp round 1 (2026-09-18): "not sure." Left unmapped —
+    # deliberately, not an oversight; do not silently resolve this one.
     Ground("Legitimate Activities by a Foundation, Association or any other Not for Profit Body (SPI)", None, None, None),
-    Ground("Legitimate Interest", None, None, "Legitimate interests"),
-    Ground("Support Business Operation", None, None, None),
+    # Carol, WhatsApp round 2 (2026-09-18): ruled Legitimate interests.
+    Ground("Legitimate Interest", None, "Legitimate interests", "Legitimate interests"),
+    # Carol, WhatsApp round 1 (2026-09-18): ruled Legitimate interests.
+    # Applied directly to the database same day; this line lands that
+    # ruling in source.
+    Ground("Support Business Operation", None, "Legitimate interests", None),
     Ground("Marketing", "Consent", "Consent", None),
-    Ground("N/A", None, None, None),
     Ground("Obligation of Law (SPI)", "Legal", "Legal obligations", None),
-    Ground("Obligation of Law- Legal basis", None, None, "Legal obligations"),
-    Ground("Performance of a Contract(Provision of products and services)", None, None, "Contract"),
-    Ground("Performance of an Insurance Agreement", None, None, "Contract"),
-    Ground("Proper Medical Treatment / Care", None, None, None),
-    Ground("Public Interest", None, None, "Public interest"),
+    # Carol, WhatsApp round 2 (2026-09-18): ruled Legal obligations.
+    Ground("Obligation of Law- Legal basis", None, "Legal obligations", "Legal obligations"),
+    # Carol, WhatsApp round 2 (2026-09-18): ruled Contract.
+    Ground("Performance of a Contract(Provision of products and services)", None, "Contract", "Contract"),
+    # Carol, WhatsApp round 1 (2026-09-18): ruled Contract. Applied directly
+    # to the database same day; this line lands that ruling in source.
+    Ground("Performance of an Insurance Agreement", None, "Contract", "Contract"),
+    # Carol, WhatsApp round 1 (2026-09-18): ruled Vital interests. Applied
+    # directly to the database same day; this line lands that ruling in
+    # source.
+    Ground("Proper Medical Treatment / Care", None, "Vital interests", None),
+    # Carol, WhatsApp round 2 (2026-09-18): ruled Public interest.
+    Ground("Public Interest", None, "Public interest", "Public interest"),
+    # Carol, WhatsApp round 1 (2026-09-18): "It could be either of the three
+    # depending on the nature of the research." Left unmapped — a situation
+    # whose basis depends on the case cannot derive one basis.
     Ground("Research", None, None, None),
-    Ground("Risk Assessment", None, None, None),
+    # Carol, WhatsApp round 1 (2026-09-18): ruled Legitimate interests.
+    # Applied directly to the database same day; this line lands that
+    # ruling in source.
+    Ground("Risk Assessment", None, "Legitimate interests", None),
 ]
 
 
@@ -272,11 +322,21 @@ def _check() -> None:
         sum(c.action == "not_personal_data" for c in CATEGORIES) == 7,
         "expected 7 not-personal-data categories",
     )
-    # Grounds: all 23 from the customer's register, 11 of them classed.
-    _require(len(GROUNDS) == 23, f"expected 23 grounds, got {len(GROUNDS)}")
+    # Grounds: 22 of the customer's original 23 — "N/A" retired on Carol's
+    # ruling (WhatsApp 2026-09-18: "yes, since it's empty."). 20 of the 22
+    # are classed: the original 11 plus 9 more from Carol's two WhatsApp
+    # rounds on 2026-09-18 (Establishment.../legal claim, Legitimate
+    # Interest, Support Business Operation, Obligation of Law- Legal basis,
+    # Performance of a Contract, Performance of an Insurance Agreement,
+    # Proper Medical Treatment / Care, Public Interest, Risk Assessment).
+    # The remaining 2 (Legitimate Activities by a Foundation..., Research)
+    # stay unmapped on Carol's own word ("not sure" / "depends on the
+    # nature of the research") — not an oversight, so do not "fix" this
+    # count back up to 22.
+    _require(len(GROUNDS) == 22, f"expected 22 grounds, got {len(GROUNDS)}")
     _require(
-        sum(g.fides_legal_basis is not None for g in GROUNDS) == 11,
-        "expected 11 grounds with a fides_legal_basis",
+        sum(g.fides_legal_basis is not None for g in GROUNDS) == 20,
+        "expected 20 grounds with a fides_legal_basis",
     )
 
 
