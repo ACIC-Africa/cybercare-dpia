@@ -5,13 +5,13 @@ import {
   Form,
   Input,
   Radio,
-  Select,
   Space,
   Text,
   useMessage,
 } from "fidesui";
 import { useState } from "react";
 
+import { SystemSelect } from "~/features/common/dropdown/SystemSelect";
 import { getErrorMessage } from "~/features/common/helpers";
 import ConfirmCloseModal from "~/features/common/modals/ConfirmCloseModal";
 import { MODAL_SIZE } from "~/features/common/modals/modal-sizes";
@@ -19,7 +19,6 @@ import { RTKErrorResult } from "~/types/errors/api";
 
 import { useReconcileDiscoveryFindingMutation } from "./discovery-findings.slice";
 import { FindingResponse } from "./discovery-findings.types";
-import { useSystemCandidatesFromFindings } from "./discoverySystemCandidates";
 import { isBlank } from "./screening.utils";
 
 const { Item } = Form;
@@ -29,7 +28,7 @@ type ReconcileChoice = "mapped" | "ignored";
 
 interface FormValues {
   choice: ReconcileChoice;
-  systemId: string | undefined;
+  systemFidesKey: string | undefined;
   reason: string;
 }
 
@@ -37,11 +36,6 @@ interface ReconcileFindingModalProps {
   open: boolean;
   onClose: () => void;
   finding: FindingResponse;
-  /** Every finding currently loaded on the table, so the "mark as mapped"
-   * picker can be built from the systems discovery already knows about —
-   * see discoverySystemCandidates.ts for why this is the only legitimate
-   * source. */
-  allFindings: FindingResponse[];
 }
 
 /**
@@ -58,13 +52,10 @@ export const ReconcileFindingModal = ({
   open,
   onClose,
   finding,
-  allFindings,
 }: ReconcileFindingModalProps) => {
   const message = useMessage();
   const [form] = Form.useForm<FormValues>();
   const [submitError, setSubmitError] = useState<string | null>(null);
-
-  const systemCandidates = useSystemCandidatesFromFindings(allFindings);
 
   const [reconcile, { isLoading: isSaving }] =
     useReconcileDiscoveryFindingMutation();
@@ -84,7 +75,7 @@ export const ReconcileFindingModal = ({
         urn: finding.urn,
         body:
           values.choice === "mapped"
-            ? { state: "mapped", system_id: values.systemId }
+            ? { state: "mapped", system_fides_key: values.systemFidesKey }
             : { state: "ignored", reason: values.reason },
       }).unwrap();
       message.success(
@@ -129,7 +120,7 @@ export const ReconcileFindingModal = ({
           form={form}
           layout="vertical"
           onFinish={handleSubmit}
-          initialValues={{ choice: "ignored", systemId: undefined, reason: "" }}
+          initialValues={{ choice: "ignored", systemFidesKey: undefined, reason: "" }}
           onValuesChange={() => setSubmitError(null)}
         >
           <Item name="choice" label="Decision">
@@ -156,18 +147,8 @@ export const ReconcileFindingModal = ({
               }
               return (
                 <>
-                  {systemCandidates.length === 0 && (
-                    <Alert
-                      type="warning"
-                      showIcon
-                      className="mb-4"
-                      message="No systems can be selected yet"
-                      description="PrivacyCare's discovery API can only offer a system here once at least one other finding has already been mapped to it — there is no route yet that looks up an arbitrary system's internal id by name. Ignore this finding with a reason, or ask engineering to map the first one directly."
-                      data-testid="no-system-candidates"
-                    />
-                  )}
                   <Item
-                    name="systemId"
+                    name="systemFidesKey"
                     label="System"
                     required
                     rules={[
@@ -182,15 +163,10 @@ export const ReconcileFindingModal = ({
                       },
                     ]}
                   >
-                    <Select
+                    <SystemSelect
                       aria-label="System"
                       data-testid="reconcile-system-select"
                       placeholder="Choose a system"
-                      disabled={systemCandidates.length === 0}
-                      options={systemCandidates.map((candidate) => ({
-                        value: candidate.systemId,
-                        label: candidate.systemName,
-                      }))}
                     />
                   </Item>
                   <Alert
@@ -276,9 +252,11 @@ export const ReconcileFindingModal = ({
           <Item noStyle shouldUpdate>
             {({ getFieldValue, getFieldsError }) => {
               const choice: ReconcileChoice = getFieldValue("choice");
-              const systemId: string | undefined = getFieldValue("systemId");
+              const systemFidesKey: string | undefined =
+                getFieldValue("systemFidesKey");
               const reason: string = getFieldValue("reason") ?? "";
-              const blocked = choice === "mapped" ? !systemId : isBlank(reason);
+              const blocked =
+                choice === "mapped" ? !systemFidesKey : isBlank(reason);
               const hasFieldErrors = getFieldsError().some(
                 (f) => f.errors.length > 0,
               );

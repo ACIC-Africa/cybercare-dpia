@@ -10,7 +10,6 @@ export * from "./discovery.slice";
 export * from "./discovery-findings.slice";
 export * from "./discovery-findings.types";
 export { DiscoveryScreen } from "./DiscoveryScreen";
-export * from "./discoverySystemCandidates";
 export * from "./EditableTextBlock";
 export * from "./EmptyState";
 export * from "./EvidenceDrawer";

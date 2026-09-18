@@ -60,8 +60,31 @@ class ReconcileFindingRequest(BaseModel):
     # system_id) — not re-checked here, same discipline risk_schemas.py's
     # RiskCreate and screening_schemas.py's ScreeningDecisionRequest apply
     # to their own core-validated fields.
+    #
+    # TWO WAYS TO NAME THE SYSTEM (2026-09-18 fix). `system_id` is
+    # ctl_systems.id, the internal primary key discovery.findings.
+    # _system_exists has always validated against — but NO read route in
+    # this codebase (not Ethyca's own System endpoints, not SystemSelect,
+    # not PrivacyCare's own ROPA/screening surfaces) ever puts that id on
+    # the wire; every other place a system is identified here uses
+    # `fides_key` (see discoverySystemCandidates.ts's retired "REAL GAP"
+    # docstring for the fuller history — the picker this field once
+    # starved is now built on system_fides_key). `system_fides_key` is
+    # resolved to the internal id server-side by
+    # api/discovery.py's _resolve_system_id, which rejects an unknown key
+    # by name (ValueError -> 400), the same way
+    # screening/mapping.py rejects an unknown data category. Give at most
+    # one; a request naming a system gives system_fides_key, never both.
+    #
+    # `system_id` stays accepted — not removed — purely for backward
+    # compatibility with existing internal callers
+    # (tests/privacycare/test_discovery_findings.py,
+    # test_api_discovery.py) that already construct a request with the
+    # real internal id directly; nothing on the wire has ever depended on
+    # it, so a new caller should always send system_fides_key.
     state: str
     system_id: Optional[str] = None
+    system_fides_key: Optional[str] = None
     reason: Optional[str] = Field(default=None)
 
 

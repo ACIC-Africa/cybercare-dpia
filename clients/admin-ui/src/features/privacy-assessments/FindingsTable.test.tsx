@@ -182,16 +182,6 @@ describe("FindingsTable — permissions", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("does not fetch the unfiltered candidate list for a Viewer at all", () => {
-    mockUserScopes = VIEWER_SCOPES;
-    render(<FindingsTable />);
-
-    expect(mockGetFindingsQuery).toHaveBeenCalledWith(
-      { state: "all" },
-      { skip: true },
-    );
-  });
-
   it("shows the Reconcile control to a Contributor (update scope)", () => {
     mockUserScopes = CONTRIBUTOR_SCOPES;
     render(<FindingsTable />);

@@ -100,6 +100,15 @@ _FINDING_EXISTS_SQL = sqlalchemy.text(
     "SELECT 1 FROM stagedresource WHERE urn = :urn AND resource_type = 'Table'"
 )
 
+# Resolves ReconcileFindingRequest.system_fides_key to ctl_systems.id — see
+# discovery_schemas.py's ReconcileFindingRequest docstring for why this
+# resolution exists: fides_key is the only system identifier any read route
+# in this codebase actually exposes, and reconcile_finding's own
+# _system_exists still (correctly) validates against the internal id.
+_SYSTEM_ID_BY_FIDES_KEY_SQL = sqlalchemy.text(
+    "SELECT id FROM ctl_systems WHERE fides_key = :fides_key"
+)
+
 
 def _finding_exists(db: Session, urn: str) -> bool:
     return db.execute(_FINDING_EXISTS_SQL, {"urn": urn}).first() is not None
@@ -111,6 +120,45 @@ def _require_finding(db: Session, urn: str) -> None:
             status_code=status_codes.HTTP_404_NOT_FOUND,
             detail=f"no such finding: {urn!r}",
         )
+
+
+def _resolve_system_id(db: Session, request: ReconcileFindingRequest) -> Optional[str]:
+    """Turns whatever the caller gave for "which system" into the
+    ctl_systems.id value reconcile_finding's own _system_exists check (and
+    the privacycare_discovery_reconciliation.system_id column) has always
+    required.
+
+    system_fides_key is preferred and is what the shipped Discovery
+    screen's picker now sends (built on the same SystemSelect/GET /system
+    surface as every other system picker in this codebase — see
+    discovery_schemas.py's ReconcileFindingRequest docstring for the full
+    "no route exposes the internal id" history). An unknown fides_key is
+    rejected BY NAME here, before reconcile_finding ever runs — a silent
+    drop would record a reconciliation nobody actually made, same
+    discipline screening/mapping.py's save_mapping already keeps for an
+    unknown data category.
+
+    system_id, when given instead, passes through unresolved — kept only
+    for the internal callers (test_discovery_findings.py,
+    test_api_discovery.py) that already construct a request with the real
+    internal id directly.
+
+    Giving both is refused outright rather than silently preferring one:
+    an ambiguous request is exactly the kind of silent behaviour this
+    module's own docstring already refuses for reconciliation itself.
+    """
+    if request.system_fides_key is not None and request.system_id is not None:
+        raise ValueError(
+            "give system_fides_key or system_id, not both"
+        )
+    if request.system_fides_key is None:
+        return request.system_id
+    row = db.execute(
+        _SYSTEM_ID_BY_FIDES_KEY_SQL, {"fides_key": request.system_fides_key}
+    ).first()
+    if row is None:
+        raise ValueError(f"unknown system: {request.system_fides_key!r}")
+    return row.id
 
 
 def _response_from_finding(row: FindingRow) -> FindingResponse:
@@ -228,29 +276,34 @@ def reconcile_discovery_finding(
     ),
 ) -> ReconciliationResponse:
     """Records one reconciliation decision for a discovered table: mark it
-    as belonging to a system (`state="mapped"`, `system_id` required), or
-    ignore it with a written reason (`state="ignored"`, `reason`
-    required). Re-reconciling APPENDS — findings.reconcile_finding's own
-    docstring — there is no update path to call; an earlier decision
+    as belonging to a system (`state="mapped"`, `system_fides_key`
+    required — see `_resolve_system_id`'s own docstring for why
+    `fides_key`, not the legacy `system_id`, is the field a new caller
+    should send), or ignore it with a written reason (`state="ignored"`,
+    `reason` required). Re-reconciling APPENDS — findings.reconcile_finding's
+    own docstring — there is no update path to call; an earlier decision
     survives being revisited, same discipline
     privacycare_screening_decision already keeps for a screening verdict.
 
     See this module's docstring for why "no such finding" (404) and every
-    other rejection out of reconcile_finding's single ValueError type
-    (unknown state; a mapped request missing system_id or naming an
-    unknown one; a mapped request carrying a reason; an ignored request
-    missing a reason, carrying only whitespace, or naming a system_id) —
-    all mapped to 400 here — are told apart the same way
-    record_screening_decision already tells apart "no such business
-    process" from every other rejection out of gate.record_decision.
+    other rejection — `_resolve_system_id`'s own ValueError (both
+    `system_id` and `system_fides_key` given; an unknown `system_fides_key`)
+    and reconcile_finding's own ValueError (unknown state; a mapped request
+    missing a system or naming an unknown `system_id`; a mapped request
+    carrying a reason; an ignored request missing a reason, carrying only
+    whitespace, or naming a system) — all mapped to 400 here, are told
+    apart the same way record_screening_decision already tells apart "no
+    such business process" from every other rejection out of
+    gate.record_decision.
     """
     decided_by = _created_by_from_client(client)
     try:
+        system_id = _resolve_system_id(db, request)
         result = reconcile_finding(
             db,
             urn=urn,
             state=request.state,
-            system_id=request.system_id,
+            system_id=system_id,
             reason=request.reason,
             decided_by=decided_by,
         )

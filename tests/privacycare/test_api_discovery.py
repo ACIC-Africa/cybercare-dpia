@@ -93,6 +93,20 @@ def system_id(db) -> str:
     return row.id
 
 
+@pytest.fixture
+def system_fides_key(db, system_id) -> str:
+    # Same row system_id names, by its OTHER identifier — see
+    # discovery_schemas.py's ReconcileFindingRequest docstring: id and
+    # fides_key differ for every real system, so this must be a real
+    # lookup, never system_id reused as a stand-in.
+    row = db.execute(
+        sqlalchemy.text("SELECT fides_key FROM ctl_systems WHERE id = :id"),
+        {"id": system_id},
+    ).first()
+    assert row is not None
+    return row.fides_key
+
+
 # --- List route --------------------------------------------------------
 
 
@@ -248,6 +262,62 @@ def test_a_failed_reconcile_writes_nothing(db, table_urn):
         {"urn": table_urn},
     ).scalar()
     assert remaining == 0
+
+
+def test_reconcile_mapped_with_a_fides_key_resolves_to_the_internal_id(
+    db, table_urn, system_id, system_fides_key
+):
+    # The 2026-09-18 fix: fides_key is the only identifier any read route
+    # (SystemSelect, GET /system) ever puts on the wire for a system, so
+    # this is what the shipped picker actually sends. It must resolve to
+    # the SAME internal id a caller naming system_id directly would have
+    # stored — same column, same downstream read (list/history), so a
+    # fides_key-based reconciliation and an id-based one are
+    # indistinguishable once recorded.
+    result = reconcile_discovery_finding(
+        table_urn,
+        ReconcileFindingRequest(state="mapped", system_fides_key=system_fides_key),
+        db=db,
+        client=_FakeClient(),
+    )
+
+    assert result.system_id == system_id
+    assert result.system_name is not None
+
+    entry = next(f for f in list_discovery_findings(db=db).findings if f.urn == table_urn)
+    assert entry.system_id == system_id
+
+
+def test_reconcile_mapped_with_an_unknown_fides_key_is_rejected_by_name(db, table_urn):
+    # A silent drop here would record a reconciliation nobody actually
+    # made — same discipline screening/mapping.py's save_mapping already
+    # keeps for an unknown data category.
+    with pytest.raises(HTTPException) as caught:
+        reconcile_discovery_finding(
+            table_urn,
+            ReconcileFindingRequest(state="mapped", system_fides_key="no-such-system"),
+            db=db,
+            client=_FakeClient(),
+        )
+    assert caught.value.status_code == 400
+    assert "no-such-system" in caught.value.detail
+
+
+def test_reconcile_rejects_both_system_id_and_system_fides_key(
+    db, table_urn, system_id, system_fides_key
+):
+    # Ambiguous input is refused outright, not silently resolved by
+    # preferring one — see _resolve_system_id's own docstring.
+    with pytest.raises(HTTPException) as caught:
+        reconcile_discovery_finding(
+            table_urn,
+            ReconcileFindingRequest(
+                state="mapped", system_id=system_id, system_fides_key=system_fides_key
+            ),
+            db=db,
+            client=_FakeClient(),
+        )
+    assert caught.value.status_code == 400
 
 
 def test_reconciling_twice_appends_a_second_history_row(db, table_urn, system_id):

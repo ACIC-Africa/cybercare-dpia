@@ -24,22 +24,6 @@ const NEEDS_REVIEW_FINDING: FindingResponse = {
   decided_at: null,
 };
 
-const ALREADY_MAPPED_FINDING: FindingResponse = {
-  urn: "privacycare_local_discovery.fides.public.ctl_systems",
-  table_name: "ctl_systems",
-  schema_name: "public",
-  monitor_key: "privacycare_local_discovery",
-  field_count: 17,
-  table_type: null,
-  diff_status: "addition",
-  state: "mapped",
-  system_id: "sys_4481f3505f6b",
-  system_name: "Fuel Card Issuance",
-  reason: null,
-  decided_by: "fid_b06b0e55-d950-43b1-bf5a-9fa4623d28a9",
-  decided_at: "2026-09-18T09:00:00Z",
-};
-
 const mockReconcile = jest.fn(() => ({
   unwrap: () => Promise.resolve({}),
 }));
@@ -49,6 +33,27 @@ jest.mock("./discovery-findings.slice", () => ({
     mockReconcile,
     { isLoading: false },
   ],
+}));
+
+// SystemSelect (2026-09-18 fix) is the "mark as mapped" picker now — a real
+// systems listing, keyed by fides_key, same as every other system picker in
+// this codebase. "Fuel Card Issuance" / "privacycare_process_bp_9e332dcbe707"
+// is a real system from the live database (same one the old candidate-
+// derivation fixture used, by its OTHER identifier — id sys_4481f3505f6b).
+const mockUseGetSystemsQuery = jest.fn(() => ({
+  data: {
+    items: [
+      {
+        fides_key: "privacycare_process_bp_9e332dcbe707",
+        name: "Fuel Card Issuance",
+      },
+    ],
+  },
+  isFetching: false,
+}));
+
+jest.mock("~/features/system/system.slice", () => ({
+  useGetSystemsQuery: (...args: unknown[]) => mockUseGetSystemsQuery(...args),
 }));
 
 // useMessage needs a FidesUIProvider ancestor this test does not stand up —
@@ -84,19 +89,9 @@ jest.mock("~/features/common/hooks/useConfirmDirtyClose", () => ({
   },
 }));
 
-const renderModal = (
-  finding: FindingResponse = NEEDS_REVIEW_FINDING,
-  allFindings: FindingResponse[] = [NEEDS_REVIEW_FINDING],
-) => {
+const renderModal = (finding: FindingResponse = NEEDS_REVIEW_FINDING) => {
   const onClose = jest.fn();
-  render(
-    <ReconcileFindingModal
-      open
-      onClose={onClose}
-      finding={finding}
-      allFindings={allFindings}
-    />,
-  );
+  render(<ReconcileFindingModal open onClose={onClose} finding={finding} />);
   return { onClose };
 };
 
@@ -145,30 +140,20 @@ describe("ReconcileFindingModal — ignoring requires a written reason", () => {
 });
 
 describe("ReconcileFindingModal — mapping to a system", () => {
-  it("shows the missing-candidates notice and keeps the system picker disabled when discovery has never mapped anything before", async () => {
+  it("keeps submit disabled until a system is chosen", async () => {
     const user = userEvent.setup();
-    renderModal(NEEDS_REVIEW_FINDING, [NEEDS_REVIEW_FINDING]);
+    renderModal();
 
     await user.click(screen.getByTestId("reconcile-choice-mapped"));
 
-    expect(screen.getByTestId("no-system-candidates")).toBeInTheDocument();
-    expect(screen.getByTestId("reconcile-system-select")).toHaveClass(
-      "ant-select-disabled",
-    );
     expect(screen.getByTestId("reconcile-submit")).toBeDisabled();
   });
 
-  it("offers a system already mapped elsewhere on this screen, and records the reconciliation against its real id", async () => {
+  it("offers the real systems list (2026-09-18 fix: no longer limited to systems some other finding already named) and records the reconciliation by fides_key", async () => {
     const user = userEvent.setup();
-    renderModal(NEEDS_REVIEW_FINDING, [
-      NEEDS_REVIEW_FINDING,
-      ALREADY_MAPPED_FINDING,
-    ]);
+    renderModal();
 
     await user.click(screen.getByTestId("reconcile-choice-mapped"));
-    expect(
-      screen.queryByTestId("no-system-candidates"),
-    ).not.toBeInTheDocument();
 
     await user.click(screen.getByTestId("reconcile-system-select"));
     await user.click(await screen.findByTitle("Fuel Card Issuance"));
@@ -179,10 +164,16 @@ describe("ReconcileFindingModal — mapping to a system", () => {
     await waitFor(() => {
       expect(mockReconcile).toHaveBeenCalledWith({
         urn: NEEDS_REVIEW_FINDING.urn,
-        body: { state: "mapped", system_id: "sys_4481f3505f6b" },
+        body: {
+          state: "mapped",
+          system_fides_key: "privacycare_process_bp_9e332dcbe707",
+        },
       });
     });
-  }, 15000); // ignore-path tests above. // submit) rather than a plain field, measurably slower than the // real virtualised dropdown (radio switch, open, pick an option, then // Bumped from the default 5000ms: this test drives the antd Select's
+  }, 15000); // Bumped from the default 5000ms: this test drives the antd Select's
+  // real virtualised dropdown (radio switch, open, pick an option, then
+  // submit) rather than a plain field, measurably slower than the
+  // ignore-path tests above.
 });
 
 describe("ReconcileFindingModal — a reconciliation is a permanent record", () => {

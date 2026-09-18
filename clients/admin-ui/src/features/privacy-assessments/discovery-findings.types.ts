@@ -49,14 +49,20 @@ export interface FindingListResponse {
 }
 
 /** POST /privacycare/discovery/{urn}/reconcile body. Validated inside
- * discovery.findings.reconcile_finding, not re-checked here — same
- * discipline ScreeningDecisionRequest documents for its own
- * server-validated fields. `system_id` here is ctl_systems.id, NOT a
- * fides_key — see discoverySystemCandidates.ts for why that distinction
- * matters to this screen. */
+ * discovery.findings.reconcile_finding and api/discovery.py's own
+ * _resolve_system_id, not re-checked here — same discipline
+ * ScreeningDecisionRequest documents for its own server-validated fields.
+ *
+ * `system_fides_key` is what this screen's picker sends (2026-09-18 fix):
+ * the identifier every other system picker in this codebase (SystemSelect,
+ * GET /system) actually exposes, resolved to the internal
+ * `ctl_systems.id` server-side. `system_id` is that internal id directly
+ * — kept on the wire for API back-compat, but nothing in the admin UI
+ * sends it; give at most one. */
 export interface ReconcileFindingRequest {
   state: "mapped" | "ignored";
   system_id?: string | null;
+  system_fides_key?: string | null;
   reason?: string | null;
 }
 

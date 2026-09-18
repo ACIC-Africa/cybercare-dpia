@@ -10,7 +10,7 @@ import {
 } from "fidesui";
 import { useState } from "react";
 
-import Restrict, { useHasPermission } from "~/features/common/Restrict";
+import Restrict from "~/features/common/Restrict";
 import { ScopeRegistryEnum } from "~/types/api";
 
 import { useGetDiscoveryFindingsQuery } from "./discovery-findings.slice";
@@ -62,21 +62,6 @@ export const FindingsTable = () => {
   const { data, isLoading, isError, refetch } = useGetDiscoveryFindingsQuery({
     state: filter,
   });
-
-  // The reconcile modal's "mark as mapped" picker needs every currently-
-  // mapped finding's system, not just the ones the active filter shows —
-  // see discoverySystemCandidates.ts. Fetched unfiltered so switching the
-  // filter to "Needs review" (the default) never starves that picker. A
-  // Viewer never reconciles, so this second call is skipped for them —
-  // fetching it anyway would cost a real request for a control that never
-  // renders.
-  const canReconcile = useHasPermission([
-    ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_UPDATE,
-  ]);
-  const { data: allData } = useGetDiscoveryFindingsQuery(
-    { state: "all" },
-    { skip: !canReconcile },
-  );
 
   if (isLoading) {
     return <Skeleton active paragraph={{ rows: 6 }} />;
@@ -169,7 +154,6 @@ export const FindingsTable = () => {
           open
           onClose={() => setReconcileTarget(null)}
           finding={reconcileTarget}
-          allFindings={allData?.findings ?? findings}
         />
       )}
     </Flex>
