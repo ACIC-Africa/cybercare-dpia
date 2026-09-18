@@ -13,7 +13,7 @@ import { useMemo } from "react";
 import { getErrorMessage } from "~/features/common/helpers";
 import ConfirmCloseModal from "~/features/common/modals/ConfirmCloseModal";
 import { MODAL_SIZE } from "~/features/common/modals/modal-sizes";
-import { RTKErrorResult } from "~/types/errors/api";
+import { isAPIError, RTKErrorResult } from "~/types/errors/api";
 
 import {
   LIKELIHOOD_LABELS,
@@ -105,11 +105,24 @@ export const AddRiskModal = ({
       form.resetFields();
       onClose();
     } catch (error) {
+      const typedError = error as RTKErrorResult["error"];
+      // Fix wave (Screen 2 review), finding 7 — same reasoning as
+      // RemoveRiskModal.tsx's catch block: risk.py's 404 detail text
+      // ("no such assessment: 'pa_...'") is written for a log, not a
+      // toast. Reachable if the assessment is deleted in another tab while
+      // this modal is still open. Raw detail still reaches the console.
+      const isNotFound = isAPIError(typedError) && typedError.status === 404;
+      if (isNotFound) {
+        // eslint-disable-next-line no-console
+        console.error("Failed to add risk (404):", typedError);
+      }
       message.error(
-        getErrorMessage(
-          error as RTKErrorResult["error"],
-          "Failed to add the risk. Please try again.",
-        ),
+        isNotFound
+          ? "This assessment could not be found. It may have been removed — refresh the page and try again."
+          : getErrorMessage(
+              typedError,
+              "Failed to add the risk. Please try again.",
+            ),
       );
     }
   };

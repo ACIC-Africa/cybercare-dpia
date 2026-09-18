@@ -138,7 +138,15 @@ describe("AddRiskModal — live consequence (DESIGN.md: show the consequence whi
 });
 
 describe("AddRiskModal — validation", () => {
-  it("rejects a description that is only whitespace", async () => {
+  it("rejects a description that is only whitespace, and blocks submission", async () => {
+    // Fix wave (Screen 2 review), finding 8: this test used to type
+    // whitespace, blur, and assert `mockAddRisk` was never called — but it
+    // never attempted to submit, so that assertion was true of ANY
+    // unsubmitted form and proved nothing about the validator. Every other
+    // field is now filled with a valid value and Submit is actually
+    // clicked, so "the mutation was not called" now demonstrates the
+    // whitespace-only description genuinely blocks submission, not merely
+    // that nothing happens when nothing is attempted.
     const user = userEvent.setup();
     render(
       <AddRiskModal
@@ -149,9 +157,15 @@ describe("AddRiskModal — validation", () => {
       />,
     );
 
+    await selectOption(
+      user,
+      "input-category",
+      "Financial or reputational harm",
+    );
+    await selectOption(user, "input-likelihood", "5 — Almost certain");
+    await selectOption(user, "input-severity", "5 — Severe");
     await user.type(screen.getByTestId("input-description"), "   ");
-    await user.click(screen.getByTestId("input-description")); // blur target below
-    await user.tab();
+    await user.click(screen.getByTestId("submit-add-risk"));
 
     expect(
       await screen.findByText("Describe what this risk is."),

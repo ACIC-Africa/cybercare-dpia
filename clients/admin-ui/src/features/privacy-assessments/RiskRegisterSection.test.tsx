@@ -147,15 +147,16 @@ describe("RiskRegisterSection — the band reflects the highest risk, never the 
     );
   });
 
-  it("never reads risk_level — the component has no such prop and cannot fall back to it", () => {
-    // RiskRegisterSectionProps carries only assessmentId (see
-    // RiskRegisterSection.tsx). There is structurally no risk_level value
-    // in scope for this component to read even by accident; this test
-    // pins the *outcome* that reading it would have gotten wrong: a
-    // Fides risk_level of "high" (its own lossy ceiling) must not appear
-    // when the risk register's true top score is Critical.
+  it("reads Critical from an OUT-OF-ORDER list — the band is computed, not read positionally", () => {
+    // Fix wave (Screen 2 review), finding 5: RiskRegisterSection used to
+    // read `risks[0].band` for the summary band, trusting the list route's
+    // own highest-score-first ordering. Every other fixture in this file
+    // happens to already be sorted that way, so a positional read would
+    // have passed every one of them — this is the test that actually
+    // exercises the failure mode: the critical risk sits LAST here, not
+    // first, and the band must still read Critical.
     mockListRisksResult = {
-      data: { items: RISKS_INCLUDING_CRITICAL },
+      data: { items: [LOW_RISK_1, LOW_RISK_2, CRITICAL_RISK] },
       isLoading: false,
       isError: false,
       refetch: jest.fn(),
@@ -167,6 +168,16 @@ describe("RiskRegisterSection — the band reflects the highest risk, never the 
       within(screen.getByTestId("risk-band-summary")).getByText("Critical"),
     ).toBeInTheDocument();
   });
+
+  // Fix wave (Screen 2 review), finding 8: a third test used to sit here
+  // ("never reads risk_level — the component has no such prop and cannot
+  // fall back to it"), reusing this same RISKS_INCLUDING_CRITICAL fixture
+  // and asserting the exact same "Critical" text as the first test in this
+  // describe block. RiskRegisterSectionProps carries only assessmentId, so
+  // there is genuinely no risk_level in scope for the component to read —
+  // but nothing distinguished that test's setup or assertion from the one
+  // above it, so it proved nothing the first test had not already proved.
+  // Removed rather than kept as duplicate coverage.
 });
 
 describe("RiskRegisterSection — empty register", () => {
@@ -312,5 +323,36 @@ describe("RiskRegisterSection — loading and error states", () => {
     const retryButton = screen.getByRole("button", { name: /retry/i });
     retryButton.click();
     expect(refetch).toHaveBeenCalled();
+  });
+
+  // Fix wave (Screen 2 review), finding 8: the loading/skeleton branch
+  // (isLoadingRisks true) had no test at all — only the error branch above
+  // was covered. A regression that swapped SKELETON_ROWS for the real
+  // `risks` array while isLoading was still true, or that stopped guarding
+  // the summary strip's Text/Tag with `isLoading ? <Skeleton.Input /> :
+  // ...`, would have shipped with every other test here green.
+  it("shows skeleton placeholders while risks are loading, not real values", () => {
+    mockListRisksResult = {
+      data: undefined,
+      isLoading: true,
+      isError: false,
+      refetch: jest.fn(),
+    };
+
+    render(<RiskRegisterSection assessmentId={ASSESSMENT_ID} />);
+
+    // Real summary content is swapped for skeletons — none of it renders
+    // while loading.
+    expect(screen.queryByTestId("highest-risk-summary")).not.toBeInTheDocument();
+    expect(screen.queryByText("No risks recorded yet.")).not.toBeInTheDocument();
+    // The empty-register copy is also a real value, not shown mid-load.
+    expect(
+      screen.queryByText(
+        "No risks recorded. The risk band stays Low until a risk is added.",
+      ),
+    ).not.toBeInTheDocument();
+    // The table renders its SKELETON_ROW_COUNT placeholder rows (header +
+    // 3), not zero rows and not real data.
+    expect(screen.getAllByRole("row")).toHaveLength(4);
   });
 });

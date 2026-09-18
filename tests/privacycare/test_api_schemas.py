@@ -258,7 +258,7 @@ def test_the_ts_files_were_actually_read():
     # exact count (not just >= N) also catches a regex that silently trimmed
     # a few fields while both sides shrank together — that must fail loudly
     # if a future Fides upgrade changes the contract.
-    assert len(_ts_fields("AssessmentResponse")) == 17
+    assert len(_ts_fields("AssessmentResponse")) == 18
     assert len(_ts_fields("TemplateResponse")) == 10
 
 

@@ -25,10 +25,14 @@ class RiskResponse(BaseModel):
     # liability) — reading them back here proves the route surfaces the
     # computed value, not a raw column.
     #
-    # No TypeScript counterpart: the DPIA risk register is PrivacyCare's
-    # own (spec D-W2-2), and nothing in the shipped admin UI has a screen
-    # for it — see tests/privacycare/test_response_model_ts_parity.py's
-    # ALLOWLIST entry for this class.
+    # TypeScript counterpart: risk.types.ts's RiskResponse interface, hand-
+    # authored for the admin-UI's risk register screen
+    # (RiskRegisterSection.tsx and friends). Field parity is asserted in
+    # tests/privacycare/test_risk_ts_parity.py and enforced by
+    # test_response_model_ts_parity.py's response-model walk (fix wave,
+    # Screen 2 review, finding 2 — this class's ALLOWLIST exemption there
+    # was removed once the screen landed; it used to say "nothing in the
+    # shipped admin UI has a screen for it", which this screen made false).
     id: str
     assessment_id: str
     category: str
@@ -45,6 +49,9 @@ class RemoveRiskResponse(BaseModel):
     # 404 by the route, not to removed=False here) — `removed` is always
     # true on a successful response; the field exists so the body still
     # names the resource it acted on rather than being an empty 200.
+    #
+    # TypeScript counterpart: risk.types.ts's RemoveRiskResponse interface —
+    # same fix-wave finding-2 history as RiskResponse above.
     id: str
     removed: bool
 
@@ -56,8 +63,9 @@ class OdpcFindingResponse(BaseModel):
     # required lives on RiskResponse already, so there is nothing to gain
     # from a second, narrower shape here.
     #
-    # No TypeScript counterpart: same reasoning as RiskResponse above — see
-    # test_response_model_ts_parity.py's ALLOWLIST entry for this class.
+    # TypeScript counterpart: risk.types.ts's OdpcFindingResponse interface,
+    # same reasoning and same fix-wave finding-2 history as RiskResponse
+    # above — field parity asserted in test_risk_ts_parity.py.
     required: bool
     band: str
     window_days: int

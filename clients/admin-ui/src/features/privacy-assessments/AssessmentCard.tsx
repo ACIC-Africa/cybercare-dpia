@@ -22,11 +22,9 @@ import { PRIVACY_ASSESSMENTS_ROUTE } from "~/features/common/nav/routes";
 import { formatDate } from "~/features/common/utils";
 
 import styles from "./AssessmentCard.module.scss";
-import {
-  ASSESSMENT_STATUS_LABELS,
-  RISK_LEVEL_LABELS,
-  RISK_TAG_COLORS,
-} from "./constants";
+import { ASSESSMENT_STATUS_LABELS } from "./constants";
+import { RISK_BAND_LABELS, RISK_BAND_TAG_COLORS } from "./risk.constants";
+import { RiskBand } from "./risk.types";
 import { AssessmentStatus, PrivacyAssessmentResponse } from "./types";
 
 const { Title } = Typography;
@@ -55,11 +53,25 @@ export const AssessmentCard = ({
   const { getDataCategoryDisplayName } = useTaxonomies();
 
   // Do not assume defaults for missing values; show "N/A" when absent
-  const riskLevel = assessment.risk_level ?? null;
+  //
+  // Fix wave (Screen 2 review), finding 1. This USED to read
+  // assessment.risk_level — Ethyca's own three-value projection, which
+  // stores CRITICAL as "high" (risk/banding.py's projected_risk_level).
+  // The assessment detail page one click away
+  // (RiskRegisterSection.tsx) reads the TRUE four-value band from the risk
+  // API, so a critical assessment could say "High" here and "Critical"
+  // there. risk_band (assessments.py's _risk_bands_by_assessment) is the
+  // same true band, computed the same way (risk/banding.py's band(), via
+  // overall_band's "highest risk, never an average" rule) — reading it here
+  // means the two screens can no longer disagree. Cast through
+  // `as RiskBand`, the same discipline RiskRegisterSection.tsx and
+  // RemoveRiskModal.tsx already apply to a server-sourced category/band
+  // string: the wire value is always one of the four bands, there just is
+  // no generated enum type on this field to prove it statically.
+  const riskBand = (assessment.risk_band as RiskBand | null | undefined) ?? null;
   const status = assessment.status ?? null;
   const completeness = assessment.completeness ?? 0;
 
-  const riskLabel = riskLevel ? RISK_LEVEL_LABELS[riskLevel] : "N/A";
   const statusLabel = status ? ASSESSMENT_STATUS_LABELS[status] : "N/A";
   const isGenerating = status === AssessmentStatus.GENERATING;
   const isComplete = status === AssessmentStatus.COMPLETED;
@@ -109,12 +121,12 @@ export const AssessmentCard = ({
               <Tag>0 data categories</Tag>
             )}
           </div>
-          {riskLevel && (
+          {riskBand && (
             <div>
               <Tag
-                color={RISK_TAG_COLORS[riskLevel] ?? CUSTOM_TAG_COLOR.DEFAULT}
+                color={RISK_BAND_TAG_COLORS[riskBand] ?? CUSTOM_TAG_COLOR.DEFAULT}
               >
-                {`${riskLabel} risk`}
+                {`${RISK_BAND_LABELS[riskBand]} risk`}
               </Tag>
             </div>
           )}

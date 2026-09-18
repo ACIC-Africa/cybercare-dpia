@@ -24,6 +24,7 @@ import {
 } from "./risk.constants";
 import { useGetOdpcFindingQuery, useListRisksQuery } from "./risk.slice";
 import { RiskBand, RiskCategory, RiskResponse } from "./risk.types";
+import { overallBandForScores } from "./risk.utils";
 import { RiskBandTag } from "./RiskBandTag";
 
 const { Title } = Typography;
@@ -129,10 +130,21 @@ export const RiskRegisterSection = ({
   const risks = useMemo(() => riskList?.items ?? [], [riskList]);
 
   // Highest-score-first is the server's own ordering (register.list_risks);
-  // this is a read of that order, never a client-side re-sort or re-derive
-  // of score/band.
+  // `highestRisk` is a read of that order, used only to NAME the entry that
+  // set the band (DESIGN.md: "Highest risk — the entry that set the band,
+  // named") — never to re-sort or re-derive score/band.
   const highestRisk = risks[0] ?? null;
-  const overallBand = highestRisk?.band ?? RiskBand.LOW;
+  // Fix wave (Screen 2 review), finding 5: `overallBand` itself used to be
+  // `highestRisk?.band ?? RiskBand.LOW` — correct only because it trusts
+  // the list route's own `sort(key=(-score, id))` to have put the highest
+  // score first. Nothing in this component enforces that ordering, and the
+  // day the route grows a sort parameter or a paginator, this would go
+  // quietly wrong with every test still green (no test fed an out-of-order
+  // list). overallBandForScores (risk.utils.ts) applies banding.py's own
+  // "maximum, never average" rule directly to every score in the register,
+  // so the summary band is correct regardless of what order the API
+  // returns rows in.
+  const overallBand = overallBandForScores(risks.map((r) => r.score));
 
   const isLoading = isLoadingRisks;
 

@@ -42,6 +42,7 @@ from fides.api.privacycare.api.schemas import (
     UpdatePrivacyAssessmentRequest,
     template_key,
 )
+from fides.api.privacycare.risk.banding import LOW, band
 from fides.api.privacycare.settings import resolve_assessment_model
 from fides.common.scope_registry import SYSTEM_READ
 
@@ -168,6 +169,88 @@ _EVIDENCE_SQL = sqlalchemy.text(
     ORDER BY a.question_id, av.created_at
     """
 )
+
+
+# Fix wave (Screen 2 review), finding 1. The TRUE four-value risk band per
+# assessment, straight from the register — never Ethyca's lossy risk_level
+# projection (see AssessmentResponse.risk_band's own comment in schemas.py
+# for the full "High card / Critical page" story this closes). One
+# aggregate query for every assessment_id that has at least one risk
+# recorded, so a list of N assessments costs one extra query total, not N —
+# the same discipline _ASSESSMENT_SQL above already follows for everything
+# else on this screen. An assessment_id absent from the result has zero
+# risks recorded, and MUST be treated as LOW by the caller — the same
+# empty-register default risk/banding.overall_band([]) returns — so the
+# band shown on a card can never disagree with what its own detail page
+# (RiskRegisterSection.tsx) would compute for the same, currently-empty,
+# register.
+_RISK_BAND_SQL = sqlalchemy.text(
+    """
+    SELECT assessment_id, MAX(likelihood * severity) AS max_score
+    FROM privacycare_dpia_risk
+    GROUP BY assessment_id
+    """
+)
+
+# Same computation, scoped to one assessment — used by the single-assessment
+# PUT echo (update_assessment), where a second bulk query would be needless.
+_RISK_BAND_FOR_ASSESSMENT_SQL = sqlalchemy.text(
+    """
+    SELECT MAX(likelihood * severity) AS max_score
+    FROM privacycare_dpia_risk
+    WHERE assessment_id = :assessment_id
+    """
+)
+
+
+def _risk_bands_by_assessment(db: Session) -> dict[str, str]:
+    """assessment_id -> true risk band, for every assessment that has at
+    least one risk recorded. Callers must default a missing key to LOW
+    (banding.overall_band's own empty-register default), not treat it as
+    unknown — see _RISK_BAND_SQL's own comment above.
+
+    Deliberately tolerant of privacycare_dpia_risk not existing yet.
+    PrivacyCare's own migration chain is a SEPARATE step from Fides'
+    (scripts/privacycare/migrate.sh's own docstring: "without something
+    invoking this script, a fresh deploy ends up with every Fides table
+    and zero PrivacyCare tables") — a real, documented deployment window,
+    not a hypothetical. Before this fix wave, list_assessments never
+    touched a PrivacyCare table and degraded through that window
+    harmlessly; it must not start 500ing the whole assessments list for
+    every user just because the risk band can't be computed yet.
+    """
+    try:
+        rows = db.execute(_RISK_BAND_SQL).mappings().all()
+    except sqlalchemy.exc.ProgrammingError:
+        # Postgres aborts the transaction on the failed statement — roll
+        # back so the session is usable for the rest of this request.
+        db.rollback()
+        logger.warning(
+            "privacycare_dpia_risk could not be queried (PrivacyCare's own "
+            "migration chain may not have run yet) — reporting every "
+            "assessment's risk_band as LOW rather than failing the list."
+        )
+        return {}
+    return {row["assessment_id"]: band(row["max_score"]) for row in rows}
+
+
+def _risk_band_for(db: Session, assessment_id: str) -> str:
+    """Same rule — and the same missing-table tolerance — as
+    _risk_bands_by_assessment, for a single assessment_id."""
+    try:
+        row = db.execute(
+            _RISK_BAND_FOR_ASSESSMENT_SQL, {"assessment_id": assessment_id}
+        ).mappings().first()
+    except sqlalchemy.exc.ProgrammingError:
+        db.rollback()
+        logger.warning(
+            "privacycare_dpia_risk could not be queried (PrivacyCare's own "
+            "migration chain may not have run yet) — reporting risk_band "
+            "as LOW rather than failing this request."
+        )
+        return LOW
+    max_score = row["max_score"] if row is not None else None
+    return band(max_score) if max_score is not None else LOW
 
 
 def _list_assessments(db: Session):
@@ -789,7 +872,13 @@ def _summary(db: Session) -> dict:
     }
 
 
-def _assessment_to_response(row) -> AssessmentResponse:
+def _assessment_to_response(row, risk_band: str = LOW) -> AssessmentResponse:
+    # risk_band defaults to LOW (banding.overall_band's own empty-register
+    # default) rather than being required: test_api_assessments.py's own
+    # fixtures call this helper directly for fields unrelated to the risk
+    # register (template name, timestamp serialisation) and should not have
+    # to compute a risk band to do it. Both real callers below (the list
+    # route and the PUT echo) always pass a real, freshly-computed value.
     return AssessmentResponse(
         id=row["id"],
         template_id=row["template_id"],
@@ -798,6 +887,7 @@ def _assessment_to_response(row) -> AssessmentResponse:
         status=row["status"],
         completeness=row["completeness"],
         risk_level=row["risk_level"],
+        risk_band=risk_band,
         system_fides_key=row["system_fides_key"],
         system_name=row["system_name"],
         declaration_id=row["declaration_id"],
@@ -826,6 +916,10 @@ def _grouped_assessments(
     rows = _list_assessments(db)
     if status is not None:
         rows = [r for r in rows if r["status"] == status]
+    # One aggregate query for every assessment in this page, not one risk-API
+    # call per card — see _RISK_BAND_SQL's own comment for why a missing key
+    # here means LOW, not unknown.
+    risk_bands = _risk_bands_by_assessment(db)
     groups: dict = {}
     for row in rows:
         key = row["data_use"]
@@ -836,7 +930,9 @@ def _grouped_assessments(
                 "systems": set(),
                 "assessments": [],
             }
-        groups[key]["assessments"].append(_assessment_to_response(row))
+        groups[key]["assessments"].append(
+            _assessment_to_response(row, risk_bands.get(row["id"], LOW))
+        )
         if row["system_fides_key"]:
             groups[key]["systems"].add(row["system_fides_key"])
     ordered = sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or ""))
@@ -1312,7 +1408,7 @@ def _update_assessment(
         .mappings()
         .first()
     )
-    return _assessment_to_response(row)
+    return _assessment_to_response(row, _risk_band_for(db, assessment_id))
 
 
 @privacycare_router.put(

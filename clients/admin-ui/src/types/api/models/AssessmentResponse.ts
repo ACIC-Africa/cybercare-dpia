@@ -35,6 +35,15 @@ export type AssessmentResponse = {
    */
   risk_level?: string | null;
   /**
+   * Risk Band
+   */
+  // PrivacyCare (fix wave 2026-09-18, risk register review finding 1) — the
+  // true four-value band, distinct from the lossy three-value risk_level
+  // above (CRITICAL is stored there as "high"). See
+  // src/fides/api/privacycare/api/schemas.py's AssessmentResponse.risk_band
+  // for the full story.
+  risk_band?: string | null;
+  /**
    * System Fides Key
    */
   system_fides_key?: string | null;

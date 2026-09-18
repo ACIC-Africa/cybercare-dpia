@@ -108,8 +108,13 @@ describe("RemoveRiskModal — the band-change preview", () => {
       />,
     );
 
+    // Fix wave (Screen 2 review), finding 3: this used to pin the raw wire
+    // values ("critical"/"low"), which made the component's own regression
+    // (rendering unlabelled band strings) look intentional. Every other
+    // band on screen renders through RISK_BAND_LABELS ("Critical"/"Low");
+    // this sentence must match that, not the wire value.
     expect(
-      screen.getByText("The risk band will change from critical to low."),
+      screen.getByText("The risk band will change from Critical to Low."),
     ).toBeInTheDocument();
   });
 

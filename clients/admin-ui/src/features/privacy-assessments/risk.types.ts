@@ -3,14 +3,21 @@
  *
  * Hand-authored TS twins of the DPIA risk register's HTTP surface
  * (`src/fides/api/privacycare/api/risk_schemas.py`). Not generated into
- * `~/types/api` — risk_schemas.py documents itself as having no TypeScript
- * counterpart (see its own module comment, and
- * tests/privacycare/test_response_model_ts_parity.py's ALLOWLIST for both
- * RiskResponse and OdpcFindingResponse): this whole surface is PrivacyCare's
- * own, with no shipped-Fides screen depending on it, so parity enforcement
- * was deferred until a screen existed to build against. This file, and this
- * screen, is that — same discipline screening.types.ts documents for its
- * own sibling surface.
+ * `~/types/api` — this whole surface is PrivacyCare's own, with no
+ * shipped-Fides screen depending on it, same discipline screening.types.ts
+ * documents for its own sibling surface.
+ *
+ * Fix wave (Screen 2 review), finding 2: this file's own comment used to
+ * say parity enforcement was DEFERRED until a screen existed to build
+ * against ("this file, and this screen, is that"). The screen
+ * (RiskRegisterSection.tsx and friends) now exists and reads every one of
+ * these interfaces, so the precondition that comment was waiting on is met
+ * — RiskResponse, RemoveRiskResponse and OdpcFindingResponse are no longer
+ * exempted in test_response_model_ts_parity.py's ALLOWLIST, and field
+ * parity against risk_schemas.py is asserted in
+ * tests/privacycare/test_risk_ts_parity.py. A field renamed on either side
+ * without the other now fails a test instead of rendering blank on this
+ * screen with nothing red anywhere.
  */
 
 // The four risk bands (risk/banding.py's LOW/MEDIUM/HIGH/CRITICAL

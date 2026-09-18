@@ -53,9 +53,23 @@ TS_DIR = (
 # features/privacycare/processing-grounds.slice.ts — was invisible to the
 # check and could only be got past the gate by allowlisting it. The glob
 # keeps a future PrivacyCare slice covered without another edit here.
+#
+# Fix wave (Screen 2 review), finding 2: risk.types.ts added below. It hand-
+# authors RiskResponse/RemoveRiskResponse/OdpcFindingResponse — the DPIA risk
+# register's TS twins of risk_schemas.py — and its own header comment already
+# says why it existed outside this walk's reach until now: "the DPIA risk
+# register is PrivacyCare's own... nothing in the shipped admin UI has a
+# screen for it... parity enforcement was deferred until a screen existed to
+# build against." The risk register screen (RiskRegisterSection.tsx) is that
+# screen. Leaving this path out after the screen shipped is exactly the
+# silent-gap failure mode this file's own module docstring exists to catch:
+# a real interface, sitting right next to types.ts, invisible to
+# _feature_interface_exists purely because nobody added its path here.
 FEATURE_TS_PATH = (
     pathlib.Path(__file__).parents[2]
     / "clients/admin-ui/src/features/privacy-assessments/types.ts",
+    pathlib.Path(__file__).parents[2]
+    / "clients/admin-ui/src/features/privacy-assessments/risk.types.ts",
     *sorted(
         (
             pathlib.Path(__file__).parents[2]
@@ -326,43 +340,40 @@ ALLOWLIST: dict[str, dict] = {
             "nothing to be in parity with."
         ),
     },
-    # The DPIA risk register's HTTP surface (plan 17, task 5). Same pattern
-    # as the DSR register, business-process ROPA surface, and stale-consent
-    # detector above: the risk register is new, Kenyan-specific ground with
-    # no Plus analogue, so no shipped admin-UI screen calls any of these
-    # four routes and none of their response models have a TS counterpart
-    # to be in parity with.
-    "RiskResponse": {
-        "ts_name": None,
-        "reason": (
-            "No TS counterpart: the DPIA risk register is PrivacyCare's own "
-            "(spec 2026-09-16 D-W2-2), and nothing in the shipped admin UI "
-            "has a screen for it — see api/risk.py's module docstring."
-        ),
-    },
+    # The DPIA risk register's HTTP surface (plan 17, task 5).
+    #
+    # Fix wave (Screen 2 review), finding 2: RiskResponse, RemoveRiskResponse
+    # and OdpcFindingResponse were exempted here with the reason "nothing in
+    # the shipped admin UI has a screen for it" — false as of the risk
+    # register screen (RiskRegisterSection.tsx), which hand-authors exactly
+    # those three interfaces in risk.types.ts (now in FEATURE_TS_PATH above).
+    # All three entries are REMOVED, not just reworded: with no ALLOWLIST
+    # entry, _expected_ts_name falls back to the model's own __name__, which
+    # is already what risk.types.ts names each interface — the parity this
+    # walk enforces for every other screen now binds here too. Field/
+    # optionality parity for the three is asserted in
+    # test_risk_ts_parity.py, which also satisfies
+    # test_every_ts_counterpart_has_a_referencing_parity_test (its own
+    # quoted "RiskResponse"/"RemoveRiskResponse"/"OdpcFindingResponse"
+    # strings are what that test's regex finds).
+    #
+    # Page[RiskResponse] (the list route's response_model) stays exempted —
+    # but for the SAME reason Page[TemplateResponse] and
+    # Page[AssessmentTaskResponse] above stay exempted even though their own
+    # T already has a real TS counterpart: fastapi_pagination.Page[T]'s
+    # generic envelope (items/total/page/size/pages) is proven once against
+    # the TS pagination contract by
+    # test_grouped_assessments_response_matches_the_shipped_contract, not
+    # re-asserted per T. RiskResponse (T itself) is fully recursed into and
+    # now carries its own parity test, same as those two.
     "Page[RiskResponse]": {
         "ts_name": None,
         "reason": (
-            "Generic pagination wrapper over a model that itself has no TS "
-            "counterpart, same as Page[DsrRequestResponse] and "
-            "Page[StaleConsentResponse] above; there is nothing to be in "
-            "parity with."
-        ),
-    },
-    "RemoveRiskResponse": {
-        "ts_name": None,
-        "reason": (
-            "No TS counterpart, same reason as RiskResponse above — DELETE "
-            "/api/v1/privacycare/risk/{risk_id} has no shipped admin-UI "
-            "caller either."
-        ),
-    },
-    "OdpcFindingResponse": {
-        "ts_name": None,
-        "reason": (
-            "No TS counterpart, same reason as RiskResponse above. Also "
-            "recurses into RiskResponse (highest_risk), already covered by "
-            "its own entry — no separate discovery happens for it here."
+            "Generic pagination wrapper: fastapi_pagination.Page[T]'s own "
+            "shape is proven once, not re-asserted per T — same precedent "
+            "as Page[TemplateResponse] and Page[AssessmentTaskResponse] "
+            "above. RiskResponse (T itself) is fully recursed into and "
+            "carries its own parity test in test_risk_ts_parity.py."
         ),
     },
     # The screening gate's HTTP surface (plan 18, task 4). Same pattern as

@@ -288,6 +288,22 @@ beforeEach(() => {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+// Fix wave (Screen 2 review), finding 6: the RiskRegisterSection mock above
+// (data-testid="risk-register-section") was stubbed but never asserted
+// anywhere in this file — deleting the <RiskRegisterSection ... /> line
+// from AssessmentDetail.tsx entirely left this whole suite green. This is
+// the assertion that makes that deletion a real regression instead of a
+// silent one.
+describe("AssessmentDetail — Risks section composition", () => {
+  it("renders the risk register section for this assessment", () => {
+    render(<AssessmentDetail assessment={makeAssessment({ id: "pa-42" })} />);
+
+    const section = screen.getByTestId("risk-register-section");
+    expect(section).toBeInTheDocument();
+    expect(section).toHaveAttribute("data-assessment-id", "pa-42");
+  });
+});
+
 describe("AssessmentDetail — Questionnaire button text", () => {
   it('shows "Start questionnaire" when no questionnaire exists', () => {
     render(<AssessmentDetail assessment={makeAssessment()} />);

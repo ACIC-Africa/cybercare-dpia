@@ -54,8 +54,15 @@ export const PriorConsultationBanner = ({
       style={{ backgroundColor: "var(--fidesui-color-error)" }}
     />
     <div>
+      {/* DESIGN.md language table: "Office of the Data Protection
+          Commissioner (ODPC) — spell out on first use, then ODPC." This
+          headline is the first text a reader sees in this banner — the
+          reason paragraph below already spells it out too (risk/odpc.py's
+          own reason text), but that is no first use if this line above it
+          said only "ODPC" first (fix wave, Screen 2 review, finding 4). */}
       <Text strong type="danger" size="sm">
-        Prior consultation with the ODPC is required
+        Prior consultation with the Office of the Data Protection
+        Commissioner (ODPC) is required
       </Text>
       <Paragraph type="secondary" size="sm" className="mb-0">
         {reason}

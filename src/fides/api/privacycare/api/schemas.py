@@ -66,6 +66,25 @@ class AssessmentResponse(BaseModel):
     status: str
     completeness: Optional[float] = 0.0
     risk_level: Optional[str] = None
+    # Fix wave (Screen 2 review), finding 1. risk_level immediately above is
+    # Ethyca's own lossy three-value projection (risk/banding.py's
+    # projected_risk_level writes CRITICAL there as "high") — the assessment
+    # LIST screen (AssessmentCard.tsx) used to render THAT field, while the
+    # detail page (RiskRegisterSection.tsx) correctly reads the true
+    # four-value band straight off the risk API. One click apart, the same
+    # assessment could read "High" on the card and "Critical" on the page it
+    # opens. risk_band is the fix: the TRUE band (risk/banding.py's band(),
+    # via overall_band's own "highest risk, never an average" rule),
+    # computed fresh from privacycare_dpia_risk by assessments.py's
+    # _risk_bands_by_assessment/_risk_band_for — never stored, never
+    # confused with risk_level. Both the card list route and the
+    # single-assessment PUT echo populate it; it stays Optional only
+    # because PrivacyAssessmentDetailResponse also inherits this field and
+    # its own route (_assessment_detail) does not bother computing it — the
+    # detail page never reads assessment.risk_band, it reads the risk API
+    # directly (RiskRegisterSection.tsx), so there is nothing to compute
+    # there.
+    risk_band: Optional[str] = None
     system_fides_key: Optional[str] = None
     system_name: Optional[str] = None
     declaration_id: Optional[str] = None
