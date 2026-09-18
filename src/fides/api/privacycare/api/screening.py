@@ -175,6 +175,17 @@ _BUSINESS_PROCESS_EXISTS_SQL = sql_text(
 #      fabricated name.
 _CLIENT_ID_PREFIX = "client:"
 _CLIENT_DECIDED_BY_LABEL = "System (automated) — not a named user"
+# The demo seed writes `client:privacycare:demo_seed` into decided_by. It has
+# to go there: privacycare_screening_decision's check constraint forbids a
+# justification on an APPLICABLE decision, so decided_by is the only free-text
+# column every seeded row can carry a marker in, and --remove deletes by that
+# marker. Fabricating a human decider instead would put a false name on the
+# one field that answers "who decided this, and is accountable for it" — the
+# compliance artifact itself. So the identifier stays honest and only its
+# LABEL changes: "System (automated)" reads as a malfunction to someone being
+# shown the product, where "Demonstration data" says exactly what the row is.
+_DEMO_SEED_DECIDED_BY = "client:privacycare:demo_seed"
+_DEMO_SEED_DECIDED_BY_LABEL = "Demonstration data"
 _UNRESOLVED_DECIDED_BY_LABEL = "This user's account is no longer available"
 
 _RESOLVE_DECIDER_NAMES_SQL = sql_text(
@@ -212,6 +223,8 @@ def _decided_by_display(
     """
     if decided_by is None:
         return None
+    if decided_by == _DEMO_SEED_DECIDED_BY:
+        return _DEMO_SEED_DECIDED_BY_LABEL
     if decided_by.startswith(_CLIENT_ID_PREFIX):
         return _CLIENT_DECIDED_BY_LABEL
     name = " ".join(part for part in (first_name, last_name) if part)

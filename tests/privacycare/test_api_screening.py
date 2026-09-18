@@ -802,3 +802,32 @@ def test_every_screening_route_requires_its_declared_scope():
     # its_declared_scope / test_every_dsr_route_requires_its_declared_scope),
     # so app.routes holds two entries per logical route: 7 * 2 = 14.
     assert checked == 14, f"expected 14 screening route/method pairs, checked {checked}"
+
+
+def test_the_demo_seed_marker_reads_as_demonstration_data_not_a_malfunction():
+    """The seed has to put its marker in decided_by — the table's check
+    constraint forbids a justification on an applicable decision, so it is the
+    only free-text column all 40 seeded rows can carry one in, and --remove
+    deletes by it.
+
+    Fabricating a human decider instead would put a false name on the field
+    that answers "who decided this, and is accountable" — the compliance
+    artifact itself. So the identifier stays honest, and only the label is fit
+    for showing: "System (automated) — not a named user" reads as a broken
+    system to someone being shown the product; "Demonstration data" says what
+    the row actually is.
+    """
+    from fides.api.privacycare.api.screening import (
+        _CLIENT_DECIDED_BY_LABEL,
+        _decided_by_display,
+    )
+
+    assert _decided_by_display("client:privacycare:demo_seed") == "Demonstration data"
+    # A genuine automated decision is still labelled as one - the demo marker
+    # must not swallow every client identifier.
+    assert _decided_by_display("client:root-user") == _CLIENT_DECIDED_BY_LABEL
+    # And a real person is still named.
+    assert (
+        _decided_by_display("fid_x", first_name="Carol", last_name="Mwangi")
+        == "Carol Mwangi"
+    )
