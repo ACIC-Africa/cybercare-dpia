@@ -76,9 +76,12 @@ therefore only needed on the two single-resource read routes, where gate.py
 has no check to defer to at all — the list route (below) has nothing to
 404 on: it always returns every row that exists, which may be zero.
 """
+from typing import Iterable, Optional
+
 from fastapi import Depends, HTTPException, Security
 from fastapi import status as status_codes
 from fastapi.security import SecurityScopes
+from sqlalchemy import bindparam
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
@@ -144,6 +147,125 @@ _BUSINESS_PROCESS_EXISTS_SQL = sql_text(
     "SELECT 1 FROM privacycare_business_process WHERE id = :id"
 )
 
+# --- decided_by display resolution -----------------------------------------
+#
+# `decided_by` (privacycare_screening_decision.decided_by, gate.py's own
+# column) is the audit record — "who decided this, on this date" is exactly
+# what a regulator asks for when a process has no assessment — and it is
+# NEVER overwritten or replaced by any of what follows. Every response model
+# below carries a SEPARATE `decided_by_display` field, resolved at READ time
+# only, purely so the screen has something better than a raw identifier to
+# put in front of Carol. See screening_schemas.py for why both fields exist
+# side by side on the wire.
+#
+# _created_by_from_client (identity.py) writes exactly one of two shapes into
+# decided_by, and a third case shows up only at READ time:
+#   1. A real fidesuser.id ("fid_..." — FidesBase.generate_uuid's own
+#      table-prefix scheme). Resolved to a name below.
+#   2. "client:<client.id>" — identity.py's own fallback for the two
+#      legitimate no-named-user paths (root/admin login, a bare M2M client).
+#      Recognised by prefix alone; never looked up, because a client id was
+#      never a fidesuser id to begin with.
+#   3. A real fidesuser.id that no fidesuser row answers to any more — the
+#      user existed when the decision was recorded and does not now. This
+#      case is INDISTINGUISHABLE, from decided_by's shape alone, from a
+#      value this test suite's own fake ids exercise (a string that was
+#      never a fidesuser id at all) — both simply fail to resolve, and both
+#      get the same honest "no longer available" label rather than a
+#      fabricated name.
+_CLIENT_ID_PREFIX = "client:"
+_CLIENT_DECIDED_BY_LABEL = "System (automated) — not a named user"
+_UNRESOLVED_DECIDED_BY_LABEL = "This user's account is no longer available"
+
+_RESOLVE_DECIDER_NAMES_SQL = sql_text(
+    "SELECT id, first_name, last_name, username FROM fidesuser WHERE id IN :ids"
+).bindparams(bindparam("ids", expanding=True))
+
+
+def _decided_by_display(
+    decided_by: Optional[str],
+    *,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+) -> Optional[str]:
+    """The one place this module turns a stored `decided_by` identifier into
+    something fit to show a non-technical privacy SME. `first_name`/
+    `last_name`/`username` are whatever a fidesuser lookup for this id
+    turned up — all None means the lookup found nothing (case 2 or 3 below).
+
+    None only when decided_by itself is None (never screened — there is
+    nothing to resolve). Otherwise always a non-empty string; never the raw
+    identifier itself, and never an invented name.
+
+    1. Resolves to a real user -> full name, falling back to username when
+       both name fields are empty (a user can have a username with no name
+       filled in yet).
+    2. decided_by is a "client:..." identifier (identity.py's
+       _created_by_from_client, for the root/admin login or a bare M2M
+       client with no linked FidesUser) -> a plain-language label, never the
+       raw token.
+    3. decided_by looks like a user id but no fidesuser row answers to it any
+       more (deleted, or — in this test suite only — a fixture id that was
+       never a real fidesuser row) -> a plain-language "no longer available"
+       label, never a blank and never a fabricated name.
+    """
+    if decided_by is None:
+        return None
+    if decided_by.startswith(_CLIENT_ID_PREFIX):
+        return _CLIENT_DECIDED_BY_LABEL
+    name = " ".join(part for part in (first_name, last_name) if part)
+    if name:
+        return name
+    if username:
+        return username
+    return _UNRESOLVED_DECIDED_BY_LABEL
+
+
+def _resolve_decided_by_display_map(
+    db: Session, decided_by_values: Iterable[Optional[str]]
+) -> dict:
+    """Resolves every DISTINCT `decided_by` value in `decided_by_values` to
+    its display string in ONE companion query — never one per row. Built for
+    the current-verdict route (at most one value) and the history route (one
+    value per past decision for a single business process, typically a
+    handful); the list route below does NOT use this — it resolves through a
+    LEFT JOIN in its own single SELECT instead, because a per-row Python
+    lookup for 86+ processes would be exactly the N-calls problem this whole
+    module exists to avoid.
+    """
+    # Materialized up front, not left as whatever iterable the caller
+    # passed: both the history route and this function's own tests pass a
+    # generator expression, and a generator is exhausted after ONE pass —
+    # the `ids` comprehension below would consume it entirely, leaving the
+    # per-value loop further down with nothing left to iterate.
+    decided_by_values = list(decided_by_values)
+    ids = sorted(
+        {
+            value
+            for value in decided_by_values
+            if value is not None and not value.startswith(_CLIENT_ID_PREFIX)
+        }
+    )
+    rows_by_id = {}
+    if ids:
+        rows_by_id = {
+            row.id: row
+            for row in db.execute(_RESOLVE_DECIDER_NAMES_SQL, {"ids": ids}).all()
+        }
+    display_by_value = {}
+    for value in decided_by_values:
+        if value is None or value in display_by_value:
+            continue
+        row = rows_by_id.get(value)
+        display_by_value[value] = _decided_by_display(
+            value,
+            first_name=row.first_name if row is not None else None,
+            last_name=row.last_name if row is not None else None,
+            username=row.username if row is not None else None,
+        )
+    return display_by_value
+
 # Every business process (excluding soft-deleted ones, same filter
 # api/processes.py's own _SELECT_PROCESSES_SQL applies) with its current
 # screening status, in ONE statement. A per-row current_verdict/
@@ -166,6 +288,19 @@ _BUSINESS_PROCESS_EXISTS_SQL = sql_text(
 # same decided_at/id tie-break gate.py's own _SELECT_DECISIONS_SQL uses, so
 # this list can never disagree with GET /{business_process_id} about which
 # decision is "current".
+#
+# decider: a second LEFT JOIN, straight onto fidesuser by id, so the name
+# behind `latest.decided_by` comes back in this SAME statement — resolving it
+# with a per-row Python call for 86+ processes would be the exact N-calls
+# defect this list route exists to avoid (see this module's docstring). A
+# LEFT JOIN, not an inner one, on purpose: `latest.decided_by` is NULL for an
+# unscreened process, a "client:..." string for the two no-named-user paths
+# identity.py's _created_by_from_client documents, or a real fidesuser.id
+# that no longer resolves to a row (deleted user) — none of those three
+# should drop the business process row itself, they should just leave
+# decider.first_name/last_name/username NULL for
+# _decided_by_display (below) to turn into an honest label instead of a
+# name.
 _LIST_SCREENING_STATUS_SQL = sql_text(
     """
     SELECT
@@ -175,6 +310,9 @@ _LIST_SCREENING_STATUS_SQL = sql_text(
         latest.dpia_required AS dpia_required,
         latest.decided_by AS decided_by,
         latest.decided_at AS decided_at,
+        decider.first_name AS decider_first_name,
+        decider.last_name AS decider_last_name,
+        decider.username AS decider_username,
         (mapped.business_process_id IS NOT NULL) AS has_mapping
     FROM privacycare_business_process bp
     LEFT JOIN LATERAL (
@@ -184,6 +322,7 @@ _LIST_SCREENING_STATUS_SQL = sql_text(
         ORDER BY d.decided_at DESC, d.id DESC
         LIMIT 1
     ) latest ON true
+    LEFT JOIN fidesuser decider ON decider.id = latest.decided_by
     LEFT JOIN (
         SELECT DISTINCT pd.business_process_id
         FROM privacycare_process_declaration pd
@@ -210,13 +349,16 @@ def _require_business_process(db: Session, business_process_id: str) -> None:
         )
 
 
-def _response_from_verdict(verdict: ScreeningVerdict) -> ScreeningVerdictResponse:
+def _response_from_verdict(
+    verdict: ScreeningVerdict, decided_by_display: Optional[str]
+) -> ScreeningVerdictResponse:
     return ScreeningVerdictResponse(
         business_process_id=verdict.business_process_id,
         dpia_required=verdict.dpia_required,
         triggered_keys=verdict.triggered_keys,
         justification=verdict.justification,
         decided_by=verdict.decided_by,
+        decided_by_display=decided_by_display,
         decided_at=verdict.decided_at,
     )
 
@@ -246,6 +388,12 @@ def _screening_status_response(row) -> ScreeningStatusResponse:
         business_cycle=row.business_cycle,
         dpia_required=row.dpia_required,
         decided_by=row.decided_by,
+        decided_by_display=_decided_by_display(
+            row.decided_by,
+            first_name=row.decider_first_name,
+            last_name=row.decider_last_name,
+            username=row.decider_username,
+        ),
         decided_at=row.decided_at,
         has_mapping=row.has_mapping,
     )
@@ -327,9 +475,14 @@ def get_current_screening_verdict(
     """
     _require_business_process(db, business_process_id)
     verdict = current_verdict(db, business_process_id)
+    display = None
+    if verdict is not None:
+        display = _resolve_decided_by_display_map(db, [verdict.decided_by])[
+            verdict.decided_by
+        ]
     return CurrentScreeningResponse(
         business_process_id=business_process_id,
-        verdict=_response_from_verdict(verdict) if verdict is not None else None,
+        verdict=_response_from_verdict(verdict, display) if verdict is not None else None,
     )
 
 
@@ -352,9 +505,18 @@ def get_screening_history(
     means exactly one thing)."""
     _require_business_process(db, business_process_id)
     history = decision_history(db, business_process_id)
+    # ONE companion query for the whole history, however many decisions it
+    # holds — never one per decision. See _resolve_decided_by_display_map's
+    # own docstring.
+    display_by_decider = _resolve_decided_by_display_map(
+        db, (v.decided_by for v in history)
+    )
     return ScreeningHistoryResponse(
         business_process_id=business_process_id,
-        decisions=[_response_from_verdict(v) for v in history],
+        decisions=[
+            _response_from_verdict(v, display_by_decider[v.decided_by])
+            for v in history
+        ],
     )
 
 
@@ -416,7 +578,13 @@ def record_screening_decision(
         )
         raise HTTPException(status_code=status_code, detail=detail) from exc
     db.commit()
-    return _response_from_verdict(verdict)
+    # One extra lookup for the single decision just recorded — never a
+    # per-row cost, and it means the caller sees the resolved name
+    # immediately rather than only on the next GET.
+    display = _resolve_decided_by_display_map(db, [verdict.decided_by])[
+        verdict.decided_by
+    ]
+    return _response_from_verdict(verdict, display)
 
 
 @privacycare_screening_router.get(

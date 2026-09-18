@@ -12,6 +12,7 @@ const baseRow: ScreeningStatusResponse = {
   business_cycle: "Card Operations",
   dpia_required: null,
   decided_by: null,
+  decided_by_display: null,
   decided_at: null,
   has_mapping: false,
 };

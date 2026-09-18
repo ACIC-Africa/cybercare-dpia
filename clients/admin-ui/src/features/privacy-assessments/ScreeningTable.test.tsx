@@ -15,7 +15,8 @@ const PROCESSES: ScreeningStatusResponse[] = [
     name: "Fuel Card Issuance",
     business_cycle: "Card Operations",
     dpia_required: true,
-    decided_by: "carol@example.com",
+    decided_by: "fid_b06b0e55-d950-43b1-bf5a-9fa4623d28a9",
+    decided_by_display: "Carol Mwangi",
     decided_at: "2026-09-10T09:00:00Z",
     has_mapping: true,
   },
@@ -24,7 +25,8 @@ const PROCESSES: ScreeningStatusResponse[] = [
     name: "CSR Planning & Execution",
     business_cycle: "CSR",
     dpia_required: false,
-    decided_by: "carol@example.com",
+    decided_by: "fid_b06b0e55-d950-43b1-bf5a-9fa4623d28a9",
+    decided_by_display: "Carol Mwangi",
     decided_at: "2026-09-11T09:00:00Z",
     has_mapping: false,
   },
@@ -158,6 +160,19 @@ describe("ScreeningTable — rendering", () => {
     render(<ScreeningTable processes={PROCESSES} />);
     expect(screen.getByText("Fuel Card Issuance")).toBeInTheDocument();
     expect(screen.getByText("CSR Planning & Execution")).toBeInTheDocument();
+  });
+
+  it('renders "Decided by" as the resolved name, never the raw stored identifier', () => {
+    render(<ScreeningTable processes={PROCESSES} />);
+
+    // Both live rows come back decided_by_display="Carol Mwangi" — that
+    // must be what's on screen, twice (once per row).
+    expect(screen.getAllByText("Carol Mwangi")).toHaveLength(2);
+    // The raw fid_... identifier is the audit artifact, not the headline —
+    // it must never appear as visible cell text.
+    expect(
+      screen.queryByText("fid_b06b0e55-d950-43b1-bf5a-9fa4623d28a9"),
+    ).not.toBeInTheDocument();
   });
 
   it("filters by business cycle — 86 rows is a working session, not a glance", async () => {

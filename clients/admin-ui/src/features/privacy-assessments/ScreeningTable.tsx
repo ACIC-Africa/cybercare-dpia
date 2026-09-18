@@ -1,4 +1,4 @@
-import { Button, ColumnsType, Flex, Select, Table, Text } from "fidesui";
+import { Button, ColumnsType, Flex, Select, Table, Text, Tooltip } from "fidesui";
 import { useMemo, useState } from "react";
 
 import { useRelativeTime } from "~/features/common/hooks/useRelativeTime";
@@ -19,6 +19,29 @@ const NO_CYCLE = "__none__";
 const DecidedAt = ({ isoDate }: { isoDate: string | null }) => {
   const relative = useRelativeTime(isoDate ? new Date(isoDate) : null);
   return <span>{isoDate ? relative : "—"}</span>;
+};
+
+// Renders the resolved, human name/label (decided_by_display) — never the
+// raw stored identifier (decided_by) — but keeps that identifier reachable
+// on hover: it is the compliance artifact a regulator asks for ("who
+// decided this"), so it must stay discoverable even though it is no longer
+// the headline text of this column. Both fields are null together for a
+// process that has never been screened.
+const DecidedBy = ({
+  display,
+  identifier,
+}: {
+  display: string | null;
+  identifier: string | null;
+}) => {
+  if (display === null || identifier === null) {
+    return <span>—</span>;
+  }
+  return (
+    <Tooltip title={`Stored identifier: ${identifier}`}>
+      <span>{display}</span>
+    </Tooltip>
+  );
 };
 
 // Defined at module scope, not inline in ScreeningTable's JSX: an inline
@@ -148,9 +171,13 @@ export const ScreeningTable = ({
     },
     {
       title: "Decided by",
-      dataIndex: "decided_by",
       key: "decided_by",
-      render: (value: string | null) => value ?? "—",
+      render: (_value, row) => (
+        <DecidedBy
+          display={row.decided_by_display}
+          identifier={row.decided_by}
+        />
+      ),
     },
     {
       title: "Decided",

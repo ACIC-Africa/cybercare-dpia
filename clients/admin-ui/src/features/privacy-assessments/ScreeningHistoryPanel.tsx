@@ -1,4 +1,4 @@
-import { Button, Result, Space, Spin, Tag, Text } from "fidesui";
+import { Button, Result, Space, Spin, Tag, Text, Tooltip } from "fidesui";
 import { useMemo } from "react";
 
 import { isAPIError } from "~/types/errors/api";
@@ -117,7 +117,14 @@ export const ScreeningHistoryPanel = ({
                 {decision.dpia_required ? "Applicable" : "Not applicable"}
               </Tag>
               <Text type="secondary" size="sm">
-                {decision.decided_by} · {formatDecidedAt(decision.decided_at)}
+                {/* decided_by_display is the resolved name/label; the
+                    stored decided_by identifier — the audit artifact — is
+                    kept discoverable on hover rather than shown outright,
+                    same as the table's own "Decided by" column. */}
+                <Tooltip title={`Stored identifier: ${decision.decided_by}`}>
+                  <span>{decision.decided_by_display}</span>
+                </Tooltip>{" "}
+                · {formatDecidedAt(decision.decided_at)}
               </Text>
             </Space>
             {decision.triggered_keys.length > 0 && (

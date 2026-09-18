@@ -63,7 +63,19 @@ class ScreeningVerdictResponse(BaseModel):
     dpia_required: bool
     triggered_keys: List[str]
     justification: Optional[str]
+    # decided_by is the AUDIT record — the identifier gate.record_decision
+    # actually stored (privacycare_screening_decision.decided_by), never
+    # overwritten and never derived. decided_by_display is a SEPARATE field,
+    # resolved at read time only (api/screening.py's
+    # _decided_by_display/_resolve_decided_by_display_map), for showing to a
+    # person instead of the raw identifier. Both exist side by side on
+    # purpose: the stored value is the compliance artifact a regulator asks
+    # for ("who decided this"), and it must never become a display string
+    # that could drift from what was actually recorded; the display value is
+    # never a substitute source of truth and is only ever computed FROM
+    # decided_by, never persisted.
     decided_by: str
+    decided_by_display: str
     decided_at: datetime
 
 
@@ -116,7 +128,11 @@ class ScreeningStatusResponse(BaseModel):
     name: str
     business_cycle: Optional[str]
     dpia_required: Optional[bool]
+    # decided_by/decided_by_display: same audit-vs-display split as
+    # ScreeningVerdictResponse above (see its own comment) — None together,
+    # always, for a business process that has never been screened.
     decided_by: Optional[str]
+    decided_by_display: Optional[str]
     decided_at: Optional[datetime]
     has_mapping: bool
 

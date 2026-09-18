@@ -37,13 +37,22 @@ export interface ScreeningDecisionRequest {
 }
 
 /** Mirrors gate.ScreeningVerdict. No `id` — a caller has nothing to refer
- * back to a specific decision by other than business_process_id + decided_at. */
+ * back to a specific decision by other than business_process_id + decided_at.
+ *
+ * decided_by / decided_by_display (screening_schemas.py's own comment):
+ * decided_by is the stored audit identifier — the compliance artifact a
+ * regulator asks for — and is NEVER a name; decided_by_display is resolved
+ * server-side at read time (a fidesuser's name, or an honest label for a
+ * system client / a since-deleted user) purely for showing to a person.
+ * Render decided_by_display, keep decided_by discoverable (tooltip / the
+ * expanded row), never hide the raw identifier entirely. */
 export interface ScreeningVerdictResponse {
   business_process_id: string;
   dpia_required: boolean;
   triggered_keys: string[];
   justification: string | null;
   decided_by: string;
+  decided_by_display: string;
   decided_at: string;
 }
 
@@ -61,7 +70,11 @@ export interface ScreeningStatusResponse {
   name: string;
   business_cycle: string | null;
   dpia_required: boolean | null;
+  // decided_by / decided_by_display: same audit-vs-display split as
+  // ScreeningVerdictResponse above — null together, always, for a process
+  // that has never been screened.
   decided_by: string | null;
+  decided_by_display: string | null;
   decided_at: string | null;
   has_mapping: boolean;
 }

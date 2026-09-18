@@ -42,8 +42,11 @@ import sqlalchemy
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from fides.api.models.fides_user import FidesUser
 from fides.api.oauth.roles import CONTRIBUTOR, OWNER, ROLES_TO_SCOPES_MAPPING, VIEWER
 from fides.api.privacycare.api.screening import (
+    _CLIENT_DECIDED_BY_LABEL,
+    _UNRESOLVED_DECIDED_BY_LABEL,
     get_current_screening_verdict,
     get_data_mapping,
     get_screening_history,
@@ -360,6 +363,208 @@ def test_history_returns_both_decisions_after_rescreening(db, triggers, business
     # Newest first (gate.decision_history's own ordering).
     assert response.decisions[0].triggered_keys == ["special_category"]
     assert response.decisions[1].triggered_keys == []
+
+
+# --- decided_by display resolution ------------------------------------------
+#
+# decided_by (the stored identifier) is never touched by any of this — every
+# assertion below checks it is UNCHANGED alongside checking the new,
+# resolved decided_by_display.
+
+
+def _seed_fidesuser(db, *, first_name=None, last_name=None, username=None) -> str:
+    """A real fidesuser row (id auto-generated with the 'fid_' table-prefix
+    scheme, same as test_api_monitors.py's own steward_user fixture) so a
+    test can record a decision as an ACTUAL, resolvable user — every other
+    helper in this file (`_record`, `_fake_client`) uses a fake string user
+    id that was never a real fidesuser row to begin with."""
+    user = FidesUser(
+        first_name=first_name,
+        last_name=last_name,
+        username=username or f"t_screening_{uuid.uuid4().hex[:8]}",
+    )
+    db.add(user)
+    db.flush()
+    return user.id
+
+
+def _record_as(db, business_process_id, client, **overrides):
+    """Same shape as `_record` above, but with the caller's own `client`
+    instead of always `_fake_client("carol@example.com")` — needed to record
+    a decision as a real fidesuser id, a "client:..." identifier, or an id
+    that resolves to nothing at all."""
+    body = dict(triggered_keys=[], justification="Internal only, no external sharing.")
+    body.update(overrides)
+    return record_screening_decision(
+        business_process_id,
+        ScreeningDecisionRequest(**body),
+        db=db,
+        client=client,
+    )
+
+
+def test_the_list_route_resolves_decided_by_to_a_real_users_name(db, triggers):
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    user_id = _seed_fidesuser(db, first_name="Carol", last_name="Mwangi")
+    _record_as(db, process_id, _fake_client(user_id, id="client_irrelevant"))
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.decided_by == user_id, "the stored audit identifier must be unchanged"
+    assert row.decided_by_display == "Carol Mwangi"
+
+
+def test_the_list_route_falls_back_to_username_when_name_fields_are_blank(db, triggers):
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    username = f"carol.mwangi.{uuid.uuid4().hex[:6]}"
+    user_id = _seed_fidesuser(db, username=username)
+    _record_as(db, process_id, _fake_client(user_id, id="client_irrelevant"))
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.decided_by_display == username
+
+
+def test_the_list_route_labels_a_client_decider_in_plain_language_not_the_raw_token(db, triggers):
+    # user_id=None mirrors identity.py's own two legitimate no-named-user
+    # paths (root/admin login, a bare M2M client) — _created_by_from_client
+    # falls back to f"client:{client.id}" for exactly this case.
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    _record_as(db, process_id, _fake_client(None, id="client_m2m_abc123"))
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.decided_by == "client:client_m2m_abc123", (
+        "the stored audit identifier must be unchanged"
+    )
+    assert row.decided_by_display == _CLIENT_DECIDED_BY_LABEL
+    assert "client_m2m_abc123" not in row.decided_by_display, (
+        "the raw token must never appear in the display string"
+    )
+
+
+def test_the_list_route_labels_an_unresolvable_decided_by_honestly_never_blank(db, triggers):
+    # No fidesuser row answers to this id — the same shape a deleted user's
+    # old decision carries (the id was real once, and resolves to nothing
+    # now). A read-time join cannot tell "never existed" apart from
+    # "existed and was deleted" — both simply fail to resolve — so both get
+    # the same honest, non-blank answer, never a fabricated name and never
+    # an empty cell.
+    process_id = _seed_business_process(db, "Fuel Card Issuance", "Card Operations")
+    fake_user_id = f"fid_{uuid.uuid4()}"
+    _record_as(db, process_id, _fake_client(fake_user_id, id="client_irrelevant"))
+
+    row = _find(list_screening_status(db=db).processes, process_id)
+    assert row.decided_by == fake_user_id, "the stored audit identifier must be unchanged"
+    assert row.decided_by_display == _UNRESOLVED_DECIDED_BY_LABEL
+    assert fake_user_id not in row.decided_by_display, (
+        "the raw identifier must never appear in the display string"
+    )
+
+
+def test_current_verdict_and_history_routes_also_carry_the_resolved_name(
+    db, triggers, business_process_id
+):
+    user_id = _seed_fidesuser(db, first_name="Carol", last_name="Mwangi")
+    _record_as(db, business_process_id, _fake_client(user_id, id="client_irrelevant"))
+
+    current = get_current_screening_verdict(business_process_id, db=db)
+    assert current.verdict.decided_by == user_id
+    assert current.verdict.decided_by_display == "Carol Mwangi"
+
+    history = get_screening_history(business_process_id, db=db)
+    assert len(history.decisions) == 1
+    assert history.decisions[0].decided_by == user_id
+    assert history.decisions[0].decided_by_display == "Carol Mwangi"
+
+
+def test_record_decision_route_response_already_carries_the_resolved_name(
+    db, triggers, business_process_id
+):
+    user_id = _seed_fidesuser(db, first_name="Josephine", last_name="Wanjiru")
+    verdict = _record_as(
+        db, business_process_id, _fake_client(user_id, id="client_irrelevant"),
+        triggered_keys=["large_scale"], justification=None,
+    )
+    assert verdict.decided_by == user_id
+    assert verdict.decided_by_display == "Josephine Wanjiru"
+
+
+def test_history_resolves_multiple_distinct_deciders_with_one_companion_query(
+    db, triggers, business_process_id
+):
+    carol_id = _seed_fidesuser(db, first_name="Carol", last_name="Mwangi")
+    josephine_id = _seed_fidesuser(db, first_name="Josephine", last_name="Wanjiru")
+
+    _record_as(
+        db, business_process_id, _fake_client(carol_id, id="c1"),
+        triggered_keys=[], justification="Nothing ticked this quarter.",
+    )
+    _backdate(db, business_process_id, [], hours=1)
+    _record_as(
+        db, business_process_id, _fake_client(josephine_id, id="c2"),
+        triggered_keys=["special_category"], justification=None,
+    )
+
+    # Asserted on the emitted SQL via before_cursor_execute — same idiom
+    # test_api_assessments.py's own test_empty_body_update_locks_the_
+    # assessment_row uses — a direct check on what was sent to Postgres,
+    # not on this module's own source.
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        history = get_screening_history(business_process_id, db=db)
+    finally:
+        sqlalchemy.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert history.decisions[0].decided_by_display == "Josephine Wanjiru"
+    assert history.decisions[1].decided_by_display == "Carol Mwangi"
+
+    fidesuser_lookups = [s for s in statements if "FROM fidesuser" in s]
+    assert len(fidesuser_lookups) == 1, (
+        "the history route must resolve every decider in ONE companion "
+        f"query, never one per decision — emitted: {fidesuser_lookups!r}"
+    )
+
+
+def test_the_list_route_issues_exactly_one_sql_statement_for_any_number_of_rows(
+    db, triggers
+):
+    # The whole point of this route (its own module-level comment on
+    # _LIST_SCREENING_STATUS_SQL): every business process, WITH its
+    # decider's resolved name, in ONE round trip — never a per-row fetch,
+    # and never a separate fidesuser lookup bolted on afterwards.
+    process_ids = [
+        _seed_business_process(db, f"Screening Perf Process {i}", "Card Operations")
+        for i in range(5)
+    ]
+    user_id = _seed_fidesuser(db, first_name="Carol", last_name="Mwangi")
+    for process_id in process_ids[:3]:
+        _record_as(db, process_id, _fake_client(user_id, id="client_irrelevant"))
+
+    statements: list[str] = []
+    engine = db.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        response = list_screening_status(db=db)
+    finally:
+        sqlalchemy.event.remove(engine, "before_cursor_execute", _capture)
+
+    for process_id in process_ids:
+        row = _find(response.processes, process_id)
+        assert row.decided_by_display in (None, "Carol Mwangi")
+
+    assert len(statements) == 1, (
+        "the list route must issue exactly one SQL statement regardless of "
+        f"row count — emitted {len(statements)}: {statements!r}"
+    )
+    assert "FROM fidesuser" not in statements[0] or "LEFT JOIN fidesuser" in statements[0]
 
 
 # --- Record decision route -------------------------------------------------
