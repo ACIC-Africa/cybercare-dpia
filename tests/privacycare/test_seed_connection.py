@@ -8,6 +8,7 @@ import importlib.util
 import pathlib
 import subprocess
 import sys
+import uuid
 
 import pytest
 import sqlalchemy
@@ -121,7 +122,7 @@ def test_the_seeded_connection_is_read_only(db):
     # never updated), so this needs a clean slate — same as the two secrets
     # tests above — to actually exercise the INSERT path this assertion is
     # about, rather than reading back whatever the live row already holds.
-    _delete_existing(db)
+    _park_existing(db)
     cli = _load_cli()
     cli.seed_connection(db)
     access = db.execute(
@@ -131,17 +132,32 @@ def test_the_seeded_connection_is_read_only(db):
     assert access == "read"
 
 
-def _delete_existing(db):
-    # The live database already carries the authorised --commit'd row (this
-    # is the ONE intended permanent write, per the brief). seed_connection()
-    # only touches `secrets` on the INSERT path — a row that already exists
-    # short-circuits before secrets are set — so a secrets-behaviour test
-    # needs a clean slate to actually exercise that path. Deleting here is
-    # safe: it happens inside the same `db` fixture's transaction, which
-    # test teardown rolls back, so the live row is untouched once the test
-    # ends (verified: `db` fixture patches commit to a no-op and always
-    # rolls back).
-    db.execute(sqlalchemy.text("DELETE FROM connectionconfig WHERE key = :k"), {"k": KEY})
+def _park_existing(db):
+    # RENAMED AWAY FROM A DELETE (2026-09-18 fix). The live database
+    # carries the authorised --commit'd row (the ONE intended permanent
+    # write, per the brief) — but a real discovery scan (2026-09-18) has
+    # since created a `monitorconfig` row that FK-references THIS row's
+    # `id` (`monitorconfig_connection_config_id_fkey`). `DELETE FROM
+    # connectionconfig WHERE key = :k` now raises ForeignKeyViolation on
+    # the DELETE statement itself — Postgres checks the constraint
+    # immediately, before this transaction's own rollback at teardown
+    # ever gets a chance to matter. That monitorconfig row is legitimate
+    # demonstration data (1881 staged resources depend on the same scan)
+    # and must not be deleted to make this test pass.
+    #
+    # seed_connection() only needs a row that does NOT match `key == KEY`
+    # to fall onto its own INSERT path — it never looks at `id`. Renaming
+    # `key` aside (a plain unique column, NOT the FK's target, which is
+    # `id`) achieves exactly that without touching the row the FK
+    # references at all: the UPDATE below never conflicts with anything.
+    # This still happens inside the same `db` fixture's transaction, which
+    # test teardown rolls back, so the live row's `key` is restored once
+    # the test ends (verified: the `db` fixture patches commit to a no-op
+    # and always rolls back).
+    db.execute(
+        sqlalchemy.text("UPDATE connectionconfig SET key = :parked WHERE key = :k"),
+        {"parked": f"{KEY}_parked_{uuid.uuid4().hex[:8]}", "k": KEY},
+    )
     db.flush()
 
 
@@ -154,7 +170,7 @@ def test_the_seeded_secrets_describe_the_container_view_not_the_host_view(db):
     # return ciphertext), same as production code reads it.
     from fides.api.models.connectionconfig import ConnectionConfig
 
-    _delete_existing(db)
+    _park_existing(db)
     cli = _load_cli()
     cli.seed_connection(db)
     connection = (
@@ -176,7 +192,7 @@ def test_the_seeded_secrets_host_and_port_are_overridable(db, monkeypatch):
     monkeypatch.setenv("PRIVACYCARE_SCRATCH_DB_PORT", "6543")
     from fides.api.models.connectionconfig import ConnectionConfig
 
-    _delete_existing(db)
+    _park_existing(db)
     cli = _load_cli()
     cli.seed_connection(db)
     connection = (

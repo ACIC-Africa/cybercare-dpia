@@ -152,6 +152,15 @@ def test_a_resource_that_has_gone_is_marked_removal_and_still_exists(db):
     # D-EX-5. The ROPA must be able to show that a table which held personal
     # data last quarter is gone this quarter. Assert BOTH the status and
     # that the row is still there.
+    #
+    # `_row_count(db)` counts the WHOLE stagedresource table, which a real
+    # discovery scan (2026-09-18) permanently populated with 1881 rows of
+    # its own — an absolute "== 2" here broke the day that scan ran. Measure
+    # this test's own baseline before touching anything, then assert the
+    # DELTA the two rows this test adds still holds, whatever else the
+    # table already contains (same baseline-relative discipline
+    # test_dsr_alert_job.py's own fix already applies).
+    before = _row_count(db)
     found = [
         FoundResource(urn="m1.db.public", name="db", resource_type="Database",
                       parent_urn=None, field_type=None),
@@ -168,7 +177,7 @@ def test_a_resource_that_has_gone_is_marked_removal_and_still_exists(db):
 
     assert summary == ReconcileSummary(added=0, removed=1, unchanged=1)
     assert _diff_status(db, "m1.db.public.orders") == "removal"
-    assert _row_count(db) == 2  # still there, not deleted
+    assert _row_count(db) == before + 2  # still there, not deleted
 
 
 def test_nothing_ever_deletes_a_staged_resource(db):
@@ -431,6 +440,11 @@ def test_the_insert_is_idempotent_under_a_racing_duplicate_urn(db):
     # exists to prove is now harmless. This is exactly the situation two
     # genuinely concurrent callers would produce: each decided "new"
     # independently, and only one of their INSERTs can win.
+    # Same baseline-relative fix as the test above: this table already
+    # carries 1881 real rows from a 2026-09-18 discovery scan, so an
+    # absolute "== 1" is exactly the defect that broke this test then —
+    # measure this test's own baseline first, assert the delta.
+    before = _row_count(db)
     params = {
         "urn": "m1.db.public.orders", "name": "orders", "resource_type": "Table",
         "parent": "m1.db.public", "monitor_config_id": "mon1",
@@ -445,4 +459,4 @@ def test_the_insert_is_idempotent_under_a_racing_duplicate_urn(db):
         "a racing duplicate INSERT must be a silent no-op, not an error"
     )
 
-    assert _row_count(db) == 1
+    assert _row_count(db) == before + 1
