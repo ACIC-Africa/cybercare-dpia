@@ -25,6 +25,7 @@ import {
   useGetDiscoveryMonitorsQuery,
   usePutDiscoveryMonitorMutation,
 } from "./discovery.slice";
+import { FindingsTable } from "./FindingsTable";
 
 // Design brief (docs/design/privacycare-screens/DESIGN.md, Screen 4):
 // "Name the target in words, every time. Not a connection key." This is the
@@ -53,18 +54,17 @@ function targetLabelFor(connectionConfigKey: string): string {
  * semi-automated discovery of personal data across company systems… flag
  * any newly discovered or undocumented processing activity for review."
  *
- * THIS BUILD CANNOT DO THE SECOND HALF OF THAT SENTENCE. DESIGN.md's own
- * spec for this screen is a findings list (one row per discovered table,
- * "Already mapped" / "Ignored" / "Needs review") with a reconcile action.
- * No route anywhere in this codebase lists an individual `stagedresource`
- * row or writes a per-resource decision — see discovery.slice.ts's own
- * header comment for the full accounting, and
- * docs/design/privacycare-screens/04-discovery-build-report.md for what was
- * looked for and not found. Rather than fabricate a findings table with no
- * API behind it, this screen shows exactly what the four real routes it
- * calls can prove: whether a monitor is configured, the one live resource
- * count `deletion-impact` can report, and a plain admission of what is not
- * built yet — never a table implying a review queue that does not exist.
+ * THE SECOND HALF OF THAT SENTENCE NOW HAS AN API BEHIND IT. The discovery-
+ * findings surface (`src/fides/api/privacycare/api/discovery.py`, commit
+ * 91712e5846 — see docs/demo/discovery-findings-api-report.md) lists every
+ * discovered table with its reconciliation state and lets a person mark
+ * one mapped or ignore it with a reason. `FindingsTable`, rendered below,
+ * is that findings list — defaulted to "Needs review" per DESIGN.md
+ * ("that is the work"). The section above stays scoped to monitor
+ * CONFIGURATION (a different HTTP surface, `plus/discovery-monitor*`) —
+ * whether a scan is configured and running it again — which this build
+ * already got right; see 04-discovery-build-report.md for the earlier,
+ * honest admission of the gap this task closes.
  */
 export const DiscoveryScreen = () => {
   const message = useMessage();
@@ -254,17 +254,7 @@ export const DiscoveryScreen = () => {
         </Space>
       )}
 
-      {/* An empty findings table with no explanation reads as a broken
-          scan, per DESIGN.md — the fix here is not a table (there is no
-          API to fill one honestly) but a plain admission of what this
-          screen cannot yet do, in the privacy officer's own language. */}
-      <Alert
-        type="warning"
-        showIcon
-        message="This screen cannot list individual findings yet"
-        description="Discovery can tell you whether a scan has run and roughly how much it found. It cannot yet list the individual tables or columns it found for you to review, or let you mark one as already mapped or ignored — that capability has not been built into PrivacyCare's API yet. See the build report for exactly what is missing."
-        data-testid="discovery-missing-capabilities"
-      />
+      <FindingsTable />
     </Space>
   );
 };

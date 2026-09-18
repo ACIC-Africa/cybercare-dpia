@@ -123,6 +123,13 @@ export const baseApi = createApi({
     // docs/design/privacycare-screens/DESIGN.md).
     "PrivacyCare Ropa Processes",
     "PrivacyCare Ropa Entry",
+    // PrivacyCare — the Discovery findings screen's own cache tags (Screen 4
+    // of docs/design/privacycare-screens/DESIGN.md). Separate from
+    // "Discovery Monitor Configs" above, which belongs to the sibling
+    // monitor-configuration surface (discovery.slice.ts), not this one
+    // (discovery-findings.slice.ts).
+    "PrivacyCare Discovery Findings",
+    "PrivacyCare Discovery Finding History",
     "User Monitors",
     "Pre-Approval Webhooks",
     "Datastore Filters",

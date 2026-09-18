@@ -75,6 +75,14 @@ jest.mock("./discovery.slice", () => ({
   ],
 }));
 
+// FindingsTable carries its own full test file (FindingsTable.test.tsx) —
+// stubbed here so this file stays about monitor CONFIGURATION, the same
+// isolation discipline RecordDecisionModal.test.tsx documents for its own
+// MappingStepForm stub.
+jest.mock("./FindingsTable", () => ({
+  FindingsTable: () => <div data-testid="findings-table-stub" />,
+}));
+
 // useMessage needs a FidesUIProvider ancestor this test does not stand up —
 // same gap RopaList.test.tsx and AddRiskModal.test.tsx document for their
 // own use of it.
@@ -269,7 +277,7 @@ describe("DiscoveryScreen — running a scan", () => {
   });
 });
 
-describe("DiscoveryScreen — the resource count is real, and there is no fabricated findings table", () => {
+describe("DiscoveryScreen — the resource count is real", () => {
   it("shows the live resource count from the deletion-impact read when a monitor has found something", () => {
     mockGetDiscoveryMonitorsQuery.mockReturnValue({
       data: CONFIGURED_MONITOR,
@@ -321,14 +329,27 @@ describe("DiscoveryScreen — the resource count is real, and there is no fabric
       "No resources discovered yet.",
     );
   });
+});
 
-  it("admits, in every state, that individual findings cannot be listed or reconciled here — never a table implying a review queue that does not exist", () => {
+describe("DiscoveryScreen — the findings list is now real, not admitted-missing", () => {
+  it("renders the findings table in every monitor-configuration state — the gap this screen used to admit is closed", () => {
     render(<DiscoveryScreen />);
+    expect(screen.getByTestId("findings-table-stub")).toBeInTheDocument();
     expect(
-      screen.getByTestId("discovery-missing-capabilities"),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
-    expect(screen.queryByText(/needs review/i)).not.toBeInTheDocument();
+      screen.queryByTestId("discovery-missing-capabilities"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("still renders the findings table once a monitor is configured", () => {
+    mockGetDiscoveryMonitorsQuery.mockReturnValue({
+      data: CONFIGURED_MONITOR,
+      isLoading: false,
+      isError: false,
+      refetch: jest.fn(),
+    });
+
+    render(<DiscoveryScreen />);
+    expect(screen.getByTestId("findings-table-stub")).toBeInTheDocument();
   });
 });
 
