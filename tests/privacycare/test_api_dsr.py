@@ -163,8 +163,17 @@ def test_the_list_filters_by_right_and_returns_the_page_envelope(db):
 
 
 def test_the_list_reads_delegated_statuses_in_one_query_not_one_per_row(db):
-    for _ in range(3):
-        _create(db, "access")
+    # The live register now permanently carries the demo seed's own DSR
+    # requests (D-SEED-8, plan 20) — including "access" rows — so the page
+    # this route returns is no longer just the 3 this test creates. Filter
+    # down to this test's own ids (tracked at creation) rather than
+    # asserting the raw page length, the same way every other test in this
+    # file that cares about "only what I created" already scopes itself by
+    # id (e.g. test_the_list_reports_vanished_for_a_deleted_delegated_
+    # request, just below). The batching claim under test — one query, not
+    # one per row — is unaffected either way: it is about how the whole
+    # page's statuses are read, not about how many rows are on it.
+    created_ids = {_create(db, "access").id for _ in range(3)}
 
     seen: list = []
 
@@ -181,8 +190,9 @@ def test_the_list_reads_delegated_statuses_in_one_query_not_one_per_row(db):
     finally:
         sqlalchemy.event.remove(db.get_bind(), "before_cursor_execute", _record)
 
-    assert len(page.items) == 3
-    assert all(item.fides_privacy_request_status == "pending" for item in page.items)
+    ours = [item for item in page.items if item.id in created_ids]
+    assert len(ours) == 3, "expected all 3 of this test's own access requests on the page"
+    assert all(item.fides_privacy_request_status == "pending" for item in ours)
     assert len(seen) == 1, f"expected one batched read, got {len(seen)}"
 
 

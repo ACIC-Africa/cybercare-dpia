@@ -90,6 +90,21 @@ def test_a_missing_timeline_row_is_an_unseeded_database_error_not_unclocked(db):
     # unseeded database is an engineering error, not a policy choice about when
     # a controller is in breach. This must be caught by checking the timeline
     # row's *presence*, not by trusting a None value.
+    #
+    # The live register now permanently carries a demo-seeded 'erasure'
+    # request (D-SEED-8, plan 20), so privacycare_dsr_timeline's own right_fkey
+    # blocks a bare DELETE of the 'erasure' timeline row — this test wants a
+    # database that was never seeded, not a change to what the demo
+    # committed for real. This session never commits (fixture, above) and
+    # always rolls back at teardown, so clearing whatever currently
+    # references 'erasure' first is transient: the demo row is exactly as
+    # it was before this test the instant the session rolls back, the same
+    # guarantee every other test in this file already relies on for its
+    # own writes.
+    db.execute(
+        sqlalchemy.text('DELETE FROM privacycare_dsr_request WHERE "right" = :right'),
+        {"right": "erasure"},
+    )
     db.execute(
         sqlalchemy.text('DELETE FROM privacycare_dsr_timeline WHERE "right" = :right'),
         {"right": "erasure"},

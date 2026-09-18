@@ -15,6 +15,7 @@ import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
 
+import fides.api.privacycare.dsr.alert_job as alert_job_module
 from fides.api.privacycare.dsr.alert_job import (
     RunSummary,
     initiate_scheduled_dsr_alerts,
@@ -28,6 +29,38 @@ from fides.api.privacycare.dsr.timelines import seed_timelines
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 NOW = datetime(2026, 9, 15, 7, 0, tzinfo=timezone.utc)
+
+
+def _scope_alert_run(monkeypatch) -> set:
+    """run_deadline_alerts walks list_requests(db) for the WHOLE shared
+    register — this live database now also carries the demo seed's own 7
+    permanent DSR rows (D-SEED-8, plan 20), spanning all six Kenyan rights
+    (access twice), plus whatever any other test session has left behind.
+    A RunSummary equality or an absolute field count (unclocked==1,
+    unowned==1, ...) only proves what it used to prove once the run is
+    scoped to just the ids THIS test created — the same idea as every
+    other file in this suite scoping its own assertions to
+    alerts_sent_for(db, request_id) rather than a database-wide count, one
+    level up: applied to run_deadline_alerts' own input instead of its
+    output.
+
+    Monkeypatches alert_job.list_requests (the one place run_deadline_
+    alerts reads the register) to filter the real result down to the
+    returned set's ids. Nothing about alert_job.py itself changes — this
+    is a test-side seam, not a production behaviour change — and the real
+    list_requests is still the thing doing the reading, just filtered
+    afterwards. Add each request's id to the returned set right after
+    creating it, before the next run_deadline_alerts call that should see
+    it.
+    """
+    ids: set = set()
+    real_list_requests = alert_job_module.list_requests
+
+    def _scoped_list_requests(db_):
+        return [row for row in real_list_requests(db_) if row["id"] in ids]
+
+    monkeypatch.setattr(alert_job_module, "list_requests", _scoped_list_requests)
+    return ids
 
 
 @pytest.fixture
@@ -71,12 +104,14 @@ class _FailingChannel:
         self.sent.append(alert)
 
 
-def test_an_obligation_at_its_threshold_warns_its_owner_once(db):
+def test_an_obligation_at_its_threshold_warns_its_owner_once(db, monkeypatch):
     # Acceptance 1. The second run the same day must send nothing.
+    scope = _scope_alert_run(monkeypatch)
     request_id = record_request(
         db, right="access", subject_identifier=_subject(),
         owner_email="ops@customer.co.ke",
     )
+    scope.add(request_id)
     # access is a 7-day clock; warn_threshold(7) == 3, so 3 days out is
     # exactly at the threshold.
     _set_deadline(db, request_id, NOW + timedelta(days=3))
@@ -162,13 +197,15 @@ def test_the_alert_reports_days_left_correctly_at_its_boundaries(db):
     assert by_id[six_hours_out].days_left == 1
 
 
-def test_an_objection_is_never_alerted_and_is_reported_as_unclocked(db):
+def test_an_objection_is_never_alerted_and_is_reported_as_unclocked(db, monkeypatch):
     # Acceptance 3 / D-AL-4. summary.unclocked counts it; summary.attempted
     # does not. Skipping it silently would make an open question invisible.
+    scope = _scope_alert_run(monkeypatch)
     request_id = record_request(
         db, right="objection", subject_identifier=_subject(),
         owner_email="ops@customer.co.ke",
     )
+    scope.add(request_id)
 
     channel = LoggingChannel()
     summary = run_deadline_alerts(db, channel=channel, now=NOW)
@@ -204,16 +241,18 @@ def test_an_obligation_fides_already_completed_is_not_alerted(db):
     assert alerts_sent_for(db, request_id) == frozenset()
 
 
-def test_a_closed_non_delegating_obligation_is_not_alerted(db):
+def test_a_closed_non_delegating_obligation_is_not_alerted(db, monkeypatch):
     # Fix round 1, Finding 1. Rectification never delegates (no Fides
     # analogue exists), so nothing about Fides' status could ever have
     # protected it — only the register's own status can. Barbara's ruling
     # makes the register the record of truth: a human closed this, so it
     # is never alerted on, breached or not.
+    scope = _scope_alert_run(monkeypatch)
     request_id = record_request(
         db, right="rectification", subject_identifier=_subject(),
         owner_email="ops@customer.co.ke",
     )
+    scope.add(request_id)
     _set_deadline(db, request_id, NOW - timedelta(hours=1))  # would otherwise breach
     record_decision(
         db, request_id=request_id, outcome="granted",
@@ -287,8 +326,10 @@ def test_an_unowned_obligation_goes_to_the_escalation_address(db, monkeypatch):
     # counted in summary.unowned — never dropped.
     monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
     monkeypatch.setenv("PRIVACYCARE_ALERT_ESCALATION_EMAIL", "escalate@customer.co.ke")
+    scope = _scope_alert_run(monkeypatch)
 
     request_id = record_request(db, right="access", subject_identifier=_subject())
+    scope.add(request_id)
     _set_deadline(db, request_id, NOW - timedelta(hours=1))
 
     channel = LoggingChannel()
@@ -302,6 +343,7 @@ def test_an_unowned_obligation_goes_to_the_escalation_address(db, monkeypatch):
     # With none configured: logged and counted, never dropped, never sent.
     monkeypatch.delenv("PRIVACYCARE_ALERT_ESCALATION_EMAIL", raising=False)
     other_id = record_request(db, right="access", subject_identifier=_subject())
+    scope.add(other_id)
     _set_deadline(db, other_id, NOW - timedelta(hours=1))
 
     again = run_deadline_alerts(db, channel=channel, now=NOW)
@@ -319,8 +361,10 @@ def test_a_blank_escalation_address_is_treated_the_same_as_unset(db, monkeypatch
     # same as unset: logged, counted in unowned, nothing attempted.
     monkeypatch.delenv("PRIVACYCARE_DPO_EMAIL", raising=False)
     monkeypatch.setenv("PRIVACYCARE_ALERT_ESCALATION_EMAIL", "")
+    scope = _scope_alert_run(monkeypatch)
 
     request_id = record_request(db, right="access", subject_identifier=_subject())
+    scope.add(request_id)
     _set_deadline(db, request_id, NOW - timedelta(hours=1))
 
     channel = LoggingChannel()
@@ -471,14 +515,23 @@ def test_a_crash_mid_run_still_commits_the_alerts_already_sent(db, monkeypatch):
     # the SECOND row only -- the same failure mode as an unrecognised
     # right, uncaught anywhere in the loop (alert_job.py calls it directly,
     # with no try/except, unlike channel.send).
+    # The live register now permanently carries the demo seed's own DSR
+    # rows (D-SEED-8), most of them open+clocked and so also processed by
+    # this loop — meaning `timeline_days` gets called on THEM too, and the
+    # "second row" this test means to crash on is not reliably `crashes_id`
+    # any more. Scope the run to just this test's own two rows first (see
+    # `_scope_alert_run`'s own docstring), so "the second row" is
+    # unambiguous again regardless of what else the register holds.
+    scope = _scope_alert_run(monkeypatch)
+
     ok_id = record_request(db, right="access", subject_identifier=_subject(),
                            owner_email="a@customer.co.ke")
+    scope.add(ok_id)
     _set_deadline(db, ok_id, NOW - timedelta(hours=1))
     crashes_id = record_request(db, right="access", subject_identifier=_subject(),
                                 owner_email="b@customer.co.ke")
+    scope.add(crashes_id)
     _set_deadline(db, crashes_id, NOW - timedelta(hours=1))
-
-    import fides.api.privacycare.dsr.alert_job as alert_job_module
 
     real_timeline_days = alert_job_module.timeline_days
     calls = {"n": 0}

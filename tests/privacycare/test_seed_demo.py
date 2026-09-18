@@ -564,8 +564,23 @@ def test_gather_counts_matches_forty_decided_after_a_fresh_seed(db):
 def test_dsr_requests_are_idempotent_by_exact_subject_identifier(db):
     """The DSR analogue of test_seed_demo_then_seed_demo_again... above,
     but calling seed_dsr_requests() directly so a failure here can't be
-    confused with a screening/mapping regression."""
+    confused with a screening/mapping regression.
+
+    NORMALISES FIRST, via its own remove_demo(db) call — same discipline
+    as test_seed_then_remove_returns_every_count_to_its_pre_seed_value's
+    own docstring, above. The real --commit has now landed permanently
+    against this live database (this task's own last step), so its 7 DSR
+    rows already exist before this test's own body ever runs; without
+    normalising, seed_dsr_requests() would find all 7 already present and
+    "first" would report written=0/skipped=7, never proving the "writes 7
+    the first time" half of idempotency at all. remove_demo(db) strips
+    them back to a known, marker-free baseline inside this rolled-back
+    session only — nothing here is ever durable — so "first" below means
+    what it always meant: seeding onto an empty register.
+    """
     cli = _load_cli()
+    cli.remove_demo(db)
+
     first = cli.seed_dsr_requests(db)
     assert first["dsr_requests_written"] == 7
     assert first["dsr_requests_skipped"] == 0
