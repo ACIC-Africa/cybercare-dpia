@@ -130,6 +130,10 @@ export const PRIVACY_ASSESSMENTS_SCREENING_ROUTE =
 // PrivacyCare: the record of processing activities (ROPA) screen — Screen 3
 // of docs/design/privacycare-screens/DESIGN.md.
 export const PRIVACY_ASSESSMENTS_ROPA_ROUTE = "/privacy-assessments/ropa";
+// PrivacyCare: the discovery screen — Screen 4 of
+// docs/design/privacycare-screens/DESIGN.md.
+export const PRIVACY_ASSESSMENTS_DISCOVERY_ROUTE =
+  "/privacy-assessments/discovery";
 
 // Data Purposes (Core Configuration)
 export const DATA_PURPOSES_ROUTE = "/data-purposes";

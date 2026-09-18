@@ -217,6 +217,18 @@ export const NAV_CONFIG: NavConfigGroup[] = [
       // should reach — the page itself handles a resulting 403 from the
       // API gracefully (RopaList.tsx / RopaEntry.tsx), rather than the nav
       // entry being the only gate.
+      // PrivacyCare: Screen 4 of docs/design/privacycare-screens/DESIGN.md —
+      // finds personal data nobody wrote down. Read is
+      // PRIVACYCARE_DISCOVERY_READ (a Viewer holds it); running a scan is
+      // gated inside the screen itself on PRIVACYCARE_DISCOVERY_UPDATE via
+      // Restrict, not on the nav entry.
+      {
+        title: "Discovery",
+        path: routes.PRIVACY_ASSESSMENTS_DISCOVERY_ROUTE,
+        scopes: [ScopeRegistryEnum.PRIVACYCARE_DISCOVERY_READ],
+        requiresFlag: "privacyAssessments",
+        keywords: ["discovery", "scan", "monitor", "undocumented processing"],
+      },
       {
         title: "Record of processing activities",
         path: routes.PRIVACY_ASSESSMENTS_ROPA_ROUTE,

@@ -6,6 +6,8 @@ export { default as AssessmentSettingsModal } from "./AssessmentSettingsModal";
 export * from "./AssessmentTaskPopoverContent";
 export * from "./AssessmentTaskStatusIndicator";
 export * from "./constants";
+export * from "./discovery.slice";
+export { DiscoveryScreen } from "./DiscoveryScreen";
 export * from "./EditableTextBlock";
 export * from "./EmptyState";
 export * from "./EvidenceDrawer";
