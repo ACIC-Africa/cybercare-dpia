@@ -204,29 +204,237 @@ Secrets come from the environment at run time and are never written into
 the repo or printed — main() only ever prints the target: line (host/
 port/database, never the password, never the raw URL).
 
-NO ORM WRITES, SO NO COMMIT TRAP. gate.record_decision and
-mapping.save_mapping (and the small handful of raw UPDATE/DELETE
-statements this script adds of its own, for the append-marker and
---remove paths) are all raw SQL through the session, exactly like
-gate.py's, mapping.py's and grounds.py's own module docstrings promise
-("all raw SQL, all bound parameters, never a commit — the caller's session
-boundary decides"). Unlike seed_dsr.py (ensure_kenyan_policies'
-Policy/Rule.create_or_update) and seed_consent_demo.py
-(PrivacyPreferenceHistory.create), nothing here ever calls Fides'
-base_class.persist_obj, so there is no unconditional inner db.commit() for
-a dry run to accidentally survive, and main() below needs no
-monkeypatch-commit-to-flush guard — the same reasoning
-seed_kenya_template.py's and seed_screening_triggers.py's own docstrings
-give for the identical omission.
+SCREENING AND MAPPING ARE RAW SQL; DSR AND CONSENT ARE NOT — SO main() DOES
+CARRY A COMMIT-TRAP GUARD AFTER ALL. gate.record_decision and
+mapping.save_mapping (and this script's own append-marker / --remove
+statements for those two tables) are all raw SQL through the session,
+exactly like gate.py's, mapping.py's and grounds.py's own module
+docstrings promise. The DSR and consent additions below are not: DSR
+requests go through dsr/register.py's record_request (also raw SQL — no
+trap there), but consent goes through seed_consent_demo.py's own
+seed_consent_demo() AND this script's own new preference rows, both of
+which call PrivacyPreferenceHistory.create() — Fides' base_class.
+persist_obj, which does add/commit/refresh UNCONDITIONALLY (see
+seed_consent_demo.py's own module docstring, "The commit trap"). So
+main() below now carries the exact same monkeypatch-commit-to-flush guard
+seed_dsr.py's and seed_consent_demo.py's own main() already use, for the
+whole seed/remove call — not only the consent portion — matching the
+pattern the `db` test fixture in test_seed_demo.py already applied
+defensively even before this was true ("in case a future edit adds an ORM
+write"). It is now load-bearing, not defensive.
 
 Every write function below (seed_screening_decisions, seed_mappings,
-seed_demo, remove_demo) never calls db.commit() or db.rollback() itself —
-the caller's session boundary decides, the same rule every PrivacyCare
-seed function in this package follows.
+seed_dsr_requests, seed_consent, seed_demo, remove_demo) never calls
+db.commit() or db.rollback() itself — the caller's session boundary
+decides, the same rule every PrivacyCare seed function in this package
+follows. (seed_consent's own inner call into seed_consent_demo() and its
+own PrivacyPreferenceHistory.create() calls DO call persist_obj's
+commit — but under main()'s guard that resolves to a flush, same as
+seed_consent_demo.py's own main() already relies on.)
+
+--- D-SEED-8: DSR REQUESTS THAT EXERCISE THE KENYAN CLOCKS ---------------
+
+seed_dsr.py already seeds the six timeline rows and the three Kenyan
+Fides policies (plan 14's runtime prerequisites) — but seeds ZERO
+`privacycare_dsr_request` rows; the design doc's own baseline table says
+so directly ("DSR requests | 0"). This script REUSES, not duplicates,
+exactly the one piece of that prerequisite it actually needs:
+`dsr.timelines.seed_timelines(db)` (idempotent, ON CONFLICT DO NOTHING),
+called at the top of seed_dsr_requests() below, the same function
+seed_dsr.py itself calls. It deliberately does NOT call
+`dsr.delegation.ensure_kenyan_policies()` or `dsr.delegation.delegate()`
+— the live database already carries all three Kenyan policies (verified
+directly against it before writing this), but delegating would create a
+real Fides `privacyrequest` row per delegating right, which is a
+different capability (Fides executing the DSR) from the one D-SEED-8
+actually asks for (the register's OWN clocks and alerting having
+something true to compute against). Every request this script writes
+stays an open register row, exactly as `dsr.register.record_request`
+leaves it — never delegated, never decided.
+
+Seven requests, one per Kenyan right plus a second `access` request, are
+written through `dsr.register.record_request()` — the exact function
+`POST /api/v1/privacycare/dsr-requests` calls — with `received_at`
+backdated by a fixed number of days from the moment this script runs, so
+that `deadline_at` (computed and stored by record_request itself, per
+dsr/timelines.py's `deadline_for`) lands in a different place relative to
+`dsr/alerts.py`'s own `alert_due`/`warn_threshold` thresholds for each
+row:
+
+  access (7 days, warn threshold ceil(7/3)=3 days): 1 day old (6 days
+  left — comfortably inside) and 5 days old (2 days left — close to
+  breach, inside the warn threshold).
+  rectification (14 days, threshold 5): 10 days old (4 days left — close
+  to breach).
+  erasure (14 days, threshold 5): 17 days old (3 days OVERDUE — deadline
+  already passed).
+  restriction (14 days, threshold 5): 9 days old (5 days left — exactly
+  AT the warn threshold, a deliberate boundary case for "close to
+  breach").
+  portability (30 days, threshold 10): 5 days old (25 days left —
+  comfortably inside).
+  objection (unclocked — dsr/timelines.py's own `_TIMELINES` stores
+  `days=None` for it, OQ-PRIVACY-02 still open): received today.
+  `deadline_at` is NULL for this row regardless of its age, by
+  construction (deadline_for(received_at, None) is None) — the one
+  request D-SEED-8 explicitly asks for, to prove the unclocked case
+  renders as "no deadline", never a false one.
+
+This spread is measured against `dsr/alerts.py`'s REAL threshold function
+(warn_threshold = ceil(days_allowed / 3)), not guessed — the same
+discipline D-SEED-9 applies to the consent detector below, applied here
+first. Ages are computed relative to `datetime.now(timezone.utc)` AT THE
+MOMENT THE SCRIPT RUNS, not a hardcoded calendar date, so "close to
+breach" reads as close to breach on the day this seed is actually
+committed — exactly the design doc's own framing ("requests spread across
+those states... so the alerting has something true to say" is a
+statement about the day of the demo, not a permanent invariant a seed
+written months from now could still satisfy with the same fixed dates).
+
+REALISTIC KENYAN IDENTITIES, MARKED AS SYNTHETIC IN THE DATA ITSELF, NOT
+ONLY IN THIS DOCSTRING. `privacycare_dsr_request` (migration
+ff91bc4d23d9_dsr_register.py) has exactly one free-text column with no
+CHECK constraint and no NOT-NULL-with-a-real-meaning conflict:
+`subject_identifier` (`character varying(255)`, NOT NULL, the requester's
+own identity — the same field the mapping/screening tables' `features`/
+`tags`/`decided_by` play the marker role for, but a scalar string here,
+so the marker is APPENDED as a bracketed suffix, never substituted for
+the name). `owner_email` was ruled out for the same reason seed_demo.py's
+own docstring already rules out `decided_by` for a marker on the wrong
+table: it is read by alert_job.py as a real delivery address
+(`run_deadline_alerts`'s `recipient = row["owner_email"]`), and a marker
+string sitting there would misroute — or worse, silently "succeed" as a
+delivery target — an alert that is supposed to demonstrate the unowned/
+escalation path. `_dsr_subject_identifier()` below renders
+`"{name} — {contact} [privacycare:demo_seed — synthetic demo requester,
+not a real data subject]"` — a full Kenyan name and a phone number or
+`.invalid`-domain email (RFC 2606, the same reserved-for-fake-addresses
+convention DEMO_SUBJECT_EMAIL in seed_consent_demo.py already
+establishes) PLUS the same DEMO_FEATURE_MARKER this script already writes
+elsewhere, so a consultant reading the register row directly — not a
+design doc, not a code comment — sees both that Grace Wanjiru looks like
+a real Kenyan fuel-card customer AND that she explicitly is not one.
+DSR_REQUESTS below never uses "Test User", "foo", or placeholder text —
+every name, phone/email and one-line scenario (in DSR_REQUESTS' own
+`role_note`, documentation only, never written to the database) is
+purpose-written for a Kenyan petroleum marketer's actual customer and
+staff population, the same discipline SCREENING_DECISIONS' justifications
+already apply.
+
+Five of the seven are linked to one of Josephine's REAL business
+processes (via `_find_business_process_id`, already defined below,
+reused rather than re-implemented) — Fuel card application processing,
+Customer Loyalty Program Management, Employee Records Management, Driver
+& Transporter Records, M-Pesa Integration & Settlement, Digital Marketing
+Analytics — so `dsr.register.resolve_owner`'s
+`business_process`-sourced branch of D-DSR-8's fallback chain is
+demonstrable too, D-SEED-3 style (grounded in her real vocabularies).
+The erasure request (Peter Kamau) is deliberately left unlinked, with no
+explicit `owner_email` either, to demonstrate the OTHER end of that same
+chain — `configured_dpo` or `unassigned`, depending on whether
+`PRIVACYCARE_DPO_EMAIL` is set in the environment this script runs
+against — the "nobody owns this yet" state `alert_job.py`'s own
+`unowned` counter and escalation path exist to catch.
+
+Idempotent the same way seed_mappings() already is: keyed on an EXACT
+match against the full, deterministic `subject_identifier` string this
+script itself constructs for each DSR_REQUESTS entry (not the marker
+alone, which is shared across all seven and cannot distinguish them) —
+`_EXISTING_DEMO_DSR_REQUEST_SQL` below. A second call finds all seven and
+writes nothing.
+
+--- D-SEED-9: CONSENT THE STALE-CONSENT DETECTOR CAN ACTUALLY ACT ON -----
+
+consent/detector.py's own module docstring is unambiguous, and this
+script is written against what it actually says, not against the word
+"stale" taken at face value: `find_stale_consents` computes staleness
+from VERSION LAG, never from elapsed time — a subject's current
+`opt_in` position is stale exactly when the `privacynoticehistory`
+version they consented against is missing a `data_use` the LIVE version
+now carries (`consent/materiality.py`'s `is_materially_different` /
+`added_uses`, rule `gained_data_use`). There is no calendar threshold
+anywhere in that code path to guess at. So "fresh" here means "consented
+against the CURRENT live version" and "stale" means "consented against an
+EARLIER version that the live one has since outgrown" — not "consented
+N days ago" — and `received_at` on each new preference row below is set
+for narrative realism only (a demo viewer reading the finding's own
+timestamp), never because the detector reads it for this purpose (it
+does surface `received_at` on a StaleConsent result, but only as
+reported detail, never as a filter — see detector.py's own `StaleConsent`
+dataclass comment).
+
+REUSES, DOES NOT DUPLICATE, seed_consent_demo.py's own notice. This
+script does not create a second notice, a third history version, or its
+own copy of the encrypted-write dance — `seed_consent()` below loads
+scripts/privacycare/seed_consent_demo.py the same way
+tests/privacycare/test_seed_consent_demo.py and test_seed_demo.py already
+load a script under this package (which carries no `__init__.py`, so it
+is not an importable package — `importlib.util.spec_from_file_location`
+is the only way in), and calls its PUBLIC `seed_consent_demo(db)`
+directly. That call is itself idempotent and ensures three things exist
+before this script adds anything of its own: the one active
+`privacycare_consent_rule` row, the `privacycare_demo_fuel_card_marketing`
+notice, and both its history versions (v1: `marketing.advertising`
+only; v2 — the LIVE version — adds `marketing.advertising.third_party`).
+Its own pre-existing preference row (DEMO_SUBJECT_EMAIL, opted in at v1)
+is left exactly as seed_consent_demo.py made it; this script never
+selects, updates or deletes it — see "REMOVAL NEVER TOUCHES
+SEED_CONSENT_DEMO.PY'S OWN ROW" below.
+
+Two NEW preference rows are added, both through
+`PrivacyPreferenceHistory.create()` — never raw SQL — for the identical
+reason seed_consent_demo.py's own docstring gives ("The encryption trap"):
+`email` is a `StringEncryptedType` column, and only the ORM's
+create/persist_obj path actually encrypts it at rest; a raw INSERT would
+write plaintext where the decrypting type decorator expects ciphertext,
+and detector.py's own ORM-based identity read (necessary for the same
+reason) would then fail to recover it. One row (`alice.wambui...`,
+opt_in) is written against v2, the live version — FRESH, and provably
+excluded from `find_stale_consents`'s report, since `added_uses(v2, v2)`
+is empty. One row (`kevin.mutiso...`, opt_in) is written against v1 —
+STALE by the exact same version-lag test the pre-existing demo subject
+already demonstrates, giving the demo TWO stale findings instead of one
+and proving the detector's judgment is about the version gap, not about
+which particular subject happens to be seeded.
+
+THE MARKER, ON THE ONE UNENCRYPTED FREE-TEXT COLUMN THIS TABLE HAS.
+`privacypreferencehistory.url_recorded` (`ConsentReportingMixinV2`,
+`fides.api.models.privacy_preference`) is a plain `String` column — NOT
+one of the four `StringEncryptedType` identity columns
+(`ConsentIdentitiesMixin`) detector.py's own docstring warns raw SQL away
+from — and it plays no role `find_stale_consents`'s `StaleConsent` result
+ever surfaces (that dataclass reports `subject`/`subject_kind`/
+`notice_key`/`notice_name`/version numbers/`added_uses`/`preference`/
+`received_at` — never `url_recorded`), so writing DEMO_FEATURE_MARKER
+into it costs the demo nothing a viewer of the detector's OWN report
+would ever see, while giving `remove_demo()` an exact-match column to key
+its DELETE on: `WHERE url_recorded = :marker`. This script's two new rows
+carry it; seed_consent_demo.py's own pre-existing row does not (its own
+`PrivacyPreferenceHistory.create()` call never sets `url_recorded`, so it
+reads NULL) — the one fact `remove_demo()`'s own SELECT depends on to
+leave that row alone. Idempotent the same way DSR requests are: keyed on
+an exact `(url_recorded, privacy_notice_history_id)` match, since the two
+new rows point at different history versions (v1 vs v2) and that pair is
+fully deterministic per entry.
+
+REMOVAL NEVER TOUCHES SEED_CONSENT_DEMO.PY'S OWN ROW, ITS NOTICE, ITS
+VERSIONS, OR ITS RULE ROW. remove_demo()'s new DELETEs are scoped to
+`privacycare_dsr_request` (by `subject_identifier LIKE
+'%privacycare:demo_seed%'`) and `privacypreferencehistory` (by
+`url_recorded = 'privacycare:demo_seed'`) ONLY — exactly the two tables
+this task's own two new write functions create rows in. `privacynotice`,
+`noticetranslation`, `privacynoticehistory` and `privacycare_consent_rule`
+are never selected, updated or deleted by this script at all, in either
+mode: they are seed_consent_demo.py's own tables to own, and this task's
+job is to ADD demonstrable preference rows against what it already built,
+not to take over its removal path too.
 """
 import argparse
+import importlib.util
 import os
+import pathlib
 import sys
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy
 from sqlalchemy.engine.url import make_url
@@ -234,6 +442,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import fides.api.db.base  # noqa: F401 — see below
+from fides.api.models.privacy_preference import PrivacyPreferenceHistory
+from fides.api.privacycare.dsr import register as dsr_register
+from fides.api.privacycare.dsr.timelines import seed_timelines
 from fides.api.privacycare.screening import gate
 from fides.api.privacycare.screening import mapping as mapping_module
 
@@ -244,6 +455,9 @@ from fides.api.privacycare.screening import mapping as mapping_module
 # System/PrivacyDeclaration-adjacent relationships indirectly through raw
 # SQL joins, and this import removes any risk of a mapper-configuration
 # ordering failure the first time those relationships are touched.
+# PrivacyPreferenceHistory is imported directly (not only reached through
+# seed_consent_demo.py's loaded module) because this script's own two new
+# preference rows (see "D-SEED-9" above) are written through it too.
 
 # --- The marker -------------------------------------------------------------
 
@@ -1130,6 +1344,106 @@ MAPPINGS: tuple[dict, ...] = (
 )
 
 
+# --- DSR requests: one per Kenyan right, spread across the alerting states -
+#
+# Each entry: process — one of Josephine's REAL business processes (or None,
+# left deliberately unlinked — see this module's own docstring, "D-SEED-8"),
+# right — one of dsr.timelines.KENYAN_RIGHTS, name/contact — a realistic
+# Kenyan requester identity (never written verbatim: _dsr_subject_identifier
+# below appends the demo marker), role_note — documentation only, never
+# written to the database, days_ago — how many days before this script runs
+# the request was "received", which this module's own docstring works out
+# against dsr/alerts.py's REAL warn_threshold for each right's clock.
+DSR_REQUESTS: tuple[dict, ...] = (
+    {
+        "process": "Fuel card application processing",
+        "right": "access",
+        "name": "Grace Wanjiru",
+        "contact": "+254 712 345 678",
+        "role_note": "fuel card customer requesting a copy of the personal "
+        "data collected on her card application",
+        "days_ago": 1,  # comfortably inside a 7-day clock (6 days left)
+    },
+    {
+        "process": "Customer Loyalty Program Management",
+        "right": "access",
+        "name": "Brian Otieno",
+        "contact": "+254 733 987 654",
+        "role_note": "loyalty programme member requesting his purchase "
+        "history held under the programme",
+        "days_ago": 5,  # close to breach on a 7-day clock (2 days left)
+    },
+    {
+        "process": "Employee Records Management",
+        "right": "rectification",
+        "name": "Mercy Achieng",
+        "contact": "mercy.achieng.hr@example.invalid",
+        "role_note": "payroll employee correcting a transposed digit in "
+        "her KRA PIN as recorded in her HR file",
+        "days_ago": 10,  # close to breach on a 14-day clock (4 days left)
+    },
+    {
+        "process": None,  # deliberately unlinked — see this module's docstring
+        "right": "erasure",
+        "name": "Peter Kamau",
+        "contact": "+254 701 222 333",
+        "role_note": "former call-centre caller asking for his recorded "
+        "call history to be deleted now that the matter is closed",
+        "days_ago": 17,  # OVERDUE on a 14-day clock (3 days past deadline)
+    },
+    {
+        "process": "Driver & Transporter Records",
+        "right": "restriction",
+        "name": "Samuel Kiptoo",
+        "contact": "+254 720 456 789",
+        "role_note": "contracted driver asking that his GPS movement logs "
+        "not be used while a grievance about his last route is open",
+        "days_ago": 9,  # AT the warn threshold on a 14-day clock (5 left)
+    },
+    {
+        "process": "M-Pesa Integration & Settlement",
+        "right": "portability",
+        "name": "Faith Nyambura",
+        "contact": "+254 798 111 222",
+        "role_note": "M-Pesa wallet customer requesting her transaction "
+        "history in a portable format to switch service providers",
+        "days_ago": 5,  # comfortably inside a 30-day clock (25 days left)
+    },
+    {
+        "process": "Digital Marketing Analytics",
+        "right": "objection",
+        "name": "Daniel Mwangi",
+        "contact": "+254 711 654 321",
+        "role_note": "customer objecting to being profiled for targeted "
+        "marketing based on his fuel purchase history",
+        "days_ago": 0,  # unclocked — must show NO deadline regardless of age
+    },
+)
+
+
+# --- Consent: one fresh, one stale, against seed_consent_demo.py's own notice
+#
+# "fresh"/"stale" here means version lag against the LIVE notice version,
+# never elapsed time — see this module's own docstring, "D-SEED-9", for why.
+# `version` selects which of seed_consent_demo.py's own two history ids
+# (v1 or v2, both already live in the database before this script ever
+# runs) the new preference row is recorded against.
+CONSENT_ADDITIONS: tuple[dict, ...] = (
+    {
+        "label": "fresh",
+        "email": "alice.wambui.consent@example.invalid",
+        "version": "v2",  # the LIVE version — not stale, provably
+        "days_old": 2,  # narrative only; the detector never reads this
+    },
+    {
+        "label": "stale",
+        "email": "kevin.mutiso.consent@example.invalid",
+        "version": "v1",  # missing marketing.advertising.third_party
+        "days_old": 400,  # narrative only; the detector never reads this
+    },
+)
+
+
 def _database_url() -> str:
     # Copied from scripts/privacycare/seed_dsr.py's _database_url()
     # verbatim (same precedence, same env vars, same defaults) rather than
@@ -1329,15 +1643,178 @@ def seed_mappings(db: Session) -> dict:
     }
 
 
+# --- DSR requests (D-SEED-8) ------------------------------------------
+
+
+def _dsr_subject_identifier(name: str, contact: str) -> str:
+    """Renders a DSR_REQUESTS entry's identity as the one string that goes
+    into `subject_identifier` — a realistic Kenyan name and contact detail,
+    with DEMO_FEATURE_MARKER appended as a bracketed, self-disclosing
+    suffix. See this module's own docstring, "D-SEED-8", for why
+    subject_identifier (not owner_email or decided_by) carries the marker
+    on this table. Deterministic per (name, contact) pair — the same
+    string this script's own idempotency check
+    (_EXISTING_DEMO_DSR_REQUEST_SQL) keys an exact match on."""
+    return (
+        f"{name} — {contact} "
+        f"[{DEMO_FEATURE_MARKER} — synthetic demo requester, not a real "
+        "data subject]"
+    )
+
+
+_EXISTING_DEMO_DSR_REQUEST_SQL = sqlalchemy.text(
+    "SELECT id FROM privacycare_dsr_request WHERE subject_identifier = :subject_identifier"
+)
+
+
+def seed_dsr_requests(db: Session) -> dict:
+    """Writes every DSR_REQUESTS entry whose exact subject_identifier isn't
+    already on the register, through dsr.register.record_request() — never
+    a raw INSERT into privacycare_dsr_request (mirrors this module's own
+    "GOES THROUGH THE PRODUCT'S OWN CODE PATH" rule for screening/mapping).
+    Calls dsr.timelines.seed_timelines(db) first — idempotent, reused
+    directly from the same module seed_dsr.py itself calls, never
+    duplicated — because record_request() raises if
+    privacycare_dsr_timeline has no row for a right at all (an unseeded
+    database, distinct from objection's real, seeded NULL). Never
+    delegates (see this module's own docstring for why). Never commits —
+    the caller's session boundary decides.
+    """
+    seed_timelines(db)
+
+    now = datetime.now(timezone.utc)
+    written = 0
+    skipped = 0
+    for entry in DSR_REQUESTS:
+        subject_identifier = _dsr_subject_identifier(entry["name"], entry["contact"])
+        existing = db.execute(
+            _EXISTING_DEMO_DSR_REQUEST_SQL,
+            {"subject_identifier": subject_identifier},
+        ).scalar()
+        if existing is not None:
+            skipped += 1
+            continue
+
+        business_process_id = (
+            _find_business_process_id(db, entry["process"])
+            if entry["process"]
+            else None
+        )
+        received_at = now - timedelta(days=entry["days_ago"])
+        dsr_register.record_request(
+            db,
+            right=entry["right"],
+            subject_identifier=subject_identifier,
+            business_process_id=business_process_id,
+            received_at=received_at,
+        )
+        written += 1
+
+    return {"dsr_requests_written": written, "dsr_requests_skipped": skipped}
+
+
+# --- Consent (D-SEED-9) -------------------------------------------------
+
+_SEED_CONSENT_DEMO_PATH = (
+    pathlib.Path(__file__).resolve().parent / "seed_consent_demo.py"
+)
+_seed_consent_demo_module_cache = None
+
+
+def _seed_consent_demo_module():
+    """Loads scripts/privacycare/seed_consent_demo.py the same way
+    tests/privacycare/test_seed_consent_demo.py and test_seed_demo.py
+    already load a script from this package — scripts/privacycare carries
+    no __init__.py, so `import seed_consent_demo` is not available, and
+    `importlib.util.spec_from_file_location` is the established way in.
+    Cached at module scope: seed_demo()/seed_consent() may each be called
+    more than once in one process (this script's own idempotency tests do
+    exactly that), and re-executing the module body every call would be
+    wasted work — seed_consent_demo.py has no import-time side effect
+    beyond def/constant statements, so caching changes nothing but cost.
+    """
+    global _seed_consent_demo_module_cache
+    if _seed_consent_demo_module_cache is None:
+        spec = importlib.util.spec_from_file_location(
+            "privacycare_seed_consent_demo", _SEED_CONSENT_DEMO_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _seed_consent_demo_module_cache = module
+    return _seed_consent_demo_module_cache
+
+
+_EXISTING_DEMO_PREFERENCE_SQL = sqlalchemy.text(
+    "SELECT id FROM privacypreferencehistory "
+    "WHERE url_recorded = :marker AND privacy_notice_history_id = :history_id "
+    "LIMIT 1"
+)
+
+
+def seed_consent(db: Session) -> dict:
+    """Ensures seed_consent_demo.py's own rule/notice/versions/preference
+    exist (idempotent — reused via its own public seed_consent_demo(db),
+    never duplicated), then adds this script's own two NEW preference rows
+    (one against v2, the live version — fresh; one against v1 — stale) —
+    both through PrivacyPreferenceHistory.create(), never raw SQL, for the
+    same encryption reason seed_consent_demo.py's own module docstring
+    gives. Idempotent on an exact (url_recorded, privacy_notice_history_id)
+    match. Never commits itself — but see this module's own docstring,
+    "SCREENING AND MAPPING ARE RAW SQL; DSR AND CONSENT ARE NOT": the ORM
+    create() calls inside this function DO call persist_obj's own
+    unconditional db.commit(), which main() below absorbs into a flush for
+    the duration of the whole seed/remove call, the same guard seed_dsr.py
+    and seed_consent_demo.py's own main() already rely on.
+    """
+    demo_consent = _seed_consent_demo_module()
+    base = demo_consent.seed_consent_demo(db)
+    history_ids = {"v1": base["v1_id"], "v2": base["v2_id"]}
+
+    now = datetime.now(timezone.utc)
+    written = 0
+    skipped = 0
+    for entry in CONSENT_ADDITIONS:
+        history_id = history_ids[entry["version"]]
+        existing = db.execute(
+            _EXISTING_DEMO_PREFERENCE_SQL,
+            {"marker": DEMO_FEATURE_MARKER, "history_id": history_id},
+        ).scalar()
+        if existing is not None:
+            skipped += 1
+            continue
+
+        PrivacyPreferenceHistory.create(
+            db,
+            data={
+                "preference": "opt_in",
+                "privacy_notice_history_id": history_id,
+                "email": entry["email"],
+                "url_recorded": DEMO_FEATURE_MARKER,
+                "received_at": now - timedelta(days=entry["days_old"]),
+            },
+            check_name=False,
+        )
+        written += 1
+
+    return {
+        "consent_preferences_written": written,
+        "consent_preferences_skipped": skipped,
+    }
+
+
 def seed_demo(db: Session) -> dict:
-    """Screening decisions, then data mappings — mappings depend on nothing
-    screening writes, but the design doc's own decision order (D-SEED-4
-    before D-SEED-5's mappings) is followed here too, so a partial run's
-    own log reads in the same order a consultant would work through it by
-    hand. Never commits — the caller's session boundary decides.
+    """Screening decisions, then data mappings, then DSR requests, then
+    consent — mappings depend on nothing screening writes and DSR/consent
+    depend on nothing either of the first two write, but the design doc's
+    own decision order (D-SEED-4 before D-SEED-5's mappings, D-SEED-8
+    before D-SEED-9) is followed here too, so a partial run's own log
+    reads in the same order a consultant would work through it by hand.
+    Never commits — the caller's session boundary decides.
     """
     summary = seed_screening_decisions(db)
     summary.update(seed_mappings(db))
+    summary.update(seed_dsr_requests(db))
+    summary.update(seed_consent(db))
     return summary
 
 
@@ -1377,6 +1854,35 @@ _DELETE_SCREENING_DECISIONS_SQL = sqlalchemy.text(
     "DELETE FROM privacycare_screening_decision WHERE decided_by = :decided_by"
 )
 
+# DSR requests (D-SEED-8): scoped by a LIKE match on subject_identifier —
+# the one exact-equality trick the other tables' array columns use
+# (`:marker = ANY(features)`) doesn't apply to a scalar free-text column
+# whose content also varies per row (name and contact differ every time).
+# The pattern still anchors on the FULL literal marker string
+# ("privacycare:demo_seed", never a fragment of it), so this is a marker
+# match, not a guess at ids or a date range. privacycare_dsr_alert rows
+# cascade automatically (migration 3a48cbf9edc3_dsr_alert.py:
+# ondelete='CASCADE' on dsr_request_id) — no explicit DELETE needed here.
+_SELECT_DEMO_DSR_REQUEST_IDS_SQL = sqlalchemy.text(
+    "SELECT id FROM privacycare_dsr_request WHERE subject_identifier LIKE :pattern"
+)
+_DELETE_DSR_REQUEST_SQL = sqlalchemy.text(
+    "DELETE FROM privacycare_dsr_request WHERE id = ANY(:ids)"
+)
+
+# Consent (D-SEED-9): scoped by an EXACT match on url_recorded — the one
+# unencrypted free-text column this script writes DEMO_FEATURE_MARKER into
+# (see this module's own docstring, "THE MARKER, ON THE ONE UNENCRYPTED
+# FREE-TEXT COLUMN THIS TABLE HAS"). seed_consent_demo.py's own
+# pre-existing preference row never sets url_recorded (NULL), so it is
+# never selected here.
+_SELECT_DEMO_PREFERENCE_IDS_SQL = sqlalchemy.text(
+    "SELECT id FROM privacypreferencehistory WHERE url_recorded = :marker"
+)
+_DELETE_PREFERENCE_SQL = sqlalchemy.text(
+    "DELETE FROM privacypreferencehistory WHERE id = ANY(:ids)"
+)
+
 
 def remove_demo(db: Session) -> dict:
     """Deletes every row this script (or an earlier run of it) marked —
@@ -1385,16 +1891,19 @@ def remove_demo(db: Session) -> dict:
     range, no "everything created today" — the brief's own words: "a
     removal that guesses will one day delete something of hers." The 2
     pre-existing demonstration decisions, 4 processing activities, 5
-    links, 3 systems and 3 risks the demo-rows inventory documents carry
-    NEITHER marker and are never selected by any query here.
+    links, 3 systems and 3 risks the demo-rows inventory documents, PLUS
+    seed_consent_demo.py's own pre-existing preference row (and its notice,
+    versions and rule row), carry NEITHER marker and are never selected by
+    any query here — see this module's own docstring, "REMOVAL NEVER
+    TOUCHES SEED_CONSENT_DEMO.PY'S OWN ROW...".
 
     Deletion order respects the FK/no-FK shape measured against the live
     schema (see each DELETE statement's own comment): declaration_ground
     (no FK) and process_declaration links (no FK) before the declaration
     itself; the declaration (NO ACTION FK to ctl_systems) before the
-    system. Screening decisions have no dependency on any of the above and
-    are removed independently. Never commits — the caller's session
-    boundary decides.
+    system. Screening decisions, DSR requests and consent preferences have
+    no dependency on any of the above (or on each other) and are removed
+    independently. Never commits — the caller's session boundary decides.
     """
     declaration_ids = [
         row[0]
@@ -1434,12 +1943,39 @@ def remove_demo(db: Session) -> dict:
         _DELETE_SCREENING_DECISIONS_SQL, {"decided_by": DECIDED_BY_MARKER}
     ).rowcount
 
+    dsr_request_ids = [
+        row[0]
+        for row in db.execute(
+            _SELECT_DEMO_DSR_REQUEST_IDS_SQL,
+            {"pattern": f"%{DEMO_FEATURE_MARKER}%"},
+        ).all()
+    ]
+    dsr_requests_removed = 0
+    if dsr_request_ids:
+        dsr_requests_removed = db.execute(
+            _DELETE_DSR_REQUEST_SQL, {"ids": dsr_request_ids}
+        ).rowcount
+
+    preference_ids = [
+        row[0]
+        for row in db.execute(
+            _SELECT_DEMO_PREFERENCE_IDS_SQL, {"marker": DEMO_FEATURE_MARKER}
+        ).all()
+    ]
+    preferences_removed = 0
+    if preference_ids:
+        preferences_removed = db.execute(
+            _DELETE_PREFERENCE_SQL, {"ids": preference_ids}
+        ).rowcount
+
     return {
         "decisions_removed": decisions_removed,
         "declarations_removed": declarations_removed,
         "links_removed": links_removed,
         "grounds_removed": grounds_removed,
         "systems_removed": systems_removed,
+        "dsr_requests_removed": dsr_requests_removed,
+        "preferences_removed": preferences_removed,
     }
 
 
@@ -1467,6 +2003,19 @@ _COUNTS_SQL = {
     ),
     "dpia_risk_total": "SELECT count(*) FROM privacycare_dpia_risk",
     "privacy_assessment_total": "SELECT count(*) FROM privacy_assessment",
+    "dsr_requests_total": "SELECT count(*) FROM privacycare_dsr_request",
+    "dsr_requests_open": (
+        "SELECT count(*) FROM privacycare_dsr_request WHERE status = 'open'"
+    ),
+    "privacypreferencehistory_total": (
+        "SELECT count(*) FROM privacypreferencehistory"
+    ),
+    # Context only, never touched by this script — proves seed_consent_demo.py's
+    # own rule/notice rows survive this task's seed/remove cycle untouched.
+    "privacycare_consent_rule_total": (
+        "SELECT count(*) FROM privacycare_consent_rule"
+    ),
+    "privacynotice_total": "SELECT count(*) FROM privacynotice",
 }
 
 
@@ -1498,6 +2047,17 @@ def gather_counts(db: Session) -> dict:
         ),
         {"decided_by": DECIDED_BY_MARKER},
     ).scalar()
+    counts["dsr_requests_demo_marked"] = len(
+        db.execute(
+            _SELECT_DEMO_DSR_REQUEST_IDS_SQL,
+            {"pattern": f"%{DEMO_FEATURE_MARKER}%"},
+        ).all()
+    )
+    counts["privacypreferencehistory_demo_marked"] = len(
+        db.execute(
+            _SELECT_DEMO_PREFERENCE_IDS_SQL, {"marker": DEMO_FEATURE_MARKER}
+        ).all()
+    )
     return counts
 
 
@@ -1516,6 +2076,13 @@ def _print_counts(counts: dict) -> None:
         "demo_marked_declarations",
         "demo_marked_systems",
         "demo_marked_decisions",
+        "dsr_requests_total",
+        "dsr_requests_open",
+        "dsr_requests_demo_marked",
+        "privacypreferencehistory_total",
+        "privacypreferencehistory_demo_marked",
+        "privacycare_consent_rule_total",
+        "privacynotice_total",
     ):
         print(f"  {key}: {counts[key]}")
 
@@ -1534,6 +2101,16 @@ def _print_seed_summary(summary: dict) -> None:
         f"skipped (already mapped by this seed): {summary['mappings_skipped']}; "
         f"systems provisioned and marked: {summary['systems_marked']}"
     )
+    print(
+        "DSR requests written: "
+        f"{summary['dsr_requests_written']}; "
+        f"skipped (already on the register): {summary['dsr_requests_skipped']}"
+    )
+    print(
+        "consent preferences written: "
+        f"{summary['consent_preferences_written']}; "
+        f"skipped (already recorded): {summary['consent_preferences_skipped']}"
+    )
 
 
 def _print_removal_summary(summary: dict) -> None:
@@ -1543,19 +2120,27 @@ def _print_removal_summary(summary: dict) -> None:
         f"data mappings: {summary['declarations_removed']}, "
         f"process-declaration links: {summary['links_removed']}, "
         f"declaration grounds: {summary['grounds_removed']}, "
-        f"systems: {summary['systems_removed']}"
+        f"systems: {summary['systems_removed']}, "
+        f"DSR requests: {summary['dsr_requests_removed']}, "
+        f"consent preferences: {summary['preferences_removed']}"
     )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Seed the PrivacyCare DPIA-spine demo data: screening "
-        "decisions on 38 business processes (23 applicable, 15 not "
-        "applicable, spread across business cycles) and a data mapping "
-        "for each of the 24 applicable processes lacking one. Every row "
-        "carries the 'privacycare:demo_seed' marker (privacydeclaration."
-        "features / ctl_systems.tags / privacycare_screening_decision."
-        "decided_by) and is fully removable with --remove."
+        description="Seed the PrivacyCare demo data: screening decisions "
+        "on 38 business processes (23 applicable, 15 not applicable, "
+        "spread across business cycles), a data mapping for each of the "
+        "24 applicable processes lacking one, 7 DSR requests spread across "
+        "the Kenyan clocks' alerting states (comfortably inside, close to "
+        "breach, overdue, and one unclocked objection), and 2 consent "
+        "preferences (one fresh, one stale) against seed_consent_demo.py's "
+        "own notice. Every row carries the 'privacycare:demo_seed' marker "
+        "(privacydeclaration.features / ctl_systems.tags / "
+        "privacycare_screening_decision.decided_by / "
+        "privacycare_dsr_request.subject_identifier / "
+        "privacypreferencehistory.url_recorded) and is fully removable "
+        "with --remove."
     )
     parser.add_argument(
         "--commit",
@@ -1590,6 +2175,20 @@ def main(argv: list[str]) -> int:
     # try/finally gets the same close-on-exit guarantee without tripping it.
     db = Session(engine)
     try:
+        # See this module's own docstring, "SCREENING AND MAPPING ARE RAW
+        # SQL; DSR AND CONSENT ARE NOT": seed_consent()'s ORM writes
+        # (PrivacyPreferenceHistory.create, both its own and
+        # seed_consent_demo.py's) go through Fides' base_class.persist_obj,
+        # which calls db.commit() UNCONDITIONALLY. Absorbing that into a
+        # flush for the duration of the seed/remove call is the exact
+        # pattern seed_dsr.py's and seed_consent_demo.py's own main()
+        # already use — restored immediately after (success or failure
+        # alike), so the REAL db.commit()/db.rollback() below (driven by
+        # args.commit) is what actually decides whether anything survives.
+        # Harmless for remove_demo() and the screening/mapping/DSR paths,
+        # which are all raw SQL with no persist_obj call to trip.
+        real_commit = db.commit
+        db.commit = db.flush  # type: ignore[method-assign]
         try:
             if args.remove:
                 print("mode: REMOVE")
@@ -1598,6 +2197,7 @@ def main(argv: list[str]) -> int:
                 print("mode: SEED")
                 summary = seed_demo(db)
         except ValueError as exc:
+            db.commit = real_commit  # type: ignore[method-assign]
             db.rollback()
             print(str(exc), file=sys.stderr)
             return 1
@@ -1610,6 +2210,7 @@ def main(argv: list[str]) -> int:
             # own handler guards against. Only the exception's class name
             # and the already-safe target line's contents (host/port/db,
             # never the password) go to stderr.
+            db.commit = real_commit  # type: ignore[method-assign]
             try:
                 db.rollback()
             except SQLAlchemyError:
@@ -1621,6 +2222,7 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 1
+        db.commit = real_commit  # type: ignore[method-assign]
 
         if args.remove:
             _print_removal_summary(summary)

@@ -29,19 +29,37 @@ this script created.
 Same fixture shape as test_seed_screening_triggers.py: `db` monkeypatches
 session.commit to session.flush and always rolls back at the end, so
 nothing any test below does is ever permanent — including calls to
-seed_demo() and remove_demo() themselves, both of which are pure raw SQL
-with no ORM persist_obj call to trip (see seed_demo.py's own module
-docstring, "NO ORM WRITES, SO NO COMMIT TRAP").
+seed_demo() and remove_demo() themselves. Screening and mapping are pure
+raw SQL with no ORM persist_obj call to trip; DSR requests are raw SQL
+too (dsr.register.record_request). Consent is the one exception —
+seed_consent() calls PrivacyPreferenceHistory.create(), which DOES call
+persist_obj's own unconditional db.commit() — but the `db` fixture's own
+monkeypatch already absorbs that into a flush, the same guard seed_demo.py's
+own main() now carries for real (see seed_demo.py's own module docstring,
+"SCREENING AND MAPPING ARE RAW SQL; DSR AND CONSENT ARE NOT").
+
+DSR/CONSENT ADDITIONS (D-SEED-8/D-SEED-9) ARE ALSO DB-STATE-INDEPENDENT.
+The live database already carries 0 `privacycare_dsr_request` rows and
+exactly 1 pre-existing `privacypreferencehistory` row (seed_consent_demo.py's
+own DEMO_SUBJECT_EMAIL, opted in at v1) before this task's own `--commit`
+lands, same as the DPIA-spine counts above — so these tests use the same
+`written + skipped == N` and marker-scoped-count idioms, not a bare count
+against an assumed-empty table.
 """
 import importlib.util
 import os
 import pathlib
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import pytest
 import sqlalchemy
 from sqlalchemy.orm import Session
+
+from fides.api.privacycare.consent.detector import find_stale_consents
+from fides.api.privacycare.dsr.alerts import alert_due
+from fides.api.privacycare.dsr.timelines import KENYAN_RIGHTS, timeline_days
 
 DB_URL = "postgresql://postgres:fides@127.0.0.1:5442/fides"
 
@@ -337,12 +355,21 @@ def test_seed_demo_then_seed_demo_again_writes_nothing_the_second_time(db):
     first = cli.seed_demo(db)
     assert first["decisions_written"] + first["decisions_skipped"] == 38
     assert first["mappings_written"] + first["mappings_skipped"] == 23
+    assert first["dsr_requests_written"] + first["dsr_requests_skipped"] == 7
+    assert (
+        first["consent_preferences_written"] + first["consent_preferences_skipped"]
+        == 2
+    )
 
     second = cli.seed_demo(db)
     assert second["decisions_written"] == 0
     assert second["decisions_skipped"] == 38
     assert second["mappings_written"] == 0
     assert second["mappings_skipped"] == 23
+    assert second["dsr_requests_written"] == 0
+    assert second["dsr_requests_skipped"] == 7
+    assert second["consent_preferences_written"] == 0
+    assert second["consent_preferences_skipped"] == 2
 
 
 def test_seed_then_remove_returns_every_count_to_its_pre_seed_value(db):
@@ -374,6 +401,15 @@ def test_seed_then_remove_returns_every_count_to_its_pre_seed_value(db):
     after_seed = cli.gather_counts(db)
     assert after_seed["demo_marked_declarations"] == 23
     assert after_seed["demo_marked_decisions"] == 38
+    assert after_seed["dsr_requests_demo_marked"] == 7
+    assert after_seed["privacypreferencehistory_demo_marked"] == 2
+    # seed_consent_demo.py's own pre-existing row is the +1 this script
+    # never creates and never removes — proved directly, not just via the
+    # round-trip equality below.
+    assert (
+        after_seed["privacypreferencehistory_total"]
+        == before["privacypreferencehistory_total"] + 2
+    )
 
     cli.remove_demo(db)
     after_remove = cli.gather_counts(db)
@@ -384,11 +420,36 @@ def test_seed_then_remove_returns_every_count_to_its_pre_seed_value(db):
 def test_remove_never_touches_prior_art_rows(db):
     """The single highest-stakes assertion in this file: the 2 pre-existing
     demonstration decisions and 4 processing activities / 3 systems from
-    plan 20 Task 5 carry NEITHER marker this script uses, and must survive
-    seed_demo() + remove_demo() by id, not just by count."""
+    plan 20 Task 5 — PLUS seed_consent_demo.py's own pre-existing
+    preference row — carry NEITHER marker this script uses, and must
+    survive seed_demo() + remove_demo() by id, not just by count."""
     cli = _load_cli()
+
+    # Captured BEFORE this test's own seed_demo() call, identified the same
+    # way remove_demo() itself would never select it: no DEMO_FEATURE_MARKER
+    # in url_recorded. There is exactly one such row in the live database
+    # (seed_consent_demo.py's own DEMO_SUBJECT_EMAIL preference).
+    prior_art_preference_ids = [
+        row[0]
+        for row in db.execute(
+            sqlalchemy.text(
+                "SELECT id FROM privacypreferencehistory WHERE url_recorded IS NULL"
+            )
+        ).all()
+    ]
+    assert len(prior_art_preference_ids) == 1
+
     cli.seed_demo(db)
     cli.remove_demo(db)
+
+    for preference_id in prior_art_preference_ids:
+        row = db.execute(
+            sqlalchemy.text(
+                "SELECT id FROM privacypreferencehistory WHERE id = :id"
+            ),
+            {"id": preference_id},
+        ).first()
+        assert row is not None, preference_id
 
     for decision_id in _PRIOR_ART_DECISION_IDS:
         row = db.execute(
@@ -487,3 +548,195 @@ def test_gather_counts_matches_forty_decided_after_a_fresh_seed(db):
     ).scalar()
     assert total_processes == 87
     assert total_processes - counts["screening_decisions_total"] == 47
+
+
+# --- DSR requests (D-SEED-8) --------------------------------------------
+
+
+def test_dsr_requests_are_idempotent_by_exact_subject_identifier(db):
+    """The DSR analogue of test_seed_demo_then_seed_demo_again... above,
+    but calling seed_dsr_requests() directly so a failure here can't be
+    confused with a screening/mapping regression."""
+    cli = _load_cli()
+    first = cli.seed_dsr_requests(db)
+    assert first["dsr_requests_written"] == 7
+    assert first["dsr_requests_skipped"] == 0
+
+    second = cli.seed_dsr_requests(db)
+    assert second["dsr_requests_written"] == 0
+    assert second["dsr_requests_skipped"] == 7
+
+
+def test_dsr_requests_span_all_six_kenyan_rights_with_objection_unclocked(db):
+    """D-SEED-8's own spread requirement, proved against the live register:
+    all six Kenyan rights are represented (access appears twice), and the
+    objection row's deadline_at is NULL — the one request D-SEED-8 asks for
+    explicitly, to prove the unclocked case renders as "no deadline", never
+    a false one."""
+    cli = _load_cli()
+    cli.seed_dsr_requests(db)
+
+    rows = db.execute(
+        sqlalchemy.text(
+            "SELECT \"right\", deadline_at FROM privacycare_dsr_request "
+            "WHERE subject_identifier LIKE :pattern"
+        ),
+        {"pattern": f"%{cli.DEMO_FEATURE_MARKER}%"},
+    ).all()
+    assert len(rows) == 7
+
+    rights_seen = {row[0] for row in rows}
+    assert rights_seen == set(KENYAN_RIGHTS)
+
+    objection_rows = [row for row in rows if row[0] == "objection"]
+    assert len(objection_rows) == 1
+    assert objection_rows[0][1] is None  # deadline_at
+
+
+def test_dsr_requests_demonstrate_comfortably_inside_close_to_breach_and_overdue(db):
+    """Proves the spread against dsr/alerts.py's REAL warn_threshold, not a
+    guess at it — the same discipline this module's own docstring applies
+    to D-SEED-9's consent detector, applied here to D-SEED-8's alerting."""
+    cli = _load_cli()
+    cli.seed_dsr_requests(db)
+    now = datetime.now(timezone.utc)
+
+    rows = db.execute(
+        sqlalchemy.text(
+            "SELECT \"right\", deadline_at FROM privacycare_dsr_request "
+            "WHERE subject_identifier LIKE :pattern"
+        ),
+        {"pattern": f"%{cli.DEMO_FEATURE_MARKER}%"},
+    ).all()
+
+    kinds = set()
+    unclocked_present = False
+    for right, deadline_at in rows:
+        if deadline_at is None:
+            unclocked_present = True
+            continue
+        days_allowed = timeline_days(db, right)
+        kind = alert_due(
+            deadline_at=deadline_at,
+            days_allowed=days_allowed,
+            now=now,
+            already_sent=frozenset(),
+        )
+        kinds.add(kind)  # None ("comfortably inside"), "approaching", "breached"
+
+    assert None in kinds  # at least one comfortably inside
+    assert "approaching" in kinds  # at least one close to breach
+    assert "breached" in kinds  # at least one overdue
+    assert unclocked_present  # the objection row
+
+
+def test_dsr_requests_are_realistic_kenyan_identities_not_placeholders(db):
+    """"Never Test User 1, foo, or lorem ipsum" (the brief's own words),
+    and every identity carries a full name plus a contact detail — checked
+    against DSR_REQUESTS itself (the source of truth this module's
+    docstring documents), not against a second, hand-typed copy."""
+    cli = _load_cli()
+    _forbidden = ("test user", "foo", "lorem", "ipsum", "placeholder", "example user")
+    for entry in cli.DSR_REQUESTS:
+        name_lower = entry["name"].lower()
+        for bad in _forbidden:
+            assert bad not in name_lower, entry["name"]
+        assert " " in entry["name"].strip()  # a full name, not a single token
+        assert entry["contact"]  # a phone number or email, never blank
+
+        subject_identifier = cli._dsr_subject_identifier(
+            entry["name"], entry["contact"]
+        )
+        assert cli.DEMO_FEATURE_MARKER in subject_identifier
+        assert "synthetic demo requester" in subject_identifier
+
+
+def test_dsr_erasure_request_is_left_unlinked_demonstrating_the_unowned_path(db):
+    """Peter Kamau's erasure request carries no business_process_id and no
+    explicit owner_email — demonstrating dsr.register.resolve_owner's
+    configured_dpo/unassigned branch and alert_job.py's own "unowned"
+    counter, the other end of D-DSR-8's fallback chain from the five
+    business-process-linked requests."""
+    cli = _load_cli()
+    cli.seed_dsr_requests(db)
+
+    row = db.execute(
+        sqlalchemy.text(
+            "SELECT business_process_id, owner_source FROM privacycare_dsr_request "
+            "WHERE \"right\" = 'erasure' AND subject_identifier LIKE :pattern"
+        ),
+        {"pattern": f"%{cli.DEMO_FEATURE_MARKER}%"},
+    ).first()
+    assert row is not None
+    assert row[0] is None  # business_process_id
+    assert row[1] in ("configured_dpo", "unassigned")  # owner_source
+
+
+def test_remove_dsr_pattern_anchors_on_the_full_marker_not_a_fragment(db):
+    """The DSR analogue of test_remove_is_exact_marker_match_not_a_substring:
+    the LIKE pattern is built from the FULL literal DEMO_FEATURE_MARKER,
+    never a fragment of it, so this remains a marker match, not a guess."""
+    cli = _load_cli()
+    compiled = str(cli._SELECT_DEMO_DSR_REQUEST_IDS_SQL)
+    assert "subject_identifier LIKE :pattern" in compiled
+    assert cli.DEMO_FEATURE_MARKER == "privacycare:demo_seed"
+
+
+# --- Consent (D-SEED-9) --------------------------------------------------
+
+
+def test_consent_seed_is_idempotent(db):
+    cli = _load_cli()
+    first = cli.seed_consent(db)
+    assert first["consent_preferences_written"] == 2
+    assert first["consent_preferences_skipped"] == 0
+
+    second = cli.seed_consent(db)
+    assert second["consent_preferences_written"] == 0
+    assert second["consent_preferences_skipped"] == 2
+
+
+def test_consent_fresh_is_not_flagged_stale_is_and_prior_art_still_is(db):
+    """The detector's real mechanism (version lag, never elapsed time —
+    see this module's own docstring, "D-SEED-9"), proved by actually
+    calling find_stale_consents(): the new fresh row (opted in at v2, the
+    live version) is absent from the report; the new stale row (opted in
+    at v1) is present; and seed_consent_demo.py's own pre-existing stale
+    row is STILL present too — proving this script added a finding
+    without disturbing the one that already existed."""
+    cli = _load_cli()
+    demo_consent = cli._seed_consent_demo_module()
+    cli.seed_consent(db)
+
+    findings = find_stale_consents(db)
+    subjects = {finding.subject for finding in findings}
+
+    fresh_entry = next(e for e in cli.CONSENT_ADDITIONS if e["label"] == "fresh")
+    stale_entry = next(e for e in cli.CONSENT_ADDITIONS if e["label"] == "stale")
+
+    assert fresh_entry["email"] not in subjects
+    assert stale_entry["email"] in subjects
+    assert demo_consent.DEMO_SUBJECT_EMAIL in subjects
+
+
+def test_remove_removes_only_this_scripts_two_new_preference_rows(db):
+    """Acceptance: --remove takes the count from 3 (1 prior art + 2 new)
+    back to 1, never to 0 — proving seed_consent_demo.py's own row survives
+    by count here, complementing test_remove_never_touches_prior_art_rows'
+    by-id proof above."""
+    cli = _load_cli()
+    before = db.execute(
+        sqlalchemy.text("SELECT count(*) FROM privacypreferencehistory")
+    ).scalar()
+
+    cli.seed_consent(db)
+    after_seed = db.execute(
+        sqlalchemy.text("SELECT count(*) FROM privacypreferencehistory")
+    ).scalar()
+    assert after_seed == before + 2
+
+    cli.remove_demo(db)
+    after_remove = db.execute(
+        sqlalchemy.text("SELECT count(*) FROM privacypreferencehistory")
+    ).scalar()
+    assert after_remove == before
