@@ -11,6 +11,7 @@ import {
 import { useRouter } from "next/router";
 
 import { PRIVACY_ASSESSMENTS_ROUTE } from "~/features/common/nav/routes";
+import { pluralize } from "~/features/common/utils";
 
 import { AssessmentCard } from "./AssessmentCard";
 import { PrivacyAssessmentResponse } from "./types";
@@ -47,8 +48,9 @@ export const AssessmentGroup = ({
               {displayName}
             </Title>
             <Text type="secondary">
-              {systemCount} {systemCount === 1 ? "system" : "systems"} •{" "}
-              {assessments.length} assessments
+              {systemCount} {pluralize(systemCount, "system", "systems")} •{" "}
+              {assessments.length}{" "}
+              {pluralize(assessments.length, "assessment", "assessments")}
             </Text>
           </div>
         </Flex>
