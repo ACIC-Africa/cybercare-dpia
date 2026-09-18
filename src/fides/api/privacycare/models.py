@@ -483,3 +483,78 @@ class GenerationSkip:
     # avoids. Same reason privacycare_business_process and
     # privacycare_dpia_risk exist.
     __table__ = generation_skip_table
+
+
+discovery_reconciliation_table = Table(
+    "privacycare_discovery_reconciliation",
+    PRIVACYCARE_METADATA,
+    Column("id", String(255), primary_key=True, default=_uuid),
+    # References stagedresource.urn, an ETHYCA table (and, unlike every
+    # other cross-chain reference in this file, not even a stable row id —
+    # a re-scan can leave the SAME urn on a NEW stagedresource.id if a row
+    # is ever recreated). Deliberately NO ForeignKey, for the same reason
+    # privacycare_dpia_risk.assessment_id and privacycare_generation_skip.
+    # task_id carry none: a constraint from our chain into an Ethyca table
+    # is the coupling that breaks an upstream merge. It is also the
+    # deliberate DESIGN choice named in the discovery-findings-API brief:
+    # keying our own record to the urn rather than to stagedresource.id
+    # means a re-scan that re-stages the same table (Ethyca's own row,
+    # possibly a new id) leaves this table's history untouched — the urn
+    # is the stable identity a privacy officer's decision is actually
+    # about, not whichever row currently represents it.
+    Column("stagedresource_urn", String(1024), nullable=False, index=True),
+    Column("state", String(16), nullable=False),
+    # References ctl_systems.id, an ETHYCA table. Deliberately NO
+    # ForeignKey, same reasoning as stagedresource_urn above. Required
+    # (and checked at write time) when state='mapped'; NULL when
+    # state='ignored' — enforced below by the CheckConstraint, not left to
+    # application discipline alone, same "both layers" rule
+    # privacycare_screening_decision's ck_screening_screenout_has_a_reason
+    # already applies to a screen-out's justification.
+    Column("system_id", String(255), nullable=True),
+    # Mandatory when state='ignored': WHY this table was decided to hold no
+    # personal data. This is the compliance artifact a regulator asks for
+    # when a discovered table has no system behind it — same reasoning as
+    # privacycare_screening_decision.justification.
+    Column("reason", Text, nullable=True),
+    Column("decided_by", String(255), nullable=False),
+    Column(
+        "decided_at",
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    ),
+    CheckConstraint(
+        "state IN ('mapped', 'ignored')",
+        name="ck_discovery_reconciliation_state",
+    ),
+    CheckConstraint(
+        "(state = 'mapped' AND system_id IS NOT NULL AND reason IS NULL) OR "
+        "(state = 'ignored' AND system_id IS NULL AND reason IS NOT NULL "
+        " AND length(trim(reason)) > 0)",
+        name="ck_discovery_reconciliation_mapped_or_ignored_with_reason",
+    ),
+)
+
+
+@mapper_registry.mapped
+class DiscoveryReconciliation:
+    # One reconciliation decision against one discovered table, at one
+    # moment: "this belongs to system X" (state='mapped') or "somebody
+    # looked and this holds no personal data, because Y" (state='ignored').
+    #
+    # APPEND-ONLY, same discipline as privacycare_screening_decision
+    # (models.py's screening_decision_table docstring): re-reconciling a
+    # table writes a NEW row rather than updating an old one, so an earlier
+    # decision — and the basis for it — survives being revisited. A
+    # reconciliation is a record, not a toggle: who decided, when, and why
+    # is exactly the evidence a regulator asks for when a discovered table
+    # turns out to have been wrongly ignored, and destroying the earlier
+    # row would destroy that evidence. Latest decided_at (tie-broken by id)
+    # wins on read — see discovery/findings.py's own SQL for that ordering.
+    #
+    # A table with NO row here at all is "needs review" — the third state,
+    # and the state the discovery screen exists to surface. That state is
+    # never written; it is the absence of a row, read as a LEFT JOIN miss
+    # by discovery/findings.py's list query.
+    __table__ = discovery_reconciliation_table

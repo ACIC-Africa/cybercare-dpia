@@ -137,6 +137,27 @@ privacycare_screening_router = APIRouter(
     prefix=PRIVACYCARE_SCREENING_PREFIX, tags=["PrivacyCare"]
 )
 
+# The discovery-findings HTTP surface (2026-09-18 discovery-findings-API
+# brief): a TENTH, separate prefix family, and — like
+# privacycare_processes_router/privacycare_chat_router/
+# privacycare_grounds_router/privacycare_dsr_router/
+# privacycare_consent_router/privacycare_risk_router/
+# privacycare_screening_router, and UNLIKE PRIVACYCARE_PREFIX/
+# PRIVACYCARE_MONITORS_PREFIX — back in OUR OWN namespace, not Ethyca's
+# `plus`. privacycare_monitors_router's prefix (/plus/discovery-monitor)
+# is Ethyca's own namespace, taken only because the shipped
+# monitor-CONFIGURATION screen calls it by that exact path — nothing in
+# the shipped admin UI calls a per-finding list or reconcile route (none
+# existed before this task), so this surface follows every OTHER router
+# below PRIVACYCARE_MONITORS_PREFIX instead and takes our own namespace.
+# See api/discovery.py's module docstring for the fuller version of this
+# argument.
+PRIVACYCARE_DISCOVERY_FINDINGS_PREFIX = f"{V1_URL_PREFIX}/privacycare/discovery"
+
+privacycare_discovery_findings_router = APIRouter(
+    prefix=PRIVACYCARE_DISCOVERY_FINDINGS_PREFIX, tags=["PrivacyCare Discovery"]
+)
+
 _REGISTERED_FLAG = "__privacycare_router_registered__"
 
 
@@ -257,6 +278,13 @@ def register() -> None:
     # on ITS router) is local to that one file and documented there instead.
     importlib.import_module("fides.api.privacycare.api.screening")
 
+    # discovery.py (2026-09-18 discovery-findings-API brief) decorates its
+    # OWN router (privacycare_discovery_findings_router, a distinct
+    # prefix), so — same as grounds.py, chat.py, monitors.py, dsr.py,
+    # consent.py, risk.py and screening.py above — it carries none of the
+    # tasks-vs-assessments matching-order hazard either.
+    importlib.import_module("fides.api.privacycare.api.discovery")
+
     app_setup.ROUTERS.append(privacycare_router)
     app_setup.ROUTERS.append(privacycare_processes_router)
     app_setup.ROUTERS.append(privacycare_chat_router)
@@ -266,4 +294,5 @@ def register() -> None:
     app_setup.ROUTERS.append(privacycare_consent_router)
     app_setup.ROUTERS.append(privacycare_risk_router)
     app_setup.ROUTERS.append(privacycare_screening_router)
+    app_setup.ROUTERS.append(privacycare_discovery_findings_router)
     setattr(app_setup, _REGISTERED_FLAG, True)

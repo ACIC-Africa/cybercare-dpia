@@ -461,6 +461,50 @@ ALLOWLIST: dict[str, dict] = {
             "above — no separate discovery happens for it there."
         ),
     },
+    # The discovery-findings HTTP surface (2026-09-18 discovery-findings-API
+    # brief): /api/v1/privacycare/discovery/*. Its prefix happens to already
+    # start with PRIVACYCARE_GROUNDS_PREFIX (/api/v1/privacycare) — same
+    # incidental overlap PRIVACYCARE_DSR_PREFIX/PRIVACYCARE_CONSENT_PREFIX/
+    # PRIVACYCARE_RISK_PREFIX/PRIVACYCARE_SCREENING_PREFIX's own comments
+    # already note for themselves — so this walk discovers these four
+    # models even though this task built the API half only: no shipped
+    # admin-UI screen calls a per-finding list or reconcile route, because
+    # none existed before this task (see api/discovery.py's module
+    # docstring). If a Discovery findings screen is ever built, these four
+    # entries come out and real parity tests go in, same as every other
+    # entry in this ALLOWLIST documents for its own surface.
+    "FindingResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart: discovery-findings is PrivacyCare's own "
+            "(2026-09-18 discovery-findings-API brief), and nothing in the "
+            "shipped admin UI has a screen for it — see api/discovery.py's "
+            "module docstring. Also recursed into from "
+            "FindingListResponse.findings, covered by its own entry below "
+            "— no separate discovery happens for it there."
+        ),
+    },
+    "FindingListResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as FindingResponse above."
+        ),
+    },
+    "ReconciliationResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as FindingResponse above. Also "
+            "recursed into from FindingHistoryResponse.reconciliations, "
+            "covered by its own entry below — no separate discovery "
+            "happens for it there."
+        ),
+    },
+    "FindingHistoryResponse": {
+        "ts_name": None,
+        "reason": (
+            "No TS counterpart, same reason as FindingResponse above."
+        ),
+    },
 }
 
 
