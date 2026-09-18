@@ -203,6 +203,22 @@ _RISK_BAND_FOR_ASSESSMENT_SQL = sqlalchemy.text(
 )
 
 
+# 42P01 is Postgres's UNDEFINED_TABLE. The tolerance below is deliberately
+# narrow: a MISSING privacycare_dpia_risk means zero risks are recorded, and
+# the band of an empty register genuinely IS low (banding.overall_band's own
+# default), so reporting LOW through the migration window is the right
+# answer rather than a guess. Any OTHER ProgrammingError - a revoked GRANT,
+# a column renamed out from under us - means the table exists and may hold
+# risks we failed to read, and reporting LOW there would be a confident
+# wrong answer about a compliance record. Those must surface, not degrade.
+_UNDEFINED_TABLE = "42P01"
+
+
+def _is_missing_risk_table(exc: sqlalchemy.exc.ProgrammingError) -> bool:
+    """True only when the failure is 'that table does not exist'."""
+    return getattr(getattr(exc, "orig", None), "pgcode", None) == _UNDEFINED_TABLE
+
+
 def _risk_bands_by_assessment(db: Session) -> dict[str, str]:
     """assessment_id -> true risk band, for every assessment that has at
     least one risk recorded. Callers must default a missing key to LOW
@@ -221,10 +237,12 @@ def _risk_bands_by_assessment(db: Session) -> dict[str, str]:
     """
     try:
         rows = db.execute(_RISK_BAND_SQL).mappings().all()
-    except sqlalchemy.exc.ProgrammingError:
+    except sqlalchemy.exc.ProgrammingError as exc:
         # Postgres aborts the transaction on the failed statement — roll
         # back so the session is usable for the rest of this request.
         db.rollback()
+        if not _is_missing_risk_table(exc):
+            raise
         logger.warning(
             "privacycare_dpia_risk could not be queried (PrivacyCare's own "
             "migration chain may not have run yet) — reporting every "
@@ -241,8 +259,10 @@ def _risk_band_for(db: Session, assessment_id: str) -> str:
         row = db.execute(
             _RISK_BAND_FOR_ASSESSMENT_SQL, {"assessment_id": assessment_id}
         ).mappings().first()
-    except sqlalchemy.exc.ProgrammingError:
+    except sqlalchemy.exc.ProgrammingError as exc:
         db.rollback()
+        if not _is_missing_risk_table(exc):
+            raise
         logger.warning(
             "privacycare_dpia_risk could not be queried (PrivacyCare's own "
             "migration chain may not have run yet) — reporting risk_band "
