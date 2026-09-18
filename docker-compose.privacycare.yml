@@ -70,5 +70,23 @@ services:
       retries: 10
     environment:
       FIDES__CELERY__HEALTHCHECK_PORT: "9002"
+      # privacycare/llm.py defaults GATEWAY_URL to http://127.0.0.1:8404,
+      # which is correct for a process running ON the host and silently wrong
+      # for this one: inside a container 127.0.0.1 is the container's OWN
+      # loopback, so every completion request was refused. Generation degrades
+      # per-question on GatewayUnavailable rather than failing, so a real run
+      # over 27 activities reported "complete, 26 of 27" in six seconds while
+      # producing 116 genuine record-derived answers and 65 EMPTY ai_analysis
+      # ones — the LLM contributed nothing and nothing said so. Found by
+      # inspecting the answers, not by any error.
+      #
+      # The gateway is a service in THIS compose project, on the same
+      # network, so address it by service name rather than by any host
+      # address. Note the port: it listens on 8400 inside its container and
+      # is published to 8404 on the host, so the host-facing 8404 is the
+      # wrong number from in here. A bridge-gateway IP (172.17.0.1:8404)
+      # also works but is specific to this host's docker networking; the
+      # service name travels.
+      PRIVACYCARE_GATEWAY_URL: "http://privacycare-gateway:8400"
     expose:
       - 9002
