@@ -200,6 +200,33 @@ export const NAV_CONFIG: NavConfigGroup[] = [
         requiresFlag: "privacyAssessments",
         keywords: ["DPIA", "screening", "applicable", "mapping"],
       },
+      // PrivacyCare: Screen 3 of docs/design/privacycare-screens/DESIGN.md —
+      // assembles, for one business process, everything it does with
+      // personal data from the mappings recorded on Screening. Read-only.
+      //
+      // SCOPES: the underlying routes (api/processes.py) are gated by
+      // Fides' own SYSTEM_READ, not a PRIVACYCARE_* scope — DESIGN.md's
+      // "read-only for everyone who can read screening" describes intent,
+      // not the literal scope the API enforces (see ropa.slice.ts's own
+      // header comment). Listing BOTH scopes here means this entry shows
+      // to a Restrict-style "any of" match on either one: every real role
+      // in this deployment holds both (roles.py grants SYSTEM_READ and
+      // PRIVACYCARE_SCREENING_READ to Viewer side by side), and a
+      // hypothetical future role with only one of the two still sees the
+      // entry rather than being silently denied a route DESIGN.md says it
+      // should reach — the page itself handles a resulting 403 from the
+      // API gracefully (RopaList.tsx / RopaEntry.tsx), rather than the nav
+      // entry being the only gate.
+      {
+        title: "Record of processing activities",
+        path: routes.PRIVACY_ASSESSMENTS_ROPA_ROUTE,
+        scopes: [
+          ScopeRegistryEnum.SYSTEM_READ,
+          ScopeRegistryEnum.PRIVACYCARE_SCREENING_READ,
+        ],
+        requiresFlag: "privacyAssessments",
+        keywords: ["ROPA", "Article 30", "data map", "register"],
+      },
     ],
   },
   {

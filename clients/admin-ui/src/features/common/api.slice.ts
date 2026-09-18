@@ -119,6 +119,10 @@ export const baseApi = createApi({
     // screen's own cache tags.
     "PrivacyCare Risk",
     "PrivacyCare Risk ODPC",
+    // PrivacyCare — the ROPA screen's own cache tags (Screen 3 of
+    // docs/design/privacycare-screens/DESIGN.md).
+    "PrivacyCare Ropa Processes",
+    "PrivacyCare Ropa Entry",
     "User Monitors",
     "Pre-Approval Webhooks",
     "Datastore Filters",

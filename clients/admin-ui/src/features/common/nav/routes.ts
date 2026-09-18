@@ -127,6 +127,9 @@ export const PRIVACY_ASSESSMENTS_DETAIL_ROUTE = "/privacy-assessments/[id]";
 // PrivacyCare (spec 2026-09-16 D-W2-7g): the DPIA screening & mapping screen.
 export const PRIVACY_ASSESSMENTS_SCREENING_ROUTE =
   "/privacy-assessments/screening";
+// PrivacyCare: the record of processing activities (ROPA) screen — Screen 3
+// of docs/design/privacycare-screens/DESIGN.md.
+export const PRIVACY_ASSESSMENTS_ROPA_ROUTE = "/privacy-assessments/ropa";
 
 // Data Purposes (Core Configuration)
 export const DATA_PURPOSES_ROUTE = "/data-purposes";
