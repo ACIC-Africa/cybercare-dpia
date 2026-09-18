@@ -434,6 +434,15 @@ export enum ScopeRegistryEnum {
    * PRIVACYCARE_SCREENING_CREATE
    */
   PRIVACYCARE_SCREENING_CREATE = "privacycare_screening:create",
+  // PrivacyCare (spec 2026-09-16 D-W2-7g): our scope, not Ethyca's.
+  /**
+   * PRIVACYCARE_RISK_READ
+   */
+  PRIVACYCARE_RISK_READ = "privacycare_risk:read",
+  /**
+   * PRIVACYCARE_RISK_CREATE
+   */
+  PRIVACYCARE_RISK_CREATE = "privacycare_risk:create",
   /**
    * ENCRYPTION_EXEC
    */

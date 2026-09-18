@@ -115,6 +115,10 @@ export const baseApi = createApi({
     "PrivacyCare Screening",
     "PrivacyCare Screening History",
     "PrivacyCare Screening Mapping",
+    // PrivacyCare (spec 2026-09-16 D-W2-7g): the DPIA risk register
+    // screen's own cache tags.
+    "PrivacyCare Risk",
+    "PrivacyCare Risk ODPC",
     "User Monitors",
     "Pre-Approval Webhooks",
     "Datastore Filters",

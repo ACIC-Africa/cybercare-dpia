@@ -2,6 +2,7 @@ import {
   Button,
   Collapse,
   CUSTOM_TAG_COLOR,
+  Divider,
   Drawer,
   Flex,
   Space,
@@ -36,6 +37,7 @@ import { QuestionCard } from "./QuestionCard";
 import { QuestionGroupPanel } from "./QuestionGroupPanel";
 import QuestionnaireChat from "./QuestionnaireChat";
 import { QuestionnaireStatusBar } from "./QuestionnaireStatusBar";
+import { RiskRegisterSection } from "./RiskRegisterSection";
 import {
   AnswerSource,
   AnswerStatus,
@@ -339,6 +341,12 @@ export const AssessmentDetail = ({ assessment }: AssessmentDetailProps) => {
           onSendReminder={handleSendReminder}
         />
       )}
+
+      <Divider className="my-2" />
+
+      <RiskRegisterSection assessmentId={assessment.id} />
+
+      <Divider className="my-2" />
 
       <Collapse
         className={styles.collapse}

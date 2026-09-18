@@ -180,6 +180,21 @@ jest.mock("./QuestionCard", () => ({
   QuestionCard: () => null,
 }));
 
+// PrivacyCare (spec 2026-09-16 D-W2-7g): the Risks section has its own RTK
+// Query hooks (useListRisksQuery/useGetOdpcFindingQuery) which need a real
+// Redux Provider this file does not stand up — stubbed here the same way
+// QuestionCard/EvidenceDrawer/QuestionnaireChat are, so this file continues
+// to test AssessmentDetail's own composition in isolation. RiskRegisterSection
+// has its own dedicated tests (RiskRegisterSection.test.tsx).
+jest.mock("./RiskRegisterSection", () => ({
+  RiskRegisterSection: ({ assessmentId }: { assessmentId: string }) => (
+    <div
+      data-testid="risk-register-section"
+      data-assessment-id={assessmentId}
+    />
+  ),
+}));
+
 jest.mock("../common/logos/SlackLogo", () => ({
   SlackLogo: () => null,
 }));
