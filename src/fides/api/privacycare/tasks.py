@@ -326,6 +326,20 @@ def run_generation(db: Session, task_id: str) -> None:
     below): a single system's gateway refusal must not discard the other
     forty-nine. The run reports `error` only when it produced nothing.
 
+    A DIFFERENT gateway failure mode does not raise at all: answer_questions
+    catches GatewayUnavailable per `partial` question (draft_with_llm) and
+    simply writes nothing for that question, so the assessment it belongs to
+    still "succeeds" and counts toward `completed`. That is correct for one
+    flaky call, but when the gateway is down for the WHOLE run, every one of
+    those assessments completes while carrying no AI-drafted content at
+    all — indistinguishable, in `status` and completed_count, from a run
+    that drafted everything for real. `gateway_unavailable` below sums
+    AnswerQuestionsResult.gateway_unavailable across the run and, when it is
+    non-zero, the outcome message says so in plain language. Not a failure:
+    the record-derived answers those assessments DO carry are genuinely
+    useful, so this stays `complete` — just no longer silent about what
+    "complete" did and did not mean.
+
     Before any of that, a target whose ACTIVITY is screened OUT is skipped
     entirely: no assessment row, no LLM call, no completeness computation.
     The verdict itself lives on a business process (screening/gate.py's
@@ -390,6 +404,19 @@ def run_generation(db: Session, task_id: str) -> None:
 
     completed = 0
     skipped = 0
+    # Sum of AnswerQuestionsResult.gateway_unavailable across every
+    # assessment this run actually committed (see the accumulation point
+    # below, inside the per-assessment try block, for why a failed
+    # assessment's count is never added here). Defect this closes: a run
+    # where the gateway was down for every `partial` question used to
+    # report `status=complete` with a message identical to a run that
+    # drafted everything for real — answer_questions swallows
+    # GatewayUnavailable per question (see draft_with_llm's own docstring
+    # for why that stays true) and simply wrote nothing for the affected
+    # questions, so nothing here ever surfaced except a WARNING log line
+    # nobody was reading. See the message assembly below for how a
+    # non-zero count now changes what the run says about itself.
+    gateway_unavailable = 0
     failures: list[str] = []
     for target in targets:
         # The gate check comes before build_context, not inside its
@@ -467,7 +494,7 @@ def run_generation(db: Session, task_id: str) -> None:
                     db, task_id, target, template_id, context, task["created_by"]
                 )
                 _log_coverage_gaps(db, assessment_id, template_id, context)
-                answer_questions(
+                outcome = answer_questions(
                     db,
                     assessment_id,
                     context,
@@ -483,6 +510,19 @@ def run_generation(db: Session, task_id: str) -> None:
                     },
                 )
                 completed += 1
+                # getattr, not outcome.gateway_unavailable: a handful of
+                # existing tests replace answer_questions with a stub that
+                # returns a plain int (e.g.
+                # test_generation_uses_the_model_the_settings_screen_configured's
+                # _capture), and this accumulation must not require every
+                # such stub to know about AnswerQuestionsResult. Only added
+                # once the assessment has actually reached completed += 1:
+                # an exception anywhere between the answer_questions call
+                # and here rolls this whole assessment back (see the except
+                # branch), and its partial gateway_unavailable count would
+                # describe an assessment that, in the end, does not exist —
+                # it is already accounted for under `failures` instead.
+                gateway_unavailable += getattr(outcome, "gateway_unavailable", 0)
                 _set_status(db, task_id, "in_processing", total, completed, None)
                 db.commit()
             except Exception as exc:  # noqa: BLE001 - see the docstring
@@ -518,6 +558,20 @@ def run_generation(db: Session, task_id: str) -> None:
     message = f"Generated {completed} of {total} assessments."
     if skipped:
         message += f" {skipped} screened out (no DPIA required)."
+    # Fix for the eighth silent-degradation defect in this workstream: a run
+    # in which every gateway call failed used to reach this point
+    # indistinguishable from a run that drafted every partial answer for
+    # real — same `status=complete`, same message shape, `gateway_unavailable`
+    # simply not existing anywhere the operator could see it. Plain language
+    # on purpose: whoever reads this task's message is a privacy officer,
+    # not an engineer, and does not know what a gateway is.
+    if gateway_unavailable:
+        message += (
+            f" AI drafting was unavailable for {gateway_unavailable} question"
+            f"{'' if gateway_unavailable == 1 else 's'}; those questions were "
+            "left unanswered for a human to complete, and the affected "
+            "assessments contain only answers read directly from the records."
+        )
     if failures:
         message += f" {len(failures)} failed: {failures[0]}"
     _finish(db, task_id, status, total, completed, message, skipped=skipped)

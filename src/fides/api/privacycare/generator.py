@@ -19,6 +19,7 @@ own.
               human; the detail route already renders an unanswered question
               as needs_input.
 """
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -84,6 +85,40 @@ class QuestionDraft:
     # (see _evidence_payload) so the gap travels with the answer rather
     # than living only in a log line.
     missing_data: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AnswerQuestionsResult:
+    """What one assessment's answer_questions call produced.
+
+    written: how many answers were persisted for this assessment — the
+    number every caller of answer_questions has always cared about, kept
+    as its own field rather than the whole return value so existing callers
+    that only ever wanted a count are unaffected in spirit (they now read
+    `.written` instead of comparing the return value directly).
+
+    gateway_unavailable: how many `partial`-coverage questions on this
+    assessment ATTEMPTED to ask the model and could not, because the
+    gateway itself refused or was unreachable (llm.GatewayUnavailable) —
+    never because the model declined the question (a real answer: the
+    record could not ground one) and never because no fact resolved to
+    ground a prompt in (draft_with_llm never calls the model at all in
+    that case; see its own docstring). Those two cases are working as
+    designed and are not this count's concern.
+
+    This exists because a gateway outage used to be indistinguishable from
+    a healthy run: draft_with_llm quietly returns None (see its own
+    docstring on why that stays true — an unanswered question is the right
+    degraded outcome, not a bypassed redactor), answer_questions skipped
+    the write, and the run above reported `complete` with no hint that the
+    AI half never ran at all. run_generation (tasks.py) sums this field
+    across every assessment in a run and, when it is non-zero, says so in
+    the run's own outcome message — the one thing an operator actually
+    reads.
+    """
+
+    written: int
+    gateway_unavailable: int = 0
 
 
 _QUESTIONS_FOR_ASSESSMENT_SQL = sqlalchemy.text(
@@ -361,6 +396,7 @@ def draft_with_llm(
     *,
     model: str | None,
     citation_start: int = 1,
+    on_gateway_unavailable: Callable[[], None] | None = None,
 ) -> QuestionDraft | None:
     """Ask the model to draft a `partial`-coverage answer. None writes nothing.
 
@@ -377,6 +413,18 @@ def draft_with_llm(
     was written to prevent. A DPIA platform that leaks personal data to a
     model is indefensible to the officer it is sold to, and an unanswered
     question is a recoverable outcome.
+
+    Returning None keeps this function's contract exactly as every existing
+    caller and test already relies on it (see test_generator.py's
+    test_a_gateway_failure_leaves_the_question_unanswered) — a gateway
+    outage must still read, right here, as "nothing to write". But a run
+    where this fires for every partial question must not read, to whoever
+    ran it, as identical to a run where the AI drafted everything correctly.
+    on_gateway_unavailable is how that distinction leaves this function
+    without changing what it returns: a caller that needs to count these
+    (answer_questions, below) passes a callback invoked once per gateway
+    failure; a caller that does not (every direct test of this function)
+    passes nothing and sees no difference at all.
 
     answer_status is "partial", never "complete": the record supplied only
     part of the answer by the question's own expected_coverage, and a
@@ -405,6 +453,8 @@ def draft_with_llm(
             question["question_key"],
             exc,
         )
+        if on_gateway_unavailable is not None:
+            on_gateway_unavailable()
         return None
 
     answer_text = (reply or "").strip()
@@ -441,11 +491,19 @@ def answer_questions(
     *,
     use_llm: bool,
     model: str | None,
-) -> int:
+) -> AnswerQuestionsResult:
     """Draft and persist an answer for every question the record can answer.
 
-    Returns the number of answers written. The caller owns the transaction —
-    this function never commits, matching every other core in this package.
+    Returns an AnswerQuestionsResult: `.written` is the number of answers
+    written (what every prior caller of this function compared the whole
+    return value to — see this field's own docstring for why it moved onto
+    a named attribute), and `.gateway_unavailable` is how many `partial`
+    questions on THIS assessment asked the model and got nothing back
+    because the gateway itself was down — see AnswerQuestionsResult and
+    draft_with_llm's on_gateway_unavailable parameter for why that count
+    exists and how it is collected without changing draft_with_llm's own
+    return contract. The caller owns the transaction — this function never
+    commits, matching every other core in this package.
 
     Citation numbers run continuously across the whole assessment rather
     than restarting per question: they are rendered as [1], [2] … in the
@@ -453,8 +511,9 @@ def answer_questions(
     references ambiguous.
 
     use_llm gates the `partial` branch: when False, only the deterministic
-    `full` branch runs and no call reaches the gateway. model is passed
-    through to draft_with_llm.
+    `full` branch runs and no call reaches the gateway — and, correctly,
+    `.gateway_unavailable` can never be non-zero, because draft_with_llm is
+    never even called.
     """
     questions = (
         db.execute(_QUESTIONS_FOR_ASSESSMENT_SQL, {"assessment_id": assessment_id})
@@ -463,12 +522,24 @@ def answer_questions(
     )
 
     written = 0
+    gateway_unavailable = 0
+
+    def _count_gateway_unavailable() -> None:
+        nonlocal gateway_unavailable
+        gateway_unavailable += 1
+
     next_citation = 1
     for question in questions:
         q = dict(question)
         draft = draft_from_context(q, context, citation_start=next_citation)
         if draft is None and use_llm:
-            draft = draft_with_llm(q, context, model=model, citation_start=next_citation)
+            draft = draft_with_llm(
+                q,
+                context,
+                model=model,
+                citation_start=next_citation,
+                on_gateway_unavailable=_count_gateway_unavailable,
+            )
         if draft is None:
             continue
         write_answer(
@@ -486,9 +557,11 @@ def answer_questions(
         written += 1
 
     logger.debug(
-        "PrivacyCare generation drafted {} of {} questions for assessment {}",
+        "PrivacyCare generation drafted {} of {} questions for assessment {}"
+        " ({} left unanswered by a gateway outage)",
         written,
         len(questions),
         assessment_id,
+        gateway_unavailable,
     )
-    return written
+    return AnswerQuestionsResult(written=written, gateway_unavailable=gateway_unavailable)

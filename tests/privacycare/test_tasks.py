@@ -32,7 +32,7 @@ import sqlalchemy
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from fides.api.privacycare.llm import DEFAULT_MODEL
+from fides.api.privacycare.llm import DEFAULT_MODEL, GatewayUnavailable
 from fides.api.privacycare.tasks import run_generation
 from tests.privacycare.test_api_assessments import _seed_question, _seed_template
 from tests.privacycare.test_context import (
@@ -172,6 +172,23 @@ def _full_coverage_template(db, assessment_type: str) -> str:
             "fides_sources = :sources WHERE id = :id"
         ),
         {"sources": ["privacy_declaration.data_use"], "id": qid},
+    )
+    return tid
+
+
+def _partial_coverage_template(db, assessment_type: str) -> str:
+    """An active template of the given type with one `partial`-coverage
+    question whose only fides_source resolves against a seeded system, so
+    draft_with_llm is actually reached rather than short-circuited by "no
+    facts to ground an answer in"."""
+    tid = _seed_template(db, assessment_type=assessment_type)
+    qid = _seed_question(db, tid, "q_partial", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'partial', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {"sources": ["system.name"], "id": qid},
     )
     return tid
 
@@ -497,6 +514,59 @@ def test_every_target_failing_is_reported_as_an_error(db, monkeypatch):
     run_generation(db, task_id)
 
     assert _task_row(db, task_id)["status"] == "error"
+
+
+def test_a_run_where_the_gateway_is_down_for_every_question_says_so(db, monkeypatch):
+    # The eighth silent-degradation defect in this workstream: a run in
+    # which the gateway failed for EVERY partial-coverage question used to
+    # report `status=complete` with a message that looked identical to a
+    # healthy run that drafted every answer for real. answer_questions
+    # already swallows GatewayUnavailable per question (draft_with_llm
+    # writes nothing and returns None; see that module's own docstrings for
+    # why that stays true) and the failure never propagates as an
+    # exception, so it never reached `failures` and never touched the
+    # message — nothing here surfaced it above a WARNING log line.
+    #
+    # Proof this test actually exercises the fix: it fails against
+    # tasks.py before run_generation accumulates and reports
+    # gateway_unavailable (verified by running this test against the
+    # pre-fix revision — see docs/demo/generation-gateway-report.md).
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: (_ for _ in ()).throw(
+            GatewayUnavailable("gateway returned 502: bad gateway")
+        ),
+    )
+
+    key = f"sys-{uuid.uuid4().hex[:6]}"
+    sid = _seed_system(db, key, name="CRM")
+    _seed_declaration(db, sid, "marketing.advertising")
+    _seed_declaration(db, sid, "essential.service.payment_processing")
+    atype = f"kenya_dpia_{uuid.uuid4().hex[:6]}"
+    _partial_coverage_template(db, atype)
+    db.flush()
+    task_id = _seed_task(
+        db, assessment_types=[atype], system_fides_keys=[key], use_llm=True
+    )
+    db.flush()
+
+    run_generation(db, task_id)
+
+    row = _task_row(db, task_id)
+    # Not a hard failure: the record-derived work these assessments could
+    # have carried is real and useful, and a `status=error` would throw it
+    # away. Both assessments still complete, just with nothing AI-drafted.
+    assert row["status"] == "complete"
+    assert row["total_count"] == 2
+    assert row["completed_count"] == 2
+    message = row["message"]
+    assert "AI drafting was unavailable" in message, message
+    assert "2 question" in message, message
+    assert "read directly from the records" in message, message
+    # Plain language: a privacy officer reading this does not know what a
+    # gateway is.
+    assert "gateway" not in message.lower(), message
+    assert "GatewayUnavailable" not in message, message
 
 
 def test_a_context_build_failure_does_not_discard_the_others(db, monkeypatch):

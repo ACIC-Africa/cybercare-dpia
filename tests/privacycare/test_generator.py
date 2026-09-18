@@ -234,9 +234,9 @@ def test_answer_questions_writes_only_the_full_coverage_questions(db):
     )
     db.flush()
 
-    written = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
+    outcome = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
 
-    assert written == 1
+    assert outcome.written == 1
     answered = db.execute(
         sqlalchemy.text(
             "SELECT question_id FROM assessment_answer WHERE assessment_id = :aid"
@@ -337,8 +337,8 @@ def test_full_coverage_evidence_round_trips_through_both_reader_paths(db):
     )
     db.flush()
 
-    written = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
-    assert written == 1
+    outcome = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
+    assert outcome.written == 1
 
     # Path 1: the /evidence endpoint.
     evidence = _evidence_for(db, aid)
@@ -387,7 +387,7 @@ def test_the_gap_in_a_partial_full_answer_reaches_the_detail_response(db):
     )
     db.flush()
 
-    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None) == 1
+    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None).written == 1
 
     detail = _assessment_detail(db, aid)
     question = detail.question_groups[0].questions[0]
@@ -489,8 +489,8 @@ def test_citation_counter_holds_when_a_middle_question_drafts_nothing(db):
     )
     db.flush()
 
-    written = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
-    assert written == 2
+    outcome = answer_questions(db, aid, _CONTEXT, use_llm=False, model=None)
+    assert outcome.written == 2
 
     rows = db.execute(
         sqlalchemy.text(
@@ -801,6 +801,63 @@ def test_a_gateway_failure_leaves_the_question_unanswered(monkeypatch):
     assert draft_with_llm(_question("partial", ["system.name"]), _CONTEXT, model=None) is None
 
 
+def test_a_gateway_failure_invokes_the_on_gateway_unavailable_callback(monkeypatch):
+    # answer_questions relies on this callback to count gateway failures
+    # across a run without changing draft_with_llm's own None-on-failure
+    # contract (pinned by the test above). Proven directly here, independent
+    # of answer_questions, so a regression in either has its own failing
+    # test.
+    def _unavailable(*args, **kwargs):
+        raise llm_module.GatewayUnavailable("gateway returned 429: budget exceeded")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _unavailable)
+
+    calls = []
+    draft = draft_with_llm(
+        _question("partial", ["system.name"]),
+        _CONTEXT,
+        model=None,
+        on_gateway_unavailable=lambda: calls.append(1),
+    )
+
+    assert draft is None
+    assert calls == [1]
+
+
+def test_no_callback_on_a_decline_or_missing_facts(monkeypatch):
+    # on_gateway_unavailable must fire ONLY for a real gateway outage — not
+    # for the model's own sanctioned decline, and not for the "nothing to
+    # ground an answer in" case that never calls the model at all. Either
+    # firing here would over-count and make a healthy run that simply had a
+    # few genuinely unanswerable questions look like an outage.
+    monkeypatch.setattr(
+        "fides.api.privacycare.generator.complete",
+        lambda *a, **k: NEEDS_INPUT_SENTINEL,
+    )
+    calls = []
+    draft = draft_with_llm(
+        _question("partial", ["system.name"]),
+        _CONTEXT,
+        model=None,
+        on_gateway_unavailable=lambda: calls.append(1),
+    )
+    assert draft is None
+    assert calls == []
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("the model must not be called with no facts")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _explode)
+    draft = draft_with_llm(
+        _question("partial", ["privacy_declaration.retention_period"]),
+        _CONTEXT,
+        model=None,
+        on_gateway_unavailable=lambda: calls.append(1),
+    )
+    assert draft is None
+    assert calls == []
+
+
 def test_the_requested_model_is_passed_through(monkeypatch):
     captured = {}
     monkeypatch.setattr(
@@ -834,7 +891,7 @@ def test_answer_questions_skips_the_llm_entirely_when_use_llm_is_false(db, monke
     )
     db.flush()
 
-    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None) == 0
+    assert answer_questions(db, aid, _CONTEXT, use_llm=False, model=None).written == 0
 
 
 def test_answer_questions_writes_the_llm_answer_when_use_llm_is_true(db, monkeypatch):
@@ -855,7 +912,7 @@ def test_answer_questions_writes_the_llm_answer_when_use_llm_is_true(db, monkeyp
     )
     db.flush()
 
-    assert answer_questions(db, aid, _CONTEXT, use_llm=True, model=None) == 1
+    assert answer_questions(db, aid, _CONTEXT, use_llm=True, model=None).written == 1
 
     row = db.execute(
         sqlalchemy.text(
@@ -869,3 +926,42 @@ def test_answer_questions_writes_the_llm_answer_when_use_llm_is_true(db, monkeyp
     assert row["answer_status"] == "partial"
     assert row["answer_source"] == "ai_analysis"
     assert row["answer_text"] == "Drafted from the record."
+
+
+def test_answer_questions_counts_gateway_unavailable_and_writes_nothing_for_it(
+    db, monkeypatch
+):
+    # The silent-degradation defect this closes: a gateway outage used to
+    # leave the question unanswered (correct) with NO signal anywhere but a
+    # WARNING log line (wrong) — answer_questions' return value gave the
+    # caller no way to tell "the model declined" or "nothing to ground it
+    # in" apart from "the gateway itself never answered". This is that
+    # signal.
+    def _unavailable(*args, **kwargs):
+        raise llm_module.GatewayUnavailable("gateway returned 502: bad gateway")
+
+    monkeypatch.setattr("fides.api.privacycare.generator.complete", _unavailable)
+
+    tid = _seed_template(db)
+    aid = _seed_assessment(db, tid, "Gateway Down DPIA")
+    qid = _seed_question(db, tid, "partial_q", "necessity", 1)
+    db.execute(
+        sqlalchemy.text(
+            "UPDATE assessment_question SET expected_coverage = 'partial', "
+            "fides_sources = :sources WHERE id = :id"
+        ),
+        {"sources": ["system.name"], "id": qid},
+    )
+    db.flush()
+
+    outcome = answer_questions(db, aid, _CONTEXT, use_llm=True, model=None)
+
+    assert outcome.written == 0, "a gateway outage must still write nothing"
+    assert outcome.gateway_unavailable == 1
+    answered = db.execute(
+        sqlalchemy.text(
+            "SELECT question_id FROM assessment_answer WHERE assessment_id = :aid"
+        ),
+        {"aid": aid},
+    ).scalars().all()
+    assert answered == [], "no partial answer_version row for the failed question"
